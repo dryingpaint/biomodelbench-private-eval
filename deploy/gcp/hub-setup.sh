@@ -69,7 +69,7 @@ if exists gcloud compute instances describe "$NAME" --zone "$ZONE" --project "$P
   echo "VM exists; settings updated. Apply with: gcloud compute instances reset $NAME --zone $ZONE"
 else
   gcloud compute instances create "$NAME" --project "$PROJECT" --zone "$ZONE" \
-    --machine-type e2-standard-2 --boot-disk-size 100GB \
+    --machine-type e2-standard-2 --boot-disk-size 100GB --boot-disk-type pd-balanced \
     --image-family ubuntu-2404-lts-amd64 --image-project ubuntu-os-cloud \
     --address "$IP" --tags "$NAME" --service-account "$SA" --scopes cloud-platform \
     --metadata "domain=$DOMAIN,bucket=$BUCKET,repo=$REPO" \

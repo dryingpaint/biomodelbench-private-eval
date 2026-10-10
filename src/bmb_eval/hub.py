@@ -14,7 +14,8 @@ gated results nodes send back. Never sees provider data.
              POST /v1/node/results/<id>           deliver the gated payload
     enroll   GET  /v1/enroll/<code>               task package (contract, scorer, ...)
              POST /v1/enroll/<code>               activate: bind task to a node
-    public   GET  /install.sh, /bmb-eval.tar.gz, /sandbox-image.tar, /guide
+    public   GET  /install.sh, /bmb-eval.tar.gz, /sandbox-image.tar,
+                  /guide and /security (provider guide and threat model as web pages)
 
 Model files live in Google Cloud Storage (`--bucket`), moved with signed URLs
 so they never pass through this server; without a bucket the hub stores
@@ -220,11 +221,54 @@ def code_tarball(root: Path) -> bytes | None:
 
 # --------------------------------------------------------------------- HTTP
 
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  :root {{ --fg:#1d2330; --muted:#5b6475; --bg:#ffffff; --code:#f4f6f9; --line:#e3e7ee; --link:#1f5fbf; }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{ --fg:#e6e9ef; --muted:#a3abb9; --bg:#14171c; --code:#1e232b; --line:#2c323c; --link:#7fb0ff; }}
+  }}
+  body {{ margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+  main {{ max-width:760px; margin:0 auto; padding:40px 20px 80px; }}
+  h1 {{ font-size:1.9em; line-height:1.25; margin:0 0 .4em; }}
+  h2 {{ font-size:1.3em; margin:2em 0 .5em; padding-top:.4em; border-top:1px solid var(--line); }}
+  a {{ color:var(--link); }}
+  code {{ background:var(--code); padding:.1em .35em; border-radius:4px; font-size:.92em; }}
+  pre {{ background:var(--code); padding:14px 16px; border-radius:8px; overflow-x:auto; line-height:1.45; }}
+  pre code {{ background:none; padding:0; }}
+  blockquote {{ margin:1em 0; padding:.2em 1em; border-left:3px solid var(--line); color:var(--muted); }}
+  table {{ border-collapse:collapse; width:100%; margin:1em 0; display:block; overflow-x:auto; }}
+  th, td {{ border:1px solid var(--line); padding:6px 10px; text-align:left; vertical-align:top; }}
+  th {{ background:var(--code); }}
+  nav {{ font-size:.9em; color:var(--muted); margin-bottom:24px; }}
+</style></head>
+<body><main><nav><a href="guide">Provider guide</a> · <a href="security">Security details</a></nav>
+{body}
+</main></body></html>"""
+
+
+def render_page(md_text: str, public_url: str) -> bytes:
+    """A docs/ Markdown file as a web page, with the hub's real address filled in."""
+    text = md_text.replace("https://<hub address>", public_url)
+    try:
+        import markdown
+        body = markdown.markdown(text, extensions=["tables", "fenced_code"])
+    except ImportError:   # hub installed without the [hub] extra: still readable
+        import html
+        body = f"<pre>{html.escape(text)}</pre>"
+    title = next((ln[2:].strip() for ln in text.splitlines() if ln.startswith("# ")), "BioModelBench")
+    return PAGE.format(title=title, body=body).encode()
+
+
 def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_bundle_gb: int):
     max_bundle = max_bundle_gb << 30
     tarball = code_tarball(repo_root)
     install_sh = repo_root / "install.sh"
-    guide = repo_root / "docs" / "PROVIDER_SETUP.md"
+    pages = {"/guide": repo_root / "docs" / "PROVIDER_SETUP.md",
+             "/security": repo_root / "docs" / "THREAT_MODEL.md"}
     image_tar = store.state / "sandbox-image.tar"
 
     class Handler(BaseHTTPRequestHandler):
@@ -236,6 +280,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
 
         # ------------------------------------------------------- plumbing
 
+        _head = False   # HEAD request: send headers only
+
         def _send(self, code: int, obj=None, body: bytes | None = None,
                   ctype: str = "application/json") -> None:
             if obj is not None:
@@ -245,7 +291,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if not self._head:
+                self.wfile.write(body)
 
         def _err(self, status: int, code: str, message: str, **extra) -> None:
             self._send(status, {"error": {"code": code, "message": message, **extra}})
@@ -265,6 +312,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
+            if self._head:
+                return
             with path.open("rb") as f:
                 while chunk := f.read(8 << 20):
                     self.wfile.write(chunk)
@@ -282,8 +331,12 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._send(200, body=body, ctype="text/x-shellscript")
             if p == "/bmb-eval.tar.gz" and tarball:
                 return self._send(200, body=tarball, ctype="application/gzip")
-            if p == "/guide" and guide.is_file():
-                return self._send(200, body=guide.read_bytes(), ctype="text/markdown; charset=utf-8")
+            if p in pages and pages[p].is_file():
+                return self._send(200, body=render_page(pages[p].read_text(), public_url),
+                                  ctype="text/html; charset=utf-8")
+            if p.removesuffix(".md") in pages and p.endswith(".md"):
+                return self._send(200, body=pages[p.removesuffix(".md")].read_bytes(),
+                                  ctype="text/markdown; charset=utf-8")
             if p == "/sandbox-image.tar" and image_tar.is_file():
                 return self._send_file(image_tar, "application/x-tar")
             if m := re.fullmatch(r"/v1/enroll/([A-Z0-9-]{14})", p):
@@ -318,6 +371,10 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                     out["result"] = json.loads(row[3])
                 return self._send(200, out)
             self._err(404, "not_found", "No such endpoint.")
+
+        def do_HEAD(self):
+            self._head = True
+            self.do_GET()
 
         def do_PUT(self):
             p, qs = self._path()

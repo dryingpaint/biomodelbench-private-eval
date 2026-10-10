@@ -554,3 +554,17 @@ def test_gcs_signed_urls_offline():
     assert up["method"] == "PUT" and up["auth"] is False and not down["auth"]
     assert "p-bmb-models/blobs/" in up["url"] and sha in up["url"] and "X-Goog-Signature" in up["url"]
     assert g._name("agent-1", sha) != g._name("agent-2", sha)   # per-agent storage
+
+
+def test_guide_and_security_pages(hub):
+    import urllib.request
+    store, url = hub
+    for path, heading in [("/guide", "Connecting your data to BioModelBench"), ("/security", "Threat model")]:
+        r = urllib.request.urlopen(url + path)
+        page = r.read().decode()
+        assert r.headers["Content-Type"].startswith("text/html")
+        assert f"<h1>{heading}</h1>" in page and "<table>" in page
+    guide = urllib.request.urlopen(url + "/guide").read().decode()
+    assert f"curl -fsSL {url}/install.sh" in guide and "&lt;hub address&gt;" not in guide
+    head = urllib.request.urlopen(urllib.request.Request(url + "/install.sh", method="HEAD"))
+    assert head.status == 200 and int(head.headers["Content-Length"]) > 100 and head.read() == b""

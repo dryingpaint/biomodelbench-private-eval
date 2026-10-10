@@ -18,7 +18,7 @@ them on your data and sends back only the scores. Your data never leaves.
 Run the command from our email on that machine:
 
 ```bash
-curl -fsSL https://<hub address>/install.sh | sh -s -- <your code> --data /path/to/your/data
+curl -fsSL https://<hub address>/install.sh | sh -s -- YOUR-CODE --data /path/to/your/data
 ```
 
 It takes about 15 minutes and may ask for your password once. It installs
@@ -97,8 +97,8 @@ strict memory, CPU and time limits. Your data is split locally: the model only
 ever receives the columns and files listed as "The model will see" (large
 files are hard-linked, not copied). Setup attacks its own sandbox before
 anything runs, and stops if any attack succeeds. Downloaded model files are
-checked against their hashes. The full list of protections is in
-`~/bmb-eval/docs/THREAT_MODEL.md`.
+checked against their hashes. The full list of protections is in the
+[security details](security) (also in `~/bmb-eval/docs/THREAT_MODEL.md`).
 
 **Disk use?** Downloaded models are cached in `~/bmb-eval/state/blobs` (up to
 300 GB by default, oldest removed first), so a model reused across submissions

@@ -14,7 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
-hub = ["google-cloud-storage>=2.14"]   # the hub, when model files live in Cloud Storage
+hub = ["google-cloud-storage>=2.14", "markdown>=3.5"]   # the hub: Cloud Storage, web pages
 
 [project.scripts]
 bmb-eval = "bmb_eval.cli:main"

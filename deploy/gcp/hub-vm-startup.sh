@@ -10,8 +10,15 @@ HOME_DIR=/home/bmb; CODE="$HOME_DIR/bmb-eval"; STATE="$HOME_DIR/hub_state"
 
 id bmb >/dev/null 2>&1 || useradd --create-home --shell /bin/bash bmb
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq git podman caddy curl >/dev/null
+# A reset can interrupt Ubuntu's automatic updates; finish them first, and wait
+# for the package lock rather than failing. Install only what's missing.
+dpkg --configure -a || true
+missing=""
+for pkg in git podman caddy curl; do dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"; done
+if [ -n "$missing" ]; then
+  apt-get -o DPkg::Lock::Timeout=600 update -qq
+  apt-get -o DPkg::Lock::Timeout=600 install -y -qq $missing >/dev/null
+fi
 
 as_bmb() { sudo -u bmb -H bash -lc "$*"; }
 as_bmb 'command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null'

@@ -15,7 +15,7 @@ gated results nodes send back. Never sees provider data.
     enroll   GET  /v1/enroll/<code>               task package (contract, scorer, ...)
              POST /v1/enroll/<code>               activate: bind task to a node
     public   GET  /install.sh, /bmb-eval.tar.gz, /sandbox-image.tar,
-                  /guide and /security (provider guide and threat model as web pages)
+                  /guide (the provider guide as a web page)
 
 Model files live in Google Cloud Storage (`--bucket`), moved with signed URLs
 so they never pass through this server; without a bucket the hub stores
@@ -243,9 +243,8 @@ PAGE = """<!doctype html>
   table {{ border-collapse:collapse; width:100%; margin:1em 0; display:block; overflow-x:auto; }}
   th, td {{ border:1px solid var(--line); padding:6px 10px; text-align:left; vertical-align:top; }}
   th {{ background:var(--code); }}
-  nav {{ font-size:.9em; color:var(--muted); margin-bottom:24px; }}
 </style></head>
-<body><main><nav><a href="guide">Provider guide</a> · <a href="security">Security details</a></nav>
+<body><main>
 {body}
 </main></body></html>"""
 
@@ -267,8 +266,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
     max_bundle = max_bundle_gb << 30
     tarball = code_tarball(repo_root)
     install_sh = repo_root / "install.sh"
-    pages = {"/guide": repo_root / "docs" / "PROVIDER_SETUP.md",
-             "/security": repo_root / "docs" / "THREAT_MODEL.md"}
+    pages = {"/guide": repo_root / "docs" / "PROVIDER_SETUP.md"}
     image_tar = store.state / "sandbox-image.tar"
 
     class Handler(BaseHTTPRequestHandler):

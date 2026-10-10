@@ -556,14 +556,16 @@ def test_gcs_signed_urls_offline():
     assert g._name("agent-1", sha) != g._name("agent-2", sha)   # per-agent storage
 
 
-def test_guide_and_security_pages(hub):
+def test_guide_page(hub):
+    import urllib.error
     import urllib.request
     store, url = hub
-    for path, heading in [("/guide", "Connecting your data to BioModelBench"), ("/security", "Threat model")]:
-        r = urllib.request.urlopen(url + path)
-        page = r.read().decode()
-        assert r.headers["Content-Type"].startswith("text/html")
-        assert f"<h1>{heading}</h1>" in page and "<table>" in page
+    r = urllib.request.urlopen(url + "/guide")
+    page = r.read().decode()
+    assert r.headers["Content-Type"].startswith("text/html")
+    assert "<h1>Connecting your data to BioModelBench</h1>" in page and "<h2>Technical details</h2>" in page
+    with pytest.raises(urllib.error.HTTPError):
+        urllib.request.urlopen(url + "/security")
     guide = urllib.request.urlopen(url + "/guide").read().decode()
     assert f"curl -fsSL {url}/install.sh" in guide and "&lt;hub address&gt;" not in guide
     head = urllib.request.urlopen(urllib.request.Request(url + "/install.sh", method="HEAD"))

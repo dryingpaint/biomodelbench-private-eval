@@ -18,9 +18,13 @@ COMMON = textwrap.dedent('''\
     import json, os
     import pandas as pd
 
-    C = json.loads(os.environ["BMB_CONTRACT"])
+    C = json.loads(open(os.environ["BMB_CONTRACT_FILE"]).read())
 
     def _valid(f):
+        if f["type"] == "vector":
+            return [_valid({**f, "type": "float"})] * f["length"]
+        if f["type"] == "list":
+            return {i["name"]: [] for i in f["items"]}
         if f.get("allowed"):
             return f["allowed"][0]
         if f["type"] == "string":
@@ -33,7 +37,10 @@ COMMON = textwrap.dedent('''\
         return int(v) if f["type"] == "int" else float(v)
 
     def baseline(df):
-        return pd.DataFrame({f["name"]: [_valid(f)] * len(df) for f in C["outputs"]})
+        return pd.DataFrame({f["name"]: [_valid(f) for _ in range(len(df))] for f in C["outputs"]})
+
+    def _inputs_path():
+        return os.environ.get("BMB_INPUTS") or os.path.join(os.environ["BMB_INPUTS_DIR"], "samples.parquet")
     ''')
 
 
@@ -45,6 +52,7 @@ class Attack:
     expect: str                        # "ok" or an error code
     container_only: bool = False       # meaningless (or unsafe) on the local backend
     limits: dict = field(default_factory=dict)
+    gpu_only: bool = False             # run only for tasks that use GPUs
 
 
 ATTACKS = [
@@ -70,14 +78,14 @@ ATTACKS = [
             for sock in ["/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"]:
                 if os.path.exists(sock):
                     hits.append(sock)
-            allowed = {os.path.realpath(os.environ["BMB_INPUTS"])}
+            inputs_dir = os.path.realpath(os.path.dirname(_inputs_path()))
             t0, seen = time.time(), 0
             for root, dirs, files in os.walk("/"):
                 dirs[:] = [d for d in dirs if os.path.join(root, d) not in ("/proc", "/sys", "/dev")]
                 for f in files:
                     seen += 1
                     p = os.path.join(root, f)
-                    if f.endswith(".parquet") and os.path.realpath(p) not in allowed:
+                    if f.endswith(".parquet") and not os.path.realpath(p).startswith(inputs_dir + os.sep):
                         hits.append(p)
                 if seen > 200_000 or time.time() - t0 > 60:
                     break
@@ -89,7 +97,7 @@ ATTACKS = [
     Attack("write_host", "write into the bundle, data and system paths", textwrap.dedent('''\
         def load_model():
             targets = [os.path.join(os.environ["BMB_BUNDLE"], "x"),
-                       os.path.join(os.path.dirname(os.environ["BMB_INPUTS"]), "x"),
+                       os.path.join(os.path.dirname(_inputs_path()), "x"),
                        "/x", "/etc/x", "/usr/x"]
             for p in targets:
                 try:
@@ -169,6 +177,15 @@ ATTACKS = [
         '''), "predictions_invalid"),
 
     Attack("symlink_tar", "smuggle a symlink to the answers in the archive", "", "bundle_unsafe"),
+
+    Attack("gpu_visible", "the task's GPU is usable inside the sandbox", textwrap.dedent('''\
+        def load_model():
+            import torch
+            if not torch.cuda.is_available():
+                raise RuntimeError("no GPU inside the sandbox")
+            torch.ones(1, device="cuda").sum().item()
+        predict = baseline
+        '''), "ok", container_only=True, gpu_only=True),
 ]
 
 

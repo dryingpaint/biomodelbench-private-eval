@@ -45,13 +45,16 @@ class Runner:
 
     # ------------------------------------------------------------------ public
 
-    def evaluate(self, task_id: str, data: bytes, *, run_id: str | None = None,
-                 submitter: str = "local", limits_override: dict | None = None) -> dict:
+    def evaluate(self, task_id: str, bundle: bytes | Path, *, run_id: str | None = None,
+                 submitter: str = "local", limits_override: dict | None = None,
+                 bundle_id: str | None = None) -> dict:
+        """bundle: a .tar.gz (operator/self-test use) or a directory already
+        assembled from the verified file cache (the node, for real submissions)."""
         run_id = run_id or new_run_id()
         t = self.cfg.tasks.get(task_id)
         run_dir = self.cfg.state_dir / "runs" / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        sha = bundle_mod.sha256(data)
+        sha = bundle_id or (bundle_mod.sha256(bundle) if isinstance(bundle, bytes) else "unknown")
         t0 = time.time()
         internal: dict = {"run_id": run_id, "task": task_id, "submitter": submitter,
                           "bundle_sha256": sha}
@@ -61,7 +64,7 @@ class Runner:
             c = t.contract
             if limits_override:
                 c = dataclasses.replace(c, limits=dataclasses.replace(c.limits, **limits_override))
-            metrics = self._pipeline(t, c, data, run_id, run_dir, internal)
+            metrics = self._pipeline(t, c, bundle, run_id, run_dir, internal)
             payload = self._payload(run_id, t, sha, STATUS_OK, metrics=metrics)
             payload = self._ladder(payload, t.contract, submitter)
         except EvalError as e:
@@ -91,21 +94,26 @@ class Runner:
 
     # ---------------------------------------------------------------- pipeline
 
-    def _pipeline(self, t: TaskBinding, c: Contract, data: bytes, run_id: str,
+    def _pipeline(self, t: TaskBinding, c: Contract, bundle: bytes | Path, run_id: str,
                   run_dir: Path, internal: dict) -> dict:
         lim = c.limits
-        public_json = json.dumps(c.public())
+        contract_file = run_dir / "contract.json"
+        contract_file.write_text(json.dumps(c.public()))
+        contract_mount = Mount("BMB_CONTRACT_FILE", contract_file, "/contract.json")
+        inputs_mount = (Mount("BMB_INPUTS_DIR", t.inputs_dir, "/data/inputs") if t.inputs_dir
+                        else Mount("BMB_INPUTS", t.inputs, "/data/inputs/samples.parquet"))
 
         # 1. unpack
-        bundle_dir = bundle_mod.unpack(data, run_dir / "bundle", lim.max_bundle_mb << 20)
+        bundle_dir = (bundle_mod.unpack(bundle, run_dir / "bundle", lim.max_bundle_gb << 30)
+                      if isinstance(bundle, bytes) else Path(bundle))
 
         # 2. predict: untrusted code sees inputs only
         r = self._stage(run_dir, internal, "predict", run_id,
-                        mounts=[Mount("BMB_BUNDLE", bundle_dir, "/bundle"),
-                                Mount("BMB_INPUTS", t.inputs, "/data/inputs.parquet")],
-                        env={"BMB_CONTRACT": public_json}, limits=lim,
+                        mounts=[Mount("BMB_BUNDLE", bundle_dir, "/bundle"), inputs_mount,
+                                contract_mount],
+                        env={}, limits=lim,
                         timeout_s=lim.predict_timeout_s,
-                        stdout_cap=lim.max_predictions_mb << 20)
+                        stdout_cap=lim.max_predictions_mb << 20, gpus=lim.gpus)
         if r.stdout_overflow:
             raise EvalError("predictions_too_large")
         if r.timed_out:
@@ -122,8 +130,9 @@ class Runner:
 
         # 3. validate: untrusted predictions -> canonical arrays, no answers present
         r = self._stage(run_dir, internal, "validate", run_id,
-                        mounts=[Mount("BMB_INPUTS", t.inputs, "/data/inputs.parquet")],
-                        env={"BMB_CONTRACT": public_json}, limits=lim,
+                        mounts=[Mount("BMB_INPUTS", t.inputs, "/data/samples.parquet"),
+                                contract_mount],
+                        env={}, limits=lim,
                         timeout_s=lim.validate_timeout_s,
                         stdout_cap=lim.max_predictions_mb << 20, stdin=r.stdout)
         if r.exit_code == EXIT_INVALID:
@@ -138,8 +147,10 @@ class Runner:
         # 4. score: trusted scorer + answers, canonical predictions on stdin
         r = self._stage(run_dir, internal, "score", run_id,
                         mounts=[Mount("BMB_TASK", t.dir, "/task"),
-                                Mount("BMB_INPUTS", t.inputs, "/data/inputs.parquet"),
-                                Mount("BMB_ANSWERS", t.answers, "/data/answers.parquet")],
+                                Mount("BMB_INPUTS", t.inputs, "/data/samples.parquet"),
+                                Mount("BMB_ANSWERS", t.answers, "/data/answers.parquet"),
+                                *([Mount("BMB_ANSWERS_DIR", t.answers_dir, "/data/answers_files")]
+                                  if t.answers_dir else [])],
                         env={}, limits=lim, timeout_s=lim.score_timeout_s,
                         stdout_cap=c.max_export_bytes * 4, stdin=r.stdout)
         if r.timed_out or r.exit_code != 0 or r.stdout_overflow:

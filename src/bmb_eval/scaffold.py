@@ -1,9 +1,9 @@
-"""Generate task contracts, scorers and synthetic data.
+"""Generate simple task contracts and scorers (`bmb-hub new-task`), and
+synthetic inputs from a public contract (agents' dry runs).
 
-add_task() infers a contract from the provider's parquet files so setup is
-one command plus a review. It records names, types and nullability only.
-It never copies min/max, category sets or row counts out of private data:
-the contract is shown to the agent, and a column's max is a private value.
+Contracts are written from column names agreed with the provider, never
+inferred from private data: the contract is shown to agents, and a
+column's max or category set can itself be private.
 """
 from __future__ import annotations
 
@@ -17,16 +17,6 @@ import yaml
 from .contract import Contract
 
 AMINO = list("ACDEFGHIKLMNPQRSTVWY")
-
-
-def _type_of(s: pd.Series) -> str:
-    if pd.api.types.is_bool_dtype(s):
-        return "bool"
-    if pd.api.types.is_integer_dtype(s):
-        return "int"
-    if pd.api.types.is_float_dtype(s):
-        return "float"
-    return "string"
 
 
 def _field_yaml(name: str, type_: str, nullable: bool, indent: str = "  ") -> str:
@@ -121,24 +111,6 @@ METRICS = {
 }
 
 
-def add_task(task_id: str, tasks_dir: Path, inputs: Path, answers: Path, key: list[str],
-             kind: str, target: str | None = None) -> Path:
-    """Infer columns from the provider's files and write the task."""
-    inp = pd.read_parquet(inputs)
-    ans = pd.read_parquet(answers)
-    for k in key:
-        if k not in inp.columns or k not in ans.columns:
-            raise SystemExit(f"key column {k!r} must be in both files")
-    if target is None:
-        rest = [c for c in ans.columns if c not in key]
-        if len(rest) != 1:
-            raise SystemExit(f"answers has columns {rest}; pick one with --target")
-        target = rest[0]
-    cols = lambda df, names: [(c, _type_of(df[c]), bool(df[c].isna().any())) for c in names]
-    return write_task(task_id, tasks_dir, cols(inp, list(inp.columns)),
-                      cols(ans, key + [target]), key, kind, target)
-
-
 def write_task(task_id: str, tasks_dir: Path, inputs: list[tuple[str, str, bool]],
                answers: list[tuple[str, str, bool]], key: list[str], kind: str,
                target: str) -> Path:
@@ -212,6 +184,19 @@ def synth_inputs(c: Contract, n: int = 200, seed: int = 0) -> pd.DataFrame:
         if f.name in c.key:
             cols[f.name] = (np.arange(n) if f.type == "int" else [f"id{i:06d}" for i in range(n)])
             continue
+        if f.type == "vector":
+            lo = f.min if f.min is not None else 0.0
+            hi = f.max if f.max is not None else 1.0
+            cols[f.name] = list(rng.uniform(lo, hi, (n, f.length)))
+            continue
+        if f.type == "file":
+            cols[f.name] = [None] * n   # filled in by prepare.synth_files
+            continue
+        if f.type == "any":
+            pool = next((i.allowed for o in c.outputs for i in (o.items or [])
+                         if i.in_input == f.name and i.allowed), None) or [f"C{j}" for j in range(50)]
+            cols[f.name] = [list(rng.choice(pool, min(10, len(pool)), replace=False)) for _ in range(n)]
+            continue
         if f.allowed:
             v = rng.choice(np.array(f.allowed, dtype=object), n)
         elif f.type == "string":
@@ -228,16 +213,3 @@ def synth_inputs(c: Contract, n: int = 200, seed: int = 0) -> pd.DataFrame:
             s = s.astype(object).where(rng.random(n) > 0.05, None)
         cols[f.name] = s
     return pd.DataFrame(cols)
-
-
-def example_private_data(dest: Path, n: int = 500, seed: int = 1) -> tuple[Path, Path]:
-    """Stand-in 'private' data for the bundled example task."""
-    rng = np.random.default_rng(seed)
-    seqs = ["".join(rng.choice(AMINO, rng.integers(30, 80))) for _ in range(n)]
-    hydro = np.array([sum(ch in "AILMFVW" for ch in s) / len(s) for s in seqs])
-    fitness = 3 * hydro + rng.normal(0, 0.2, n)
-    ids = [f"v{i:05d}" for i in range(n)]
-    dest.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({"variant_id": ids, "sequence": seqs}).to_parquet(dest / "inputs.parquet")
-    pd.DataFrame({"variant_id": ids, "fitness": fitness}).to_parquet(dest / "answers.parquet")
-    return dest / "inputs.parquet", dest / "answers.parquet"

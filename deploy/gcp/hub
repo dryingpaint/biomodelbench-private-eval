@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Run a bmb-hub admin command on the hub VM from your laptop:
+#   deploy/gcp/hub agent-token my-agent
+#   deploy/gcp/hub enroll examples/tasks/sequence_regression    (copies the task up first)
+#   deploy/gcp/hub status
+set -euo pipefail
+NAME="${NAME:-bmb-hub}"; ZONE="${ZONE:-us-central1-a}"
+PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
+run() { gcloud compute ssh "$NAME" --zone "$ZONE" --project "$PROJECT" --quiet --command "$1"; }
+DOMAIN="$(gcloud compute instances describe "$NAME" --zone "$ZONE" --project "$PROJECT" --format json |
+  python3 -c 'import json, sys; print(next(i["value"] for i in json.load(sys.stdin)["metadata"]["items"] if i["key"] == "domain"))')"
+HUB="sudo -u bmb -H /home/bmb/bmb-eval/.venv/bin/bmb-hub --state /home/bmb/hub_state"
+
+if [ "${1:-}" = "enroll" ]; then
+  dir="${2:?usage: hub enroll <task folder>}"
+  task="$(basename "$dir")"
+  gcloud compute scp --recurse "$dir" "$NAME:/tmp/bmb-task-$task" --zone "$ZONE" --project "$PROJECT" --quiet
+  run "sudo rm -rf /home/bmb/tasks/$task && sudo mkdir -p /home/bmb/tasks && \
+       sudo mv /tmp/bmb-task-$task /home/bmb/tasks/$task && sudo chown -R bmb /home/bmb/tasks && \
+       $HUB enroll /home/bmb/tasks/$task --public-url https://$DOMAIN"
+else
+  run "$HUB $*"
+fi

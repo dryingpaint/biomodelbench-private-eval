@@ -50,6 +50,9 @@ PREDICTION_REASONS = {
     "duplicate_keys",
     "missing_keys",
     "unexpected_keys",
+    "wrong_length",
+    "too_many_items",
+    "not_in_candidates",
 }
 
 

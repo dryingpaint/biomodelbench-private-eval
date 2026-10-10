@@ -24,7 +24,6 @@ from .config import save_yaml
 from .sandbox import ENGINES, detect_engine, make as make_sandbox
 
 IMAGE = "bmb-eval-sandbox:latest"
-EXAMPLE = "example_regression"
 
 
 def _cfg(args):
@@ -57,19 +56,12 @@ def cmd_init(args) -> None:
                 "  RHEL/Fedora:    sudo dnf install -y podman")
     runtime = "runsc" if engine in ENGINES and _has_gvisor(engine) else None
 
-    root = cfg_path.resolve().parent
-    tasks = {}
-    if args.example:
-        inp, ans = scaffold.example_private_data(root / "private_data" / EXAMPLE)
-        tasks[EXAMPLE] = {"dir": f"tasks/{EXAMPLE}",
-                          "inputs": str(inp.relative_to(root)),
-                          "answers": str(ans.relative_to(root))}
     raw = {
         "node_name": socket.gethostname().split(".")[0],
         "sandbox": {"backend": engine, "image": IMAGE, "runtime": runtime},
         "alerts": {"webhook_url": None, "infra_failure_threshold": 3},
         "retain_bundles": False,
-        "tasks": tasks,
+        "tasks": {},
     }
     if engine == "local":
         raw["sandbox"]["i_understand_local_backend_is_not_isolated"] = True
@@ -161,47 +153,22 @@ def data_problems(t) -> list[str]:
     return out
 
 
-def _read_table(path: Path):
-    """Read the provider's file (.csv, .tsv, .txt or .parquet) as a DataFrame."""
-    import pandas as pd
-    if not path.is_file():
-        raise SystemExit(f"Can't find {path}")
-    if path.suffix == ".parquet":
-        return pd.read_parquet(path)
-    if path.suffix not in (".csv", ".tsv", ".txt"):
-        raise SystemExit(f"{path.name}: please provide a .csv, .tsv or .parquet file")
-    return pd.read_csv(path, sep="\t" if path.suffix in (".tsv", ".txt") else ",")
-
-
 def _user_path(p: str) -> Path:
     """Resolve a path the way the user typed it (install.sh changes directory)."""
     q = Path(p).expanduser()
     return q if q.is_absolute() else (Path(os.environ.get("BMB_CALLER_CWD", ".")) / q).resolve()
 
 
-def _split_data(df, c, dest: Path) -> tuple[Path, Path]:
-    """One provider file -> inputs.parquet (only what the model may see) and
-    answers.parquet (key + answer columns). Other columns are dropped."""
-    dest.mkdir(parents=True, exist_ok=True)
-    want_in = [f.name for f in c.inputs]
-    want_ans = [f.name for f in c.answers]
-    missing = [col for col in dict.fromkeys(want_in + want_ans) if col not in df.columns]
-    if missing:
-        print("\nThere's a problem with your data file:")
-        for col in missing:
-            print(f"  • It has no column '{col}'.")
-        print(f"  Columns found: {', '.join(map(str, df.columns))}")
-        raise SystemExit("\nFix the file and run the same command again.")
-    df[want_in].to_parquet(dest / "inputs.parquet", index=False)
-    df[want_ans].to_parquet(dest / "answers.parquet", index=False)
-    return dest / "inputs.parquet", dest / "answers.parquet"
-
-
-def _bind_task(cfg_path: Path, task: str, task_dir: Path, inputs: Path, answers: Path) -> None:
+def _bind_task(cfg_path: Path, task: str, task_dir: Path, inputs: Path, answers: Path,
+               inputs_dir: Path | None = None, answers_dir: Path | None = None) -> None:
     raw = yaml.safe_load(cfg_path.read_text()) or {}
     raw.setdefault("tasks", {})[task] = {
         "dir": str(task_dir.relative_to(cfg_path.parent)),
         "inputs": str(inputs), "answers": str(answers)}
+    if inputs_dir:
+        raw["tasks"][task]["inputs_dir"] = str(inputs_dir)
+    if answers_dir:
+        raw["tasks"][task]["answers_dir"] = str(answers_dir)
     save_yaml(cfg_path, raw)
 
 
@@ -216,6 +183,8 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
     local = cfg.backend == "local"
     failed = 0
     for a in ATTACKS:
+        if a.gpu_only and not t.contract.limits.gpus:
+            continue
         if a.container_only and local:
             if verbose:
                 print(f"  SKIP  {a.name:14s} {a.what} (local backend has no isolation)")
@@ -238,19 +207,52 @@ def _kb(bits: float) -> str:
     return f"{b:,.0f} bytes" if b < 1000 else f"{b / 1000:.1f} KB"
 
 
+def gpus_here() -> list[int]:
+    """Memory (GB) of each NVIDIA GPU on this machine; [] if none."""
+    if not shutil.which("nvidia-smi"):
+        return []
+    r = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                       capture_output=True, text=True)
+    return [int(x) // 1024 for x in r.stdout.split()] if r.returncode == 0 else []
+
+
+def hardware_problems(lim, root: Path) -> list[str]:
+    out = []
+    if lim.gpus:
+        mem = gpus_here()
+        if len(mem) < lim.gpus:
+            out.append(f"This task needs {lim.gpus} NVIDIA GPU(s); found {len(mem)}."
+                       + ("" if mem else " (If it has one, its driver may not be installed.)"))
+        elif lim.gpu_memory_gb and min(sorted(mem)[-lim.gpus:]) < lim.gpu_memory_gb:
+            out.append(f"This task needs {lim.gpu_memory_gb} GB of GPU memory; the GPU here has "
+                       f"{max(mem)} GB.")
+    if (shutil.disk_usage(root).free >> 30) < 20:
+        out.append("Less than 20 GB of disk is free; models need room to download.")
+    return out
+
+
+def disk_note(lim, root: Path) -> str | None:
+    """Advice (not a blocker): large models need room to cache."""
+    free_gb, want_gb = shutil.disk_usage(root).free >> 30, 2 * lim.max_bundle_gb
+    if free_gb < want_gb:
+        return (f"Note: {free_gb} GB of disk is free. Models for this task can be up to "
+                f"{lim.max_bundle_gb} GB, so about {want_gb} GB free is recommended.")
+    return None
+
+
 def _summary(c, n_rows: int) -> str:
+    from .prepare import describe_hidden, describe_inputs
     b = leakage.budget(c)
     lim = c.limits
     total = f", {lim.submissions_total} in total" if lim.submissions_total else ""
     worst = (f"at most ~{_kb(b.lifetime)} of information about your data, "
              f"across all {lim.submissions_total} evaluations"
              if b.lifetime else f"at most ~{b.per_submission:.0f} bits per evaluation")
-    hidden = [f.name for f in c.answers if f.name not in c.key]
     return "\n".join([
         f"  Task:                {c.title}",
         f"  Rows:                {n_rows:,}",
-        f"  The model will see:  {', '.join(f.name for f in c.inputs)}",
-        f"  Never shared:        {', '.join(hidden)}",
+        f"  The model will see:  {describe_inputs(c)}",
+        f"  Never shared:        {describe_hidden(c)}",
         f"  Evaluations:         at most {lim.submissions_per_day}/day per agent{total}",
         f"  What leaves:         only scores ({', '.join(m.name for m in c.metrics)}), "
         f"{c.decimals} decimals",
@@ -275,8 +277,7 @@ def cmd_connect(args) -> None:
 
     # 2. Node config, sandbox image and task files.
     if not cfg_path.exists():
-        cmd_init(argparse.Namespace(config=str(cfg_path), engine="auto", example=False,
-                                    force=False))
+        cmd_init(argparse.Namespace(config=str(cfg_path), engine="auto", force=False))
     cfg = Config.load(cfg_path)
     if cfg.backend in ENGINES and make_sandbox(cfg).image_id() == "missing":
         cmd_build_image(argparse.Namespace(config=str(cfg_path), from_url=f"{hub_url}/sandbox-image.tar"))
@@ -287,20 +288,33 @@ def cmd_connect(args) -> None:
             raise SystemExit("unexpected file in task package")
         (task_dir / name).write_text(text)
 
-    # 3. Their data: one file, split locally into what the model sees and the answers.
+    # 3. Their data (one table or a folder), split locally into what the model
+    #    sees and the answers.
     from .contract import Contract
-    df = _read_table(_user_path(args.data))
-    inputs, answers = _split_data(df, Contract.load(task_dir / "contract.yaml"),
-                                  root / "private_data" / task)
-    _bind_task(cfg_path, task, task_dir, inputs, answers)
-    cfg = Config.load(cfg_path)
-    problems = data_problems(cfg.tasks[task])
-    if problems:
-        print("\nThere's a problem with your data file:")
+    from .prepare import DataError, prepare
+    try:
+        inputs_dir, answers, n_rows = prepare(Contract.load(task_dir / "contract.yaml"),
+                                              _user_path(args.data), root / "private_data" / task)
+        _bind_task(cfg_path, task, task_dir, inputs_dir / "samples.parquet", answers, inputs_dir,
+                   answers.parent / "answers_files" if (answers.parent / "answers_files").exists() else None)
+        cfg = Config.load(cfg_path)
+        if problems := data_problems(cfg.tasks[task]):
+            raise DataError(problems)
+    except DataError as e:
+        print("\nThere's a problem with your data:")
+        for p in e.problems:
+            print(f"  • {p}")
+        raise SystemExit("\nFix it and run the same command again.")
+    print(f"✓ Your data looks good ({n_rows:,} rows)")
+
+    if problems := hardware_problems(cfg.tasks[task].contract.limits, root):
+        print("\nThis machine isn't quite ready for this task:")
         for p in problems:
             print(f"  • {p}")
-        raise SystemExit("\nFix the file and run the same command again.")
-    print(f"✓ Your data looks good ({len(df):,} rows)")
+        raise SystemExit("\nPlease send this message to BioModelBench; we'll help sort it out.")
+
+    if note := disk_note(cfg.tasks[task].contract.limits, root):
+        print(f"  {note}")
 
     # 4. Prove the sandbox holds on this machine, with this data.
     print("  Testing this machine's security (about a minute)...")
@@ -310,7 +324,7 @@ def cmd_connect(args) -> None:
     print("✓ Security self-test passed")
 
     # 5. Informed approval.
-    print("\n" + _summary(cfg.tasks[task].contract, len(df)) + "\n")
+    print("\n" + _summary(cfg.tasks[task].contract, n_rows) + "\n")
     if not args.yes and _ask("Approve and start? [y/N] ") not in ("y", "yes"):
             raise SystemExit("Not started. Nothing was shared. "
                              "Run the same command again whenever you're ready.")
@@ -415,10 +429,9 @@ def cmd_status(args) -> None:
     print(f"audit log   {n} entries, {msg}")
     counts = Store(cfg.state_dir).summary()
     for task in cfg.tasks:
-        if task != EXAMPLE:
-            c = counts.get(task, {})
-            print(f"task        {task}: {c.get('done', 0)} evaluated, "
-                  f"{c.get('queued', 0) + c.get('running', 0)} in progress")
+        c = counts.get(task, {})
+        print(f"task        {task}: {c.get('done', 0)} evaluated, "
+              f"{c.get('queued', 0) + c.get('running', 0)} in progress")
 
 
 def cmd_stop(args) -> None:
@@ -483,7 +496,7 @@ def cmd_check(args) -> None:
 
 def cmd_selftest(args) -> None:
     cfg = _cfg(args)
-    task = args.task or (EXAMPLE if EXAMPLE in cfg.tasks else next(iter(cfg.tasks), None))
+    task = args.task or next(iter(cfg.tasks), None)
     if task is None:
         print("no task connected yet; the self-test runs when you connect")
         return
@@ -496,19 +509,6 @@ def cmd_selftest(args) -> None:
         print(f"\n{failed} check(s) failed. Please send this output to BioModelBench.")
         sys.exit(1)
     print("\nall checks passed")
-
-
-def cmd_add_task(args) -> None:
-    cfg_path = Path(args.config).resolve()
-    dest = cfg_path.parent / "private_data" / args.task
-    dest.mkdir(parents=True, exist_ok=True)
-    inputs, answers = dest / "inputs.parquet", dest / "answers.parquet"
-    _read_table(_user_path(args.inputs)).to_parquet(inputs, index=False)
-    _read_table(_user_path(args.answers)).to_parquet(answers, index=False)
-    d = scaffold.add_task(args.task, cfg_path.parent / "tasks", inputs, answers,
-                          args.key, args.kind, args.target)
-    _bind_task(cfg_path, args.task, d, inputs, answers)
-    print(f"created {d}/contract.yaml and {d}/score.py")
 
 
 def cmd_eval(args) -> None:
@@ -548,32 +548,43 @@ def cmd_submit(args) -> None:
 
 
 def cmd_synth(args) -> None:
-    df = scaffold.synth_inputs(_load_public(args.contract), n=args.n)
-    df.to_parquet(args.out, index=False)
-    print(f"wrote {len(df)} synthetic rows to {args.out}")
+    from .prepare import synth_files
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    df = synth_files(_load_public(args.contract), args.n, out)
+    print(f"wrote a synthetic inputs folder to {out} ({len(df)} samples)")
 
 
 def cmd_dryrun(args) -> None:
     """Run predict + validate on synthetic inputs, unisolated, with full logs.
     For agents iterating on a bundle before spending a private evaluation."""
+    from .prepare import synth_files
     from .sandbox import LocalSandbox, Mount
     c = _load_public(args.contract)
     bundle = Path(args.bundle).resolve()
     with tempfile.TemporaryDirectory() as tmp:
-        inputs = Path(tmp) / "inputs.parquet"
-        scaffold.synth_inputs(c, n=args.n).to_parquet(inputs, index=False)
-        env = {"BMB_CONTRACT": json.dumps(c.public())}
+        inputs_dir = Path(tmp) / "inputs"
+        inputs_dir.mkdir()
+        synth_files(c, args.n, inputs_dir)
+        if c.data.include:
+            print("note: pass-through files are empty placeholders in a dry run: "
+                  + ", ".join(i["path"] for i in c.data.include), file=sys.stderr)
+        contract_file = Path(tmp) / "contract.json"
+        contract_file.write_text(json.dumps(c.public()))
+        inputs = inputs_dir / "samples.parquet"
+        cm = Mount("BMB_CONTRACT_FILE", contract_file, "")
+        env = {}
         lim = c.limits
         sb = LocalSandbox()
         r = sb.run(name="dryrun-predict", entry="predict", env=env, limits=lim,
-                   mounts=[Mount("BMB_BUNDLE", bundle, ""), Mount("BMB_INPUTS", inputs, "")],
+                   mounts=[Mount("BMB_BUNDLE", bundle, ""), Mount("BMB_INPUTS_DIR", inputs_dir, ""), cm],
                    timeout_s=lim.predict_timeout_s, stdout_cap=lim.max_predictions_mb << 20)
         sys.stderr.write(r.stderr)
         if r.exit_code != 0 or r.timed_out or r.stdout_overflow or not r.stdout:
             raise SystemExit(f"predict failed: exit={r.exit_code} timed_out={r.timed_out} "
                              f"overflow={r.stdout_overflow} bytes={len(r.stdout)}")
         v = sb.run(name="dryrun-validate", entry="validate", env=env, limits=lim,
-                   mounts=[Mount("BMB_INPUTS", inputs, "")], stdin=r.stdout,
+                   mounts=[Mount("BMB_INPUTS", inputs, ""), cm], stdin=r.stdout,
                    timeout_s=lim.validate_timeout_s, stdout_cap=lim.max_predictions_mb << 20)
         if v.exit_code != 0:
             sys.stderr.write(v.stderr)
@@ -595,7 +606,7 @@ def main(argv=None) -> None:
     # Providers
     p = sub.add_parser("connect", help="connect this machine using the code BioModelBench sent you")
     p.add_argument("code", help="XXXX-XXXX-XXXX, or https://<hub>/c/XXXX-XXXX-XXXX")
-    p.add_argument("--data", required=True, help="your data file (.csv, .tsv or .parquet)")
+    p.add_argument("--data", required=True, help="your data: one table (.csv, .tsv, .parquet) or a folder")
     p.add_argument("--hub", default=os.environ.get("BMB_HUB"), help=argparse.SUPPRESS)
     p.add_argument("--yes", action="store_true", help="approve without asking")
     p.add_argument("--no-service", action="store_true", help="don't install the background service")
@@ -609,7 +620,6 @@ def main(argv=None) -> None:
     # Setup and troubleshooting
     p = sub.add_parser("init", help="(setup) write config.yaml")
     p.add_argument("--engine", default="auto", choices=["auto", *ENGINES, "local"])
-    p.add_argument("--example", action="store_true", help="add a demo task with fake data")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)
     p = sub.add_parser("build-image", help="(setup) get or build the sandbox image")
@@ -630,14 +640,6 @@ def main(argv=None) -> None:
     p = sub.add_parser("audit", help="(troubleshoot) verify the audit log")
     p.add_argument("action", choices=["verify"])
     p.set_defaults(fn=cmd_audit)
-    p = sub.add_parser("add-task", help="(operator) create a task from data files, without the hub")
-    p.add_argument("task")
-    p.add_argument("--inputs", required=True)
-    p.add_argument("--answers", required=True)
-    p.add_argument("--key", required=True, nargs="+")
-    p.add_argument("--kind", default="regression", choices=sorted(scaffold.SCORERS))
-    p.add_argument("--target")
-    p.set_defaults(fn=cmd_add_task)
     p = sub.add_parser("contract", help="(operator) print a task's public contract")
     p.add_argument("task")
     p.set_defaults(fn=cmd_contract)
@@ -652,7 +654,7 @@ def main(argv=None) -> None:
     p.set_defaults(fn=cmd_submit)
     p = sub.add_parser("synth", help="(agent) synthetic inputs from a public contract")
     p.add_argument("contract")
-    p.add_argument("--out", default="synthetic_inputs.parquet")
+    p.add_argument("--out", default="synthetic_inputs")
     p.add_argument("-n", type=int, default=200)
     p.set_defaults(fn=cmd_synth)
     p = sub.add_parser("dryrun", help="(agent) run a bundle on synthetic inputs with full logs")

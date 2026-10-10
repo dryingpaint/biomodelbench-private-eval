@@ -1,0 +1,35 @@
+# TF prediction for cell-state transitions: a ranked list of TFs per query,
+# drawn from that query's permitted candidates. Shows: list outputs whose items
+# must come from an input column (in_input), and list answers.
+# Provider data: one table; candidates and true_tfs as JSON lists in CSV, e.g.
+#   candidates: ["ASCL1", "NEUROD1", ...]   true_tfs: {"tf": ["ASCL1", "BRN2"]}
+id: tf_ranking
+version: 1
+title: TF ranking for cell-state transitions (example)
+description: Rank the candidate TFs most likely to drive the source -> target transition.
+key: [query_id]
+inputs:
+  - {name: query_id, type: string}
+  - {name: source_state, type: string}
+  - {name: target_state, type: string}
+  - {name: candidates, type: any, description: "list of permitted TF symbols for this query"}
+outputs:
+  - name: ranking
+    type: list
+    max_items: 20
+    items:
+      - {name: tf, type: string, in_input: candidates}
+      - {name: score, type: float}
+answers:
+  - {name: query_id, type: string}
+  - name: true_tfs
+    type: list
+    max_items: 20
+    items:
+      - {name: tf, type: string}
+metrics:
+  - {name: ndcg_at_10, type: float, min: 0, max: 1, goal: max}
+  - {name: hit_at_5, type: float, min: 0, max: 1, goal: max}
+headline: ndcg_at_10
+export: {decimals: 3}
+limits: {submissions_per_day: 20, submissions_total: 200}

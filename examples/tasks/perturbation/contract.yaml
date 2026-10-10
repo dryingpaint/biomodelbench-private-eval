@@ -1,0 +1,30 @@
+# Genetic perturbation outcome: per-gene change in mean expression per query.
+# Shows: a vector over a public gene panel (genes.txt), answers given as one
+# column per gene, and a control-cell matrix passed to the model as-is.
+# Provider data: a folder with queries.csv (query_id, perturbed_gene, modality,
+# plus one column per gene in genes.txt holding the measured change) and
+# control_expression.npy (control cells x genes).
+id: perturbation
+version: 1
+title: Genetic perturbation response (example)
+description: Predict the change in normalized mean expression of each panel gene for each perturbation.
+key: [query_id]
+data:
+  samples: queries.csv
+  include:
+    - {path: control_expression.npy, shape: [200, 20], description: "control cells x panel genes, normalized"}
+inputs:
+  - {name: query_id, type: string}
+  - {name: perturbed_gene, type: string}
+  - {name: modality, type: string, allowed: [KO, CRISPRi, CRISPRa, OE]}
+outputs:
+  - {name: delta, type: vector, labels: genes.txt, min: -50, max: 50, description: predicted change per panel gene}
+answers:
+  - {name: query_id, type: string}
+  - {name: delta_true, type: vector, labels: genes.txt}
+metrics:
+  - {name: pearson_mean, type: float, nullable: true, min: -1, max: 1, goal: max}
+  - {name: mae, type: float, min: 0, max: 50, goal: min}
+headline: pearson_mean
+export: {decimals: 3}
+limits: {submissions_per_day: 10, submissions_total: 100}

@@ -16,9 +16,11 @@ PKG = Path(__file__).resolve().parent  # the bmb_eval package directory
 class TaskBinding:
     id: str
     dir: Path          # contract.yaml + score.py
-    inputs: Path       # private inputs parquet (model sees this)
+    inputs: Path       # samples table the model sees (parquet)
     answers: Path      # private answers parquet (only the scorer sees this)
     contract: Contract
+    inputs_dir: Path | None = None  # folder the model sees, holding inputs + its files
+    answers_dir: Path | None = None  # scorer-only files (data.private)
 
 
 @dataclass
@@ -33,6 +35,7 @@ class Config:
     webhook_url: str | None
     infra_failure_threshold: int
     retain_bundles: bool
+    cache_gb: int      # model-file cache size before least-recently-used files go
     hub: dict          # {url, node_id, secret} once connected; {} before
     tasks: dict[str, TaskBinding] = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
@@ -62,6 +65,7 @@ class Config:
             webhook_url=al.get("webhook_url"),
             infra_failure_threshold=int(al.get("infra_failure_threshold", 3)),
             retain_bundles=bool(raw.get("retain_bundles", False)),
+            cache_gb=int(raw.get("cache_gb", 300)),
             hub=dict(raw.get("hub") or {}),
             raw=raw,
         )
@@ -70,7 +74,9 @@ class Config:
             contract = Contract.load(d / "contract.yaml")
             if contract.id != tid:
                 raise SystemExit(f"task {tid!r}: contract id is {contract.id!r}")
-            cfg.tasks[tid] = TaskBinding(tid, d, rel(t["inputs"]), rel(t["answers"]), contract)
+            cfg.tasks[tid] = TaskBinding(tid, d, rel(t["inputs"]), rel(t["answers"]), contract,
+                                         rel(t["inputs_dir"]) if t.get("inputs_dir") else None,
+                                         rel(t["answers_dir"]) if t.get("answers_dir") else None)
         if cfg.backend not in ("docker", "podman", "local"):
             raise SystemExit("sandbox.backend must be docker, podman or local")
         if cfg.backend == "local" and not cfg.allow_unisolated:

@@ -1,0 +1,29 @@
+# H&E to transcriptomics: expression of a gene panel at each spot, from an
+# image patch. Shows: file inputs (one .npy patch per spot) and vector output.
+# Provider data: a folder with spots.csv (spot_id, slide, x, y, patch = path to
+# the spot's patch inside the folder, plus one column per panel gene) and the
+# patch files.
+id: he_spatial
+version: 1
+title: H&E to spatial expression (example)
+description: Predict normalized expression of each panel gene at each spot from its H&E patch.
+key: [spot_id]
+data:
+  samples: spots.csv
+inputs:
+  - {name: spot_id, type: string}
+  - {name: slide, type: string}
+  - {name: x, type: float}
+  - {name: y, type: float}
+  - {name: patch, type: file, format: npy, shape: [32, 32, 3], description: "RGB patch, float32 in [0,1]"}
+outputs:
+  - {name: expr, type: vector, labels: [EPCAM, KRT8, VIM, PTPRC, COL1A1], min: -20, max: 20}
+answers:
+  - {name: spot_id, type: string}
+  - {name: expr_true, type: vector, labels: [EPCAM, KRT8, VIM, PTPRC, COL1A1]}
+metrics:
+  - {name: pearson_per_gene_mean, type: float, nullable: true, min: -1, max: 1, goal: max}
+  - {name: mae, type: float, min: 0, max: 20, goal: min}
+headline: pearson_per_gene_mean
+export: {decimals: 3}
+limits: {submissions_per_day: 5, submissions_total: 50, predict_timeout_s: 7200}

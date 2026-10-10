@@ -1,4 +1,4 @@
-"""Example bundle for the example_regression task.
+"""Example bundle for the sequence_regression task.
 
 A bundle is a directory (sent as .tar.gz) containing:
     predict.py   required: predict(df) -> DataFrame or list, one row per input row

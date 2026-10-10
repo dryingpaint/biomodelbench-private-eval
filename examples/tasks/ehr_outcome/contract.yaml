@@ -1,0 +1,37 @@
+# Longitudinal clinical outcome: cumulative risk at 30/90/365 days per patient.
+# Shows: a folder of data (patients table + an events table passed to the model
+# as-is), and a fixed-length vector output.
+# Provider data: a folder with patients.csv (columns below) and events.parquet
+# (patient_id, day, code: all events before each patient's index day).
+id: ehr_outcome
+version: 1
+title: Clinical outcome risk (example)
+description: >
+  For each patient, predict the cumulative risk of the outcome within 30, 90 and
+  365 days after the index day. Pre-index events are in events.parquet.
+key: [patient_id]
+data:
+  samples: patients.csv
+  include:
+    - path: events.parquet
+      description: "pre-index events, one row per event"
+      fields:
+        - {name: patient_id, type: string}
+        - {name: day, type: int, min: 0, max: 3650}
+        - {name: code, type: string, allowed: [I10, E11, N18, J45]}
+inputs:
+  - {name: patient_id, type: string}
+  - {name: index_day, type: int, description: day number of the prediction time}
+  - {name: age, type: int, min: 0, max: 120}
+outputs:
+  - {name: risk, type: vector, labels: [d30, d90, d365], min: 0, max: 1, description: cumulative risk by horizon}
+answers:
+  - {name: patient_id, type: string}
+  - {name: followup_days, type: float}
+  - {name: had_event, type: int, allowed: [0, 1]}
+metrics:
+  - {name: brier, type: float, min: 0, max: 1, goal: min, per: [d30, d90, d365]}
+  - {name: brier_mean, type: float, min: 0, max: 1, goal: min}
+headline: brier_mean
+export: {decimals: 3}
+limits: {submissions_per_day: 5, submissions_total: 50, release_after_s: 3000}

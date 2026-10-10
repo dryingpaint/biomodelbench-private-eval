@@ -99,6 +99,9 @@ returns your most extreme label directly.
 | Encode data in timing | `release_after_s` hides results until a fixed time | `store.py` | Open unless configured; counted in the budget |
 | Exploit the predictions parser next to the answers | Untrusted parquet is parsed in a separate validate sandbox **without answers**; the scorer only loads plain numpy arrays (`allow_pickle=False`) | `sandbox_entry/validate.py` | Exploiting the validator gains nothing it could not already do |
 | Fill the provider's disk or memory | tmpfs and memory caps, pid limit, capped stdout, `--log-driver none` (Docker's default would copy stdout, possibly containing private data, to `/var/lib/docker`) | `sandbox.py` | None known |
+| Malicious bundle manifest (paths like `../`, absolute paths, huge sizes) | Manifests are validated before any download; only regular files at safe relative paths; size cap per task | `blobs.py` | None known |
+| Tampered model files (in storage or in transit) | Every file is checked against its sha256 before entering the node's cache; a mismatch rejects the submission | `blobs.py` | None known |
+| One agent planting a bad file under another's hash | Hub storage is per agent; nodes verify hashes anyway | `hub.py` | None known |
 | Tar tricks (symlinks, `..`, devices, decompression bombs) | Rejected before extraction; "data" extraction filter | `bundle.py` | None known |
 | Fork bomb, CPU exhaustion | `--pids-limit`, `--cpus`, timeouts | `sandbox.py` | None known |
 | Covert channel between concurrent runs | One run at a time | `node.py` | None known |
@@ -109,6 +112,8 @@ returns your most extreme label directly.
 | Stolen agent token | Hashed at rest on the hub; per-agent daily quota and global lifetime cap enforced **on the node** | `hub.py`, `node.py` | Rotate tokens |
 | Attack on the provider's network | The node opens no ports; it only makes outbound HTTPS calls to the hub | `node.py` | None known |
 | Compromised hub | The hub never holds provider data. It can send hostile bundles, which every bundle is assumed to be anyway. It cannot change a task's contract or scorer after the provider approves: the node keeps its own copy under the approval lock, and quotas, release timing and the output gate all run on the node | `node.py`, `approval.py` | A hub could hand a *new* provider a hostile scorer at connect time. That scorer still runs sandboxed and gated, so it can leak no more than the budget shown at approval |
+| Per-group metrics multiply leakage | Each group is a separately bounded metric, and the budget counts every one | `contract.py`, `leakage.py` | Operators must keep group counts small |
+| A file column pointing at the answers | File paths must stay inside the data folder and may not name the samples table; only listed columns and files are linked into the model's folder | `prepare.py` | A provider could put answers inside a pass-through file themselves; the approval summary lists every file the model will see |
 | Node running on the provider's main data server | Same sandbox; only the task's two files are mounted | `sandbox.py` | A container escape would reach everything that account can read. Use gVisor, or a dedicated account or VM |
 
 `bmb-eval selftest` runs the first half of this table as real attack bundles

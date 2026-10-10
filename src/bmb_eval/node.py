@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 
 from . import alerts, approval, audit
+from .blobs import BlobCache, check_manifest
 from .config import Config
 from .errors import EvalError
 from .runner import Runner
@@ -86,8 +87,17 @@ class HubAPI:
     def next(self) -> dict | None:
         return self._req("GET", "/v1/node/next")
 
-    def bundle(self, sid: str, cap: int) -> bytes:
-        return self._req("GET", f"/v1/node/bundles/{sid}", raw=True, cap=cap)
+    def download(self, info: dict, cache: BlobCache, sha: str, size: int) -> None:
+        """Fetch one model file (signed storage URL, or the hub itself) into the cache."""
+        headers = dict(info.get("headers") or {})
+        if info.get("auth"):
+            headers["Authorization"] = f"Bearer {self.secret}"
+        req = urllib.request.Request(info["url"], headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                cache.put(sha, size, r.read)
+        except (urllib.error.URLError, OSError) as e:
+            raise HubError(f"download failed: {e}")
 
     def result(self, sid: str, payload: dict) -> None:
         self._req("POST", f"/v1/node/results/{sid}", payload)
@@ -105,18 +115,24 @@ class Worker:
         self.api = api or HubAPI(cfg.hub["url"], cfg.hub["secret"])
         self.store = Store(cfg.state_dir)
         self.runner = Runner(cfg, store=self.store)
-        self.queue_dir = cfg.state_dir / "queue"
+        self.queue_dir = cfg.state_dir / "queue"      # one <id>.json per job held locally
         self.queue_dir.mkdir(exist_ok=True)
+        self.cache = BlobCache(cfg.state_dir / "blobs")
         self._last_hello = 0.0
         self._hub_failures = 0
         self._unapproved_alerted = False
+        self._accepting = (0.0, False)
 
     # ------------------------------------------------------------- gates
 
     def accepting(self) -> bool:
         if paused_path(self.cfg).exists():
             return False
+        checked, ok = self._accepting
+        if time.time() - checked < 30:
+            return ok
         drift = approval.diff(self.cfg)
+        self._accepting = (time.time(), not drift)
         if drift and not self._unapproved_alerted:
             alerts.send(self.cfg, "config", "configuration differs from what you approved; "
                         "no new work until you run `bmb-eval approve`", changes=len(drift))
@@ -130,7 +146,7 @@ class Worker:
         did = False
         accepting = self.accepting()
         if time.time() - self._last_hello > HELLO_S:
-            held = [p.name.removesuffix(".tar.gz") for p in self.queue_dir.glob("*.tar.gz")]
+            held = [p.stem for p in self.queue_dir.glob("*.json")]
             self.api.hello({t: b.contract.public() for t, b in self.cfg.tasks.items()},
                            accepting, held)
             self._last_hello = time.time()
@@ -185,38 +201,53 @@ class Worker:
             return
         t = self.cfg.tasks.get(task)
         lim = t.contract.limits if t else None
-        refusal = None
+        refusal, files = None, []
         if t is None:
             refusal = EvalError("task_unknown")
         elif self.store.count_today(submitter, task) >= lim.submissions_per_day or (
                 lim.submissions_total and self.store.count_total(task) >= lim.submissions_total):
             refusal = EvalError("quota_exceeded")
+        else:
+            try:
+                files = check_manifest(job.get("manifest"), lim.max_bundle_gb << 30)
+                # Fetch only what this machine hasn't cached. A network failure
+                # raises HubError before anything is recorded, so the hub
+                # re-queues the job and it is retried later.
+                fetched = 0
+                for f in {f["sha256"]: f for f in files}.values():
+                    if not self.cache.has(f["sha256"], f["size"]):
+                        self.api.download(job["downloads"][f["sha256"]], self.cache,
+                                          f["sha256"], f["size"])
+                        fetched += f["size"]
+            except EvalError as e:   # bad manifest, or a file that fails its hash
+                refusal = e
         if refusal:
             # Data-independent refusal: answer immediately, never run anything.
             self.store.add(sid, task, submitter, 0)
             self.store.finish(sid, {"run_id": sid, "task": task, "status": "error",
                                     "error": refusal.public()})
             return
-        try:
-            data = self.api.bundle(sid, lim.max_bundle_mb << 20)
-        except EvalError as e:
-            self.store.add(sid, task, submitter, 0)
-            self.store.finish(sid, {"run_id": sid, "task": task, "status": "error",
-                                    "error": e.public()})
-            return
-        (self.queue_dir / f"{sid}.tar.gz").write_bytes(data)
+        (self.queue_dir / f"{sid}.json").write_text(json.dumps(
+            {"files": files, "bundle_id": job.get("bundle_id")}))
         self.store.add(sid, task, submitter, lim.release_after_s)
         audit.record(self.cfg.state_dir, "job_received", run_id=sid, task=task,
-                     submitter=submitter, bytes=len(data))
+                     submitter=submitter, bundle_id=job.get("bundle_id"),
+                     bytes=sum(f["size"] for f in files), downloaded=fetched)
         self.store.start(sid)
         self._run(sid, task, submitter)
 
     def _run(self, sid: str, task: str, submitter: str) -> None:
-        path = self.queue_dir / f"{sid}.tar.gz"
+        path = self.queue_dir / f"{sid}.json"
         try:
-            result = self.runner.evaluate(task, path.read_bytes(), run_id=sid, submitter=submitter)
+            job = json.loads(path.read_text())
+            if not all(self.cache.has(f["sha256"], f["size"]) for f in job["files"]):
+                raise EvalError("infra_error", internal="cached files missing")
+            bundle = self.cache.assemble(job["files"], self.cfg.state_dir / "runs" / sid / "bundle")
+            result = self.runner.evaluate(task, bundle, run_id=sid, submitter=submitter,
+                                          bundle_id=job.get("bundle_id"))
         except Exception as e:
             audit.record(self.cfg.state_dir, "worker_error", run_id=sid, error=type(e).__name__)
             result = {"run_id": sid, "status": "error", "error": EvalError("infra_error").public()}
         self.store.finish(sid, result)
         path.unlink(missing_ok=True)
+        self.cache.evict(self.cfg.cache_gb << 30)

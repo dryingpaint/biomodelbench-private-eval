@@ -1,78 +1,112 @@
-# Running the hub (BioModelBench team)
+# Operating BioModelBench evaluation (BioModelBench team)
 
-The hub is the only service we run. Agents submit models to it. Provider nodes
-connect *out* to it, collect work, and post back gated scores. It never
-receives provider data.
+## Why we run a hub
 
-## Deploy once
+Providers' machines can't accept incoming connections, and agents can't be
+pointed at dozens of separate provider machines. The hub sits in between:
+agents give it models, and each provider's node reaches out to collect work
+and return scores. So providers open no ports, and we have one place to issue
+connect codes, keep multi-GB models (in Cloud Storage), and serve the
+installer. It never receives provider data, and it can't change what a
+provider approved.
 
-Any small Linux server works (1 CPU, 2 GB RAM, disk for queued bundles).
+## Bring up the hub (once, about 30 minutes)
 
-```bash
-git clone https://github.com/dryingpaint/biomodelbench-private-eval bmb-eval && cd bmb-eval
-uv venv && uv pip install -e .
-bmb-hub --state hub_state serve --port 8790 --public-url https://hub.biomodelbench.org
-```
-
-Put TLS in front, for example with Caddy:
-`caddy reverse-proxy --from hub.biomodelbench.org --to 127.0.0.1:8790`.
-Run both as services. Back up `hub_state/hub.db`.
-
-The hub serves providers the install script, the guide (`/guide`), and a
-tarball of *this checkout's* code. It packs the tarball at startup, so restart
-the hub after pulling new code.
-
-**Prebuilt sandbox image (recommended).** This makes installs faster and lets
-them work on networks that block package downloads:
+Needs: the `gcloud` CLI logged in to our Google Cloud project. A domain is
+optional.
 
 ```bash
-podman build -t bmb-eval-sandbox:latest -f sandbox/Dockerfile .
-podman save -o hub_state/sandbox-image.tar bmb-eval-sandbox:latest
+git clone https://github.com/dryingpaint/biomodelbench-private-eval && cd biomodelbench-private-eval
+deploy/gcp/hub-setup.sh                     # or: deploy/gcp/hub-setup.sh eval.<our-domain>
 ```
 
-Without it, each provider builds the image locally, which takes about 10
-minutes and needs access to PyPI and Docker Hub.
+This creates:
+- a Cloud Storage bucket for model files (each kept 30 days);
+- a service account that can sign download links;
+- a static IP and HTTPS firewall rule;
+- an `e2-standard-2` VM that installs the hub on boot, builds the sandbox image
+  providers download, and runs behind Caddy (which gets the HTTPS certificate
+  automatically).
+
+Without a domain, the hub is reachable at `https://<ip-with-dashes>.sslip.io`,
+a free DNS name that points at the IP, with a real certificate. With a domain,
+add the DNS record the script prints.
+
+About 15 minutes after the first boot, `curl -fsS https://<hub>/install.sh |
+head -3` prints the installer.
+
+**Cost:** the VM is about $50/month. Storage and downloads are a few cents per
+GB, and caching on providers' machines means a shared base model is downloaded
+once per provider.
+
+**Updating:** push to the repo, then
+`gcloud compute instances reset bmb-hub --zone us-central1-a`. On boot the VM
+pulls the code, rebuilds the sandbox image if it changed, and restarts.
+Providers get updates by re-running the install command without arguments;
+their node pauses until they approve the new version.
+
+**Backups:** `/home/bmb/hub_state/hub.db` on the VM (tokens, codes, queue,
+results). Snapshot the VM's disk on a schedule.
+
+## Admin commands
+
+Run from your laptop; they execute on the hub VM:
+
+```bash
+deploy/gcp/hub agent-token claude-run-17                  # prints the agent's token once
+deploy/gcp/hub enroll examples/tasks/sequence_regression  # prints the provider email
+deploy/gcp/hub status                                     # nodes, tasks, queue, codes
+```
 
 ## Onboard a provider
 
-1. **Agree on the task.** Ask the five questions in `docs/PROVIDER_INTAKE.md`.
-2. **Write the task.** Use the column names from their data file:
-   ```bash
-   bmb-hub new-task binding_affinity --key variant_id \
-       --inputs variant_id:string,sequence:string --target kd:float --kind regression
-   ```
-   Edit `tasks/binding_affinity/contract.yaml`: title, descriptions, limits.
-   Run `bmb-eval dryrun` against the public contract with a reference bundle
-   to check the scorer.
-3. **Make a connect code.** This prints the complete email: one command, plus
-   the columns their file needs:
-   ```bash
-   bmb-hub enroll tasks/binding_affinity --public-url https://hub.biomodelbench.org
-   ```
+1. **Ask the five questions** in `docs/PROVIDER_INTAKE.md`.
+2. **Write their task.** Copy the closest template from `examples/tasks/` into
+   a new folder, and edit `contract.yaml` and `score.py` to match their data.
+   Each template has a contract, a scorer and a working example model:
+
+   | Benchmark task | Template | What it shows |
+   |---|---|---|
+   | Property prediction, toxicity, VEP | `property_prediction` | One value per row; one metric per endpoint |
+   | Clinical outcome (EHR), tissue state from blood | `ehr_outcome` | Folder with a patients table plus an events table; risk vector per patient |
+   | Genetic perturbation | `perturbation` | Gene-panel vector (`genes.txt`); answers as one column per gene; control matrix passed through |
+   | H&E to transcriptomics | `he_spatial` | One image file per spot; expression vector per spot |
+   | MS/MS peak prediction | `msms_peaks` | Variable-length peak list per spectrum |
+   | TF prediction | `tf_ranking` | Ranked list restricted to each query's candidates |
+   | Anything with one table and one target | `sequence_regression` | The simplest case |
+
+   The contract language (documented at the top of `src/bmb_eval/contract.py`):
+   - Field types: `string`, `int`, `float`, `bool`, `vector` (fixed length or
+     `labels`), `list` (records, `max_items`), and for inputs only `file` and
+     `any`.
+   - `data.samples` names the samples table in a folder; `data.include` lists
+     files the model gets; `data.private` lists files only the scorer gets
+     (answers in any format).
+   - `per` on a metric reports it per group.
+   - `limits` sets time, memory, GPUs (`gpus`, `gpu_memory_gb`), bundle size
+     and evaluation caps.
+3. **Check it with fake data:** save the public contract (`Contract.load(...).public()`
+   as JSON), then run `bmb-eval dryrun contract.json <template>/bundle`.
+4. **Enroll:** `deploy/gcp/hub enroll <task folder>` prints the email. Send it.
    A code works once, and is only used up when the provider approves.
-4. **Watch it come online:** `bmb-hub status`.
+5. **Watch it come online:** `deploy/gcp/hub status`.
 
 Changing a live task's contract or scorer means sending a new code for a new
 task version. The node holds its own copy under the provider's approval lock,
 so the hub cannot change it remotely.
 
-## Agents
-
-```bash
-bmb-hub agent-token claude-run-17        # prints the token once
-```
-
-Agents use `bmb_eval.client.Client(hub_url, token)`: see the README.
-
-## Defaults worth deciding per task
+## Settings worth deciding per task
 
 | Setting | Default | Trade-off |
 |---|---|---|
 | `limits.submissions_total` | 200 | Lifetime leakage scales with it |
 | `limits.submissions_per_day` | 20 | Per agent |
-| `limits.release_after_s` | 0 | ≥ total timeout removes the timing channel but slows feedback |
+| `limits.release_after_s` | 0 | Setting it at or above the total timeout removes the timing channel, but slows feedback |
+| `limits.gpus`, `gpu_memory_gb` | 0 | Large models need a GPU at the provider; connect checks the GPU is big enough |
+| `limits.max_bundle_gb` | 64 | Provider needs about 2× this much free disk |
 | `export.decimals` | 3 | Each decimal ≈ 3.3 bits per metric per evaluation |
 | `export.ladder_step` | off | Turn on for "final" tasks |
+| metric `per: [...]` | none | Every group adds a full metric to the leakage budget |
 
 Recommended: a `dev` task with frequent feedback, plus a `final` task on
 separate held-out rows with `submissions_total` of 1–5.

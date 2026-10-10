@@ -1,7 +1,7 @@
 """Runs INSIDE the predict sandbox, alongside untrusted bundle code.
 
-Sees: the bundle (read-only), the private inputs file (read-only). Never
-sees answers. No network. No writable host path.
+Sees: the bundle and the task's inputs folder (both read-only). Never sees
+answers. No network. No writable host path.
 
 Predictions leave as parquet bytes on the original stdout; fd 1 is pointed
 at stderr before bundle code loads, so the bundle's prints go to the
@@ -9,13 +9,18 @@ provider-only log. Nothing this process emits is trusted: the controller
 caps stdout bytes, re-validates them in a separate sandbox, and maps the
 exit code onto a fixed enum.
 
-    BMB_BUNDLE    dir containing predict.py
-    BMB_INPUTS    inputs.parquet
-    BMB_CONTRACT  public contract JSON (string)
+    BMB_BUNDLE         dir containing predict.py
+    BMB_INPUTS_DIR     inputs folder: samples.parquet plus any files the task provides
+    BMB_INPUTS         (alternative) path to the samples table when there is no folder
+    BMB_CONTRACT_FILE  public contract JSON
+
+predict.py may define predict(df) or predict(df, inputs_dir), and optionally
+load_model() or load_model(inputs_dir). File columns arrive as absolute paths.
 """
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -65,6 +70,15 @@ def _install_wheels(bundle: Path) -> None:
     sys.path.insert(0, str(target))
 
 
+def _call(fn, *args):
+    """Call fn with as many of args as it accepts (so predict(df) still works)."""
+    try:
+        n = len(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        n = len(args)
+    return fn(*args[:n])
+
+
 def main() -> None:
     pred_out = os.fdopen(os.dup(1), "wb")
     os.dup2(2, 1)
@@ -73,11 +87,13 @@ def main() -> None:
     import pandas as pd
 
     bundle = Path(os.environ["BMB_BUNDLE"])
-    inputs_path = Path(os.environ["BMB_INPUTS"])
-    contract = json.loads(os.environ["BMB_CONTRACT"])
+    inputs_dir = Path(os.environ["BMB_INPUTS_DIR"]) if os.environ.get("BMB_INPUTS_DIR") else None
+    inputs_path = Path(os.environ.get("BMB_INPUTS") or inputs_dir / "samples.parquet")
+    contract = json.loads(Path(os.environ["BMB_CONTRACT_FILE"]).read_text())
     key = contract["key"]
     output_names = [f["name"] for f in contract["outputs"]]
     input_names = [f["name"] for f in contract["inputs"]]
+    file_cols = [f["name"] for f in contract["inputs"] if f["type"] == "file"]
     batch_size = int(contract.get("prediction", {}).get("batch_size", 1024))
 
     _seed()
@@ -92,17 +108,19 @@ def main() -> None:
         if not callable(getattr(module, "predict", None)):
             raise AttributeError("predict.py defines no predict()")
         if callable(getattr(module, "load_model", None)):
-            module.load_model()
+            _call(module.load_model, inputs_dir)
     except BaseException:
         traceback.print_exc()
         sys.exit(EXIT_IMPORT)
 
     inputs = pd.read_parquet(inputs_path, columns=input_names)
+    for c in file_cols:
+        inputs[c] = inputs[c].map(lambda p: str(inputs_dir / p) if isinstance(p, str) else p)
     parts = []
     try:
         for start in range(0, len(inputs), batch_size):
             batch = inputs.iloc[start:start + batch_size].reset_index(drop=True)
-            res = module.predict(batch.copy())
+            res = _call(module.predict, batch.copy(), inputs_dir)
             if isinstance(res, pd.DataFrame):
                 res = res.reset_index(drop=True)
                 missing = [c for c in output_names if c not in res.columns]

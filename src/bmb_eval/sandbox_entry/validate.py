@@ -6,8 +6,8 @@ public output contract and the input keys, and writes canonical predictions
 nothing: the sandbox holds no answers, and its only outputs are an
 enumerated rejection or arrays the bundle could have produced anyway.
 
-    BMB_INPUTS    inputs.parquet (only key columns are read)
-    BMB_CONTRACT  public contract JSON (string)
+    BMB_INPUTS         samples table (only key and candidate columns are read)
+    BMB_CONTRACT_FILE  public contract JSON
 
 Exit 0: stdout is canonical predictions.
 Exit 3: stdout is {"column": ..., "reason": ...} JSON.
@@ -26,11 +26,16 @@ def main() -> None:
     import pandas as pd
     import pyarrow.parquet as pq
 
-    from bmb_eval.contract import Contract, invalid, to_canonical, validate_predictions
+    from pathlib import Path
+
+    from bmb_eval.contract import (Contract, candidate_columns, invalid, to_canonical,
+                                   validate_predictions)
     from bmb_eval.errors import EvalError
 
-    contract = Contract.from_dict(json.loads(os.environ["BMB_CONTRACT"]), public=True)
-    input_keys = pd.read_parquet(os.environ["BMB_INPUTS"], columns=contract.key)
+    contract = Contract.from_dict(json.loads(Path(os.environ["BMB_CONTRACT_FILE"]).read_text()),
+                                  public=True)
+    input_keys = pd.read_parquet(os.environ["BMB_INPUTS"],
+                                 columns=contract.key + candidate_columns(contract))
     data = sys.stdin.buffer.read()
     key = ",".join(contract.key)
     try:
@@ -41,7 +46,7 @@ def main() -> None:
                 raise invalid(key, "unexpected_keys")
             if pf.metadata.num_rows < len(input_keys):
                 raise invalid(key, "missing_keys")
-            if pf.metadata.num_columns > len(contract.key) + len(contract.outputs):
+            if len(pf.schema_arrow) > len(contract.key) + len(contract.outputs):
                 raise invalid("*", "unexpected_column")
             preds = pf.read().to_pandas()
         except EvalError:

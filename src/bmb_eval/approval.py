@@ -40,12 +40,27 @@ def _dir_hash(d: Path, pattern: str = "*") -> str:
     return h.hexdigest()
 
 
+def _tree_hash(d: Path) -> str:
+    """Hash of a data folder: per-file hashes are cached by (path, mtime, size),
+    so re-checking a large image folder costs one stat per file."""
+    if not d.exists():
+        return "missing"
+    h = hashlib.sha256()
+    for p in sorted(d.rglob("*")):
+        if p.is_file():
+            h.update(str(p.relative_to(d)).encode())
+            h.update(_file_hash(p).encode())
+    return h.hexdigest()
+
+
 def fingerprint(cfg: Config) -> dict:
     tasks = {}
     for tid, t in sorted(cfg.tasks.items()):
         tasks[tid] = {
             "contract": _file_hash(t.dir / "contract.yaml"),
             "task_dir": _dir_hash(t.dir),  # scorer and anything it imports
+            "inputs_dir": _tree_hash(t.inputs_dir) if t.inputs_dir else None,
+            "answers_dir": _tree_hash(t.answers_dir) if t.answers_dir else None,
             "inputs": _file_hash(t.inputs) if t.inputs.exists() else "missing",
             "answers": _file_hash(t.answers) if t.answers.exists() else "missing",
         }

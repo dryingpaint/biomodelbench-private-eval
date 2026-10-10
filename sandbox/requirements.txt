@@ -1,8 +1,15 @@
-# Sandbox packages. Pin exact versions (`uv pip compile`) before production so
-# that image rebuilds are reproducible.
+# What submitted models can import without shipping wheels. Pin exact versions
+# (`uv pip compile`) before production so image rebuilds are reproducible.
 numpy>=1.26
 pandas>=2.2
 pyarrow>=15
 scipy>=1.12
 scikit-learn>=1.4
 pyyaml>=6
+torch>=2.4            # standard wheel: CUDA included, runs on CPU too
+transformers>=4.44
+safetensors>=0.4
+accelerate>=0.33
+peft>=0.12            # LoRA adapters on top of a base model
+anndata>=0.10         # .h5ad single-cell data
+pillow>=10            # images

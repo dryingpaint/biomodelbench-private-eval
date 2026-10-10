@@ -5,22 +5,26 @@ them on your data and sends back only the scores. Your data never leaves.
 
 ## What you need
 
-- **A Linux machine that stays on**, with 4 CPUs and 16 GB RAM. The server
-  your data is already on is ideal. If you don't have one, see
+- **A Linux machine that stays on.** The server your data is already on is
+  ideal. Our email says what it needs: CPU-only tasks need 4 CPUs, 16 GB RAM
+  and 150 GB free disk. Tasks with large models also need an NVIDIA GPU, 64 GB
+  RAM and about 300 GB free disk. If you don't have a suitable machine, see
   [Getting a Linux machine](#getting-a-linux-machine).
-- **Your data as one file** (CSV is fine). Our email lists the columns it
-  needs. Extra columns are fine; they're ignored.
+- **The data you described to us**, as one file or one folder, in whatever
+  format it's already in.
 
 ## The one step
 
 Run the command from our email on that machine:
 
 ```bash
-curl -fsSL https://<hub>/install.sh | sh -s -- XXXX-XXXX-XXXX --data your_data.csv
+curl -fsSL https://<hub address>/install.sh | sh -s -- <your code> --data /path/to/your/data
 ```
 
-It takes about 10 minutes and may ask for your password once. At the end it
-shows you exactly what you're agreeing to:
+It takes about 15 minutes and may ask for your password once. It installs
+what's needed (including GPU support if the machine has an NVIDIA GPU), checks
+your data, tests its own security, and then shows you exactly what you're
+agreeing to:
 
 ```
 ✓ Your data looks good (4,812 rows)
@@ -39,8 +43,9 @@ Approve and start? [y/N]
 Type `y`. **You're done.** It runs in the background and restarts after
 reboots.
 
-If something is wrong with your file, it says what (for example, *"It has no
-column 'sequence'"*). Fix the file and run the same command again.
+If something needs fixing, it says what (for example, *"It has no column
+'sequence'"*, or *"This task needs 40 GB of GPU memory; the GPU here has 24
+GB"*). Fix it and run the same command again.
 
 ## If you ever need to
 
@@ -53,47 +58,61 @@ column 'sequence'"*). Fix the file and run the same command again.
 ## Getting a Linux machine
 
 Only needed if the machine your data is on isn't suitable (for example, it's
-Windows or a laptop).
+Windows, a laptop, or has no GPU for a large-model task).
 
 **Ask your IT or research computing group.** You can forward this:
 
 > Please create a Linux VM for an external benchmarking collaboration:
-> Ubuntu 24.04 LTS · 4 vCPUs · 16 GB RAM · 50 GB disk plus the size of the
-> dataset · outbound HTTPS allowed · no inbound ports needed · one user
-> account with sudo. It needs to run continuously for [benchmark duration].
+> Ubuntu 24.04 LTS · 4 vCPUs · 16 GB RAM · 150 GB disk plus the size of the
+> dataset (for large-model tasks: one NVIDIA GPU with the memory BioModelBench
+> specified, 64 GB RAM, 300 GB disk) · outbound HTTPS allowed · no inbound
+> ports · one user account with sudo. It needs to run continuously for
+> [benchmark duration].
 
-**Or use your own cloud account** (AWS, Google Cloud or Azure), if your data
-is already there. Create an Ubuntu 24.04 VM with 4 CPUs and 16 GB RAM (roughly
-$100–150/month), block all inbound traffic except SSH, and copy your file onto
-it.
+**Or use your own Google Cloud, AWS or Azure account**, if your data is
+already there. Create an Ubuntu 24.04 VM of the size above, block all inbound
+traffic except SSH, and copy your data onto it. For a GPU on Google Cloud, a
+`g2-standard-16` machine (one NVIDIA L4, 24 GB) with Google's "Deep Learning
+VM" image comes with GPU drivers installed. Use an `a2` machine (A100) for
+tasks needing more GPU memory.
 
 ## FAQ for your IT team
 
-**Network?** Outbound HTTPS only, to the BioModelBench hub (plus package
-downloads during install). No inbound ports, no web server, no firewall changes.
+**Network?** Outbound HTTPS only: to the BioModelBench hub address, to
+`storage.googleapis.com` (where models are downloaded from), and during
+install to package mirrors (Ubuntu/Red Hat, PyPI, NVIDIA). No inbound ports,
+no web server, no firewall changes.
 
 **What leaves the machine?** Only scores like
 `{"spearman": 0.712, "pearson": 0.731, "rmse": 0.193}`, or a fixed error code
 such as `predict_timeout`. Never data, logs, error messages or predictions.
 
 **What's installed?** Podman (container software from your OS's own package
-repository) and the evaluator, into `~/bmb-eval`. Nothing else system-wide.
+repository), on GPU machines the NVIDIA container toolkit, and the evaluator
+in `~/bmb-eval`. Nothing else system-wide.
 
 **How is the model's code contained?** Each model runs in a locked-down
-container: no network, read-only filesystem, no access to the answer column,
-and strict memory, CPU and time limits. Your data is split locally: the model
-only ever receives the columns listed as "The model will see". Setup attacks
-its own sandbox before anything runs and stops if any attack succeeds. The
-full list of protections is in `docs/THREAT_MODEL.md` in `~/bmb-eval`.
+container: no network, read-only filesystem, no access to the answers, and
+strict memory, CPU and time limits. Your data is split locally: the model only
+ever receives the columns and files listed as "The model will see" (large
+files are hard-linked, not copied). Setup attacks its own sandbox before
+anything runs, and stops if any attack succeeds. Downloaded model files are
+checked against their hashes. The full list of protections is in
+`~/bmb-eval/docs/THREAT_MODEL.md`.
 
-**Extra protection on a shared server:** install [gVisor](https://gvisor.dev),
-set `sandbox.runtime: runsc` in `~/bmb-eval/config.yaml`, then run
-`~/bmb-eval/bmb-eval selftest` and `~/bmb-eval/bmb-eval approve`.
+**Disk use?** Downloaded models are cached in `~/bmb-eval/state/blobs` (up to
+300 GB by default, oldest removed first), so a model reused across submissions
+is downloaded only once.
+
+**Extra protection on a shared server:** install [gVisor](https://gvisor.dev)
+(on GPU machines, enable its `nvproxy` option), set `sandbox.runtime: runsc` in
+`~/bmb-eval/config.yaml`, then run `~/bmb-eval/bmb-eval selftest` and
+`~/bmb-eval/bmb-eval approve`.
 
 **Records?** Every evaluation is logged in `~/bmb-eval/state/`, with a
 tamper-evident audit log. Logs never leave the machine.
 
-**Changes?** If the data file or settings change, the evaluator pauses itself
+**Changes?** If the data or settings change, the evaluator pauses itself
 until someone runs `~/bmb-eval/bmb-eval approve`.
 
 **Alerts?** Optional. Put a Slack or Teams webhook URL in

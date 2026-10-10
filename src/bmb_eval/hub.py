@@ -1,25 +1,30 @@
 """BioModelBench hub: the one service we run. Providers' nodes connect *out*
 to it, so providers open no ports and run no web server.
 
-Holds only agent submissions (model bundles) and the gated results nodes
-send back. Never sees provider data. Standard library only.
+Holds agent submissions (model bundles, as content-addressed files) and the
+gated results nodes send back. Never sees provider data.
 
-    agents   POST /v1/tasks/<task>/submissions   bundle .tar.gz -> {submission_id}
-             GET  /v1/submissions/<id>           {status: pending|done, result?}
-             GET  /v1/tasks                      public contracts + node status
-    nodes    POST /v1/node/hello                 report tasks/contracts, recover jobs
-             GET  /v1/node/next                  claim the next job (204 if none)
-             GET  /v1/node/bundles/<id>          download its bundle
-             POST /v1/node/results/<id>          deliver the gated payload
-    enroll   GET  /v1/enroll/<code>              task package (contract + scorer)
-             POST /v1/enroll/<code>              activate: bind task to a node
+    agents   POST /v1/tasks/<task>/submissions   {manifest} -> {submission_id, uploads}
+             PUT  <upload url>                    each file the hub doesn't have yet
+             POST /v1/submissions/<id>/commit     queue it once every file is present
+             GET  /v1/submissions/<id>            {status: pending|done, result?}
+             GET  /v1/tasks                       public contracts + node status
+    nodes    POST /v1/node/hello                  report tasks/contracts, recover jobs
+             GET  /v1/node/next                   claim a job: manifest + download urls
+             POST /v1/node/results/<id>           deliver the gated payload
+    enroll   GET  /v1/enroll/<code>               task package (contract, scorer, ...)
+             POST /v1/enroll/<code>               activate: bind task to a node
     public   GET  /install.sh, /bmb-eval.tar.gz, /sandbox-image.tar, /guide
 
-Run behind TLS (see docs/OPERATOR.md). Admin commands: `bmb-hub --help`.
+Model files live in Google Cloud Storage (`--bucket`), moved with signed URLs
+so they never pass through this server; without a bucket the hub stores
+them on its own disk (development and tests). Run behind TLS: see
+deploy/gcp/ and docs/OPERATOR.md. Admin commands: `bmb-hub --help`.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import io
 import json
@@ -32,7 +37,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .blobs import BlobCache, check_manifest, manifest_id
 from .contract import Contract
+from .errors import EvalError
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (name TEXT PRIMARY KEY, token_sha256 TEXT NOT NULL);
@@ -46,11 +53,12 @@ CREATE TABLE IF NOT EXISTS enrollments (
     created REAL NOT NULL, used_by TEXT);
 CREATE TABLE IF NOT EXISTS submissions (
     id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL, created REAL NOT NULL,
-    status TEXT NOT NULL,          -- queued | assigned | done
-    node_id TEXT, result TEXT);
+    status TEXT NOT NULL,          -- uploading | queued | assigned | done
+    node_id TEXT, result TEXT, manifest TEXT NOT NULL);
 """
 ONLINE_S = 120          # a node that polled within this window is "online"
-MAX_RESULT_BYTES = 64 << 10
+MAX_JSON_BYTES = 16 << 20   # manifests of large bundles can be a few MB
+URL_TTL = datetime.timedelta(hours=24)
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
 
 
@@ -62,10 +70,77 @@ def new_code() -> str:
     return "-".join("".join(secrets.choice(CODE_ALPHABET) for _ in range(4)) for _ in range(3))
 
 
+# ------------------------------------------------------------- file storage
+
+class DiskBlobs:
+    """Model files on the hub's own disk; the hub serves uploads and downloads
+    itself (with the caller's bearer token). Verified by hash on upload."""
+
+    def __init__(self, root: Path, public_url: str):
+        self.cache = BlobCache(root)
+        self.public_url = public_url
+
+    def has(self, agent: str, sha: str, size: int) -> bool:
+        return self.cache.has(sha, size)
+
+    def upload(self, agent: str, sha: str, size: int) -> dict:
+        return {"url": f"{self.public_url}/v1/blobs/{sha}?size={size}", "method": "PUT",
+                "headers": {}, "auth": True}
+
+    def download(self, agent: str, sha: str, size: int) -> dict:
+        return {"url": f"{self.public_url}/v1/blobs/{sha}", "headers": {}, "auth": True}
+
+
+class GCSBlobs:
+    """Model files in a Cloud Storage bucket, moved with signed URLs, so
+    multi-GB uploads and downloads never pass through the hub. Stored per
+    agent (an agent can't plant a bad file under someone else's hash); nodes
+    verify every hash anyway. Needs google-cloud-storage and a service
+    account allowed to sign (deploy/gcp/hub-setup.sh grants it)."""
+
+    def __init__(self, bucket: str, credentials=None, project: str | None = None):
+        import google.auth
+        from google.auth.transport import requests as gauth_requests
+        from google.cloud import storage
+        if credentials is None:
+            credentials, project = google.auth.default()
+        self._creds = credentials
+        self._request = gauth_requests.Request()
+        self.bucket = storage.Client(project=project, credentials=self._creds).bucket(bucket)
+
+    def _name(self, agent: str, sha: str) -> str:
+        return f"blobs/{_h(agent)[:16]}/{sha}"
+
+    def _sign(self, agent: str, sha: str, method: str, **kw) -> str:
+        signer = {}
+        if hasattr(self._creds, "service_account_email") and not hasattr(self._creds, "signer"):
+            # Compute Engine credentials sign through the IAM API.
+            if not self._creds.valid:
+                self._creds.refresh(self._request)
+            signer = {"service_account_email": self._creds.service_account_email,
+                      "access_token": self._creds.token}
+        return self.bucket.blob(self._name(agent, sha)).generate_signed_url(
+            version="v4", expiration=URL_TTL, method=method, **signer, **kw)
+
+    def has(self, agent: str, sha: str, size: int) -> bool:
+        b = self.bucket.get_blob(self._name(agent, sha))
+        return b is not None and b.size == size
+
+    def upload(self, agent: str, sha: str, size: int) -> dict:
+        ct = "application/octet-stream"
+        return {"url": self._sign(agent, sha, "PUT", content_type=ct), "method": "PUT",
+                "headers": {"Content-Type": ct}, "auth": False}
+
+    def download(self, agent: str, sha: str, size: int) -> dict:
+        return {"url": self._sign(agent, sha, "GET"), "headers": {}, "auth": False}
+
+
+# -------------------------------------------------------------------- state
+
 class HubStore:
     def __init__(self, state: Path):
         self.state = state
-        (state / "bundles").mkdir(parents=True, exist_ok=True)
+        state.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(state / "hub.db", check_same_thread=False)
         self.db.executescript(SCHEMA)
         self.lock = threading.Lock()
@@ -93,9 +168,11 @@ class HubStore:
     # ----------------------------------------------------------- enrollment
 
     def add_enrollment(self, task_dir: Path) -> tuple[str, Contract]:
+        """Package a task: contract, scorer, and any small text files it uses
+        (e.g. a gene-panel labels file). Example bundles are not shipped."""
         c = Contract.load(task_dir / "contract.yaml")
         files = {p.name: p.read_text() for p in sorted(task_dir.iterdir())
-                 if p.is_file() and p.suffix in (".yaml", ".py")}
+                 if p.is_file() and p.suffix in (".yaml", ".py", ".txt", ".json", ".csv", ".tsv")}
         code = new_code()
         self.q("INSERT INTO enrollments VALUES (?,?,?,?,NULL)",
                (code, c.id, json.dumps(files), time.time()))
@@ -130,8 +207,7 @@ def code_tarball(root: Path) -> bytes | None:
     """The node code providers install, built from this checkout."""
     if not (root / "setup.sh").is_file():
         return None
-    include = ["pyproject.toml", "README.md", "setup.sh", "bmb-eval", "sandbox", "src",
-               "docs", "examples", "tasks/example_regression"]
+    include = ["pyproject.toml", "README.md", "setup.sh", "bmb-eval", "sandbox", "src", "docs"]
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for name in include:
@@ -142,10 +218,13 @@ def code_tarball(root: Path) -> bytes | None:
     return buf.getvalue()
 
 
-def make_handler(store: HubStore, public_url: str, repo_root: Path, max_upload_mb: int):
-    max_upload = max_upload_mb << 20
+# --------------------------------------------------------------------- HTTP
+
+def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_bundle_gb: int):
+    max_bundle = max_bundle_gb << 30
     tarball = code_tarball(repo_root)
-    install_sh = (repo_root / "install.sh")
+    install_sh = repo_root / "install.sh"
+    guide = repo_root / "docs" / "PROVIDER_SETUP.md"
     image_tar = store.state / "sandbox-image.tar"
 
     class Handler(BaseHTTPRequestHandler):
@@ -168,14 +247,14 @@ def make_handler(store: HubStore, public_url: str, repo_root: Path, max_upload_m
             self.end_headers()
             self.wfile.write(body)
 
-        def _err(self, status: int, code: str, message: str) -> None:
-            self._send(status, {"error": {"code": code, "message": message}})
+        def _err(self, status: int, code: str, message: str, **extra) -> None:
+            self._send(status, {"error": {"code": code, "message": message, **extra}})
 
         def _bearer(self) -> str:
             h = self.headers.get("Authorization", "")
             return h[7:] if h.startswith("Bearer ") else ""
 
-        def _json_body(self, cap: int = MAX_RESULT_BYTES):
+        def _json_body(self, cap: int = MAX_JSON_BYTES):
             n = int(self.headers.get("Content-Length", "0") or 0)
             if n > cap:
                 raise ValueError("body too large")
@@ -187,21 +266,24 @@ def make_handler(store: HubStore, public_url: str, repo_root: Path, max_upload_m
             self.send_header("Content-Length", str(path.stat().st_size))
             self.end_headers()
             with path.open("rb") as f:
-                while chunk := f.read(1 << 20):
+                while chunk := f.read(8 << 20):
                     self.wfile.write(chunk)
+
+        def _path(self) -> tuple[str, dict]:
+            p, _, qs = self.path.partition("?")
+            return p, dict(x.split("=", 1) for x in qs.split("&") if "=" in x)
 
         # ---------------------------------------------------------- routes
 
         def do_GET(self):
-            p = self.path.split("?")[0]
+            p, qs = self._path()
             if p == "/install.sh" and install_sh.is_file():
                 body = install_sh.read_text().replace("__BMB_HUB__", public_url).encode()
                 return self._send(200, body=body, ctype="text/x-shellscript")
-            if p == "/guide" and (repo_root / "docs" / "PROVIDER_SETUP.md").is_file():
-                return self._send(200, body=(repo_root / "docs" / "PROVIDER_SETUP.md").read_bytes(),
-                                  ctype="text/markdown; charset=utf-8")
             if p == "/bmb-eval.tar.gz" and tarball:
                 return self._send(200, body=tarball, ctype="application/gzip")
+            if p == "/guide" and guide.is_file():
+                return self._send(200, body=guide.read_bytes(), ctype="text/markdown; charset=utf-8")
             if p == "/sandbox-image.tar" and image_tar.is_file():
                 return self._send_file(image_tar, "application/x-tar")
             if m := re.fullmatch(r"/v1/enroll/([A-Z0-9-]{14})", p):
@@ -209,6 +291,8 @@ def make_handler(store: HubStore, public_url: str, repo_root: Path, max_upload_m
                 if e is None or e[2] is not None:
                     return self._err(404, "code_invalid", "This connect code is unknown or already used.")
                 return self._send(200, {"task": e[0], "files": e[1]})
+            if m := re.fullmatch(r"/v1/blobs/([0-9a-f]{64})", p):
+                return self._blob_get(m.group(1))
             if p.startswith("/v1/node/"):
                 return self._node_get(p)
             agent = store.agent(self._bearer())
@@ -235,8 +319,28 @@ def make_handler(store: HubStore, public_url: str, repo_root: Path, max_upload_m
                 return self._send(200, out)
             self._err(404, "not_found", "No such endpoint.")
 
+        def do_PUT(self):
+            p, qs = self._path()
+            m = re.fullmatch(r"/v1/blobs/([0-9a-f]{64})", p)
+            if not m or not isinstance(blobs, DiskBlobs):
+                return self._err(404, "not_found", "No such endpoint.")
+            if store.agent(self._bearer()) is None:
+                return self._err(401, "unauthorized", "Missing or invalid token.")
+            try:
+                size = int(qs.get("size", "-1"))
+                n = int(self.headers.get("Content-Length", "-1"))
+            except ValueError:
+                size = n = -1
+            if size < 0 or n != size or size > max_bundle:
+                return self._err(400, "bundle_invalid", "Bad upload size.")
+            try:
+                blobs.cache.put(m.group(1), size, self.rfile.read)
+            except EvalError:
+                return self._err(400, "bundle_invalid", "Upload does not match its hash.")
+            self._send(200, {"ok": True})
+
         def do_POST(self):
-            p = self.path.split("?")[0]
+            p, _ = self._path()
             if m := re.fullmatch(r"/v1/enroll/([A-Z0-9-]{14})", p):
                 try:
                     body = self._json_body()
@@ -252,35 +356,59 @@ def make_handler(store: HubStore, public_url: str, repo_root: Path, max_upload_m
                 return self._err(401, "unauthorized", "Missing or invalid token.")
             if m := re.fullmatch(r"/v1/tasks/([\w.-]{1,64})/submissions", p):
                 return self._submit(agent, m.group(1))
+            if m := re.fullmatch(r"/v1/submissions/([\w-]{1,64})/commit", p):
+                return self._commit(agent, m.group(1))
             self._err(404, "not_found", "No such endpoint.")
+
+        # ------------------------------------------------------------ agents
 
         def _submit(self, agent: str, task: str) -> None:
             if not store.q("SELECT 1 FROM node_tasks WHERE task=?", (task,), one=True):
                 return self._err(404, "task_unknown", "Unknown task id.")
             try:
-                n = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                n = 0
-            if n <= 0:
-                return self._err(400, "bundle_invalid", "Empty upload.")
-            if n > max_upload:
-                self.close_connection = True
-                return self._err(413, "bundle_too_large", "Bundle exceeds the upload limit.")
+                manifest = self._json_body()["manifest"]
+                files = check_manifest(manifest, max_bundle)
+            except (ValueError, KeyError, TypeError):
+                return self._err(400, "bundle_invalid", "Body must be {\"manifest\": ...}.")
+            except EvalError as e:
+                return self._err(413 if e.code == "bundle_too_large" else 400, e.code,
+                                 e.public()["message"])
             sid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(4)
-            path = store.state / "bundles" / f"{sid}.tar.gz"
-            with path.open("wb") as f:
-                left = n
-                while left > 0:
-                    chunk = self.rfile.read(min(left, 1 << 20))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    left -= len(chunk)
-            store.q("INSERT INTO submissions VALUES (?,?,?,?, 'queued', NULL, NULL)",
-                    (sid, task, agent, time.time()))
+            store.q("INSERT INTO submissions VALUES (?,?,?,?, 'uploading', NULL, NULL, ?)",
+                    (sid, task, agent, time.time(), json.dumps(manifest)))
+            uploads, seen = [], set()
+            for f in files:
+                if f["sha256"] in seen or blobs.has(agent, f["sha256"], f["size"]):
+                    continue
+                seen.add(f["sha256"])
+                uploads.append({"sha256": f["sha256"], "size": f["size"],
+                                **blobs.upload(agent, f["sha256"], f["size"])})
+            self._send(201, {"submission_id": sid, "uploads": uploads})
+
+        def _commit(self, agent: str, sid: str) -> None:
+            row = store.q("SELECT status, manifest FROM submissions WHERE id=? AND agent=?",
+                          (sid, agent), one=True)
+            if not row:
+                return self._err(404, "not_found", "No such submission.")
+            if row[0] != "uploading":
+                return self._send(200, {"submission_id": sid, "status": "pending"})
+            missing = sorted({f["sha256"] for f in json.loads(row[1])["files"]
+                              if not blobs.has(agent, f["sha256"], f["size"])})
+            if missing:
+                return self._err(409, "files_missing", "Some files were not uploaded.",
+                                 missing=missing)
+            store.q("UPDATE submissions SET status='queued' WHERE id=?", (sid,))
             self._send(202, {"submission_id": sid, "status": "pending"})
 
-        # ----------------------------------------------------------- nodes
+        def _blob_get(self, sha: str) -> None:
+            if not isinstance(blobs, DiskBlobs) or store.node(self._bearer()) is None:
+                return self._err(404, "not_found", "No such file.")
+            path = blobs.cache.path(sha)
+            if not path.is_file():
+                return self._err(404, "not_found", "No such file.")
+            self._send_file(path, "application/octet-stream")
+
+        # ------------------------------------------------------------- nodes
 
         def _node(self) -> str | None:
             node = store.node(self._bearer())
@@ -294,33 +422,31 @@ def make_handler(store: HubStore, public_url: str, repo_root: Path, max_upload_m
             node = self._node()
             if node is None:
                 return
-            if p == "/v1/node/next":
-                with store.lock, store.db:
-                    row = store.db.execute(
-                        "SELECT s.id, s.task, s.agent FROM submissions s JOIN node_tasks t "
-                        "ON t.task = s.task WHERE t.node_id=? AND s.status='queued' "
-                        "ORDER BY s.created LIMIT 1", (node,)).fetchone()
-                    if row:
-                        store.db.execute("UPDATE submissions SET status='assigned', node_id=? "
-                                         "WHERE id=?", (node, row[0]))
-                if not row:
-                    return self._send(204)
-                return self._send(200, {"submission_id": row[0], "task": row[1], "submitter": row[2]})
-            if m := re.fullmatch(r"/v1/node/bundles/([\w-]{1,64})", p):
-                ok = store.q("SELECT 1 FROM submissions WHERE id=? AND node_id=? AND status='assigned'",
-                             (m.group(1), node), one=True)
-                path = store.state / "bundles" / f"{m.group(1)}.tar.gz"
-                if not ok or not path.is_file():
-                    return self._err(404, "not_found", "No such job.")
-                return self._send_file(path, "application/gzip")
-            self._err(404, "not_found", "No such endpoint.")
+            if p != "/v1/node/next":
+                return self._err(404, "not_found", "No such endpoint.")
+            with store.lock, store.db:
+                row = store.db.execute(
+                    "SELECT s.id, s.task, s.agent, s.manifest FROM submissions s JOIN node_tasks t "
+                    "ON t.task = s.task WHERE t.node_id=? AND s.status='queued' "
+                    "ORDER BY s.created LIMIT 1", (node,)).fetchone()
+                if row:
+                    store.db.execute("UPDATE submissions SET status='assigned', node_id=? "
+                                     "WHERE id=?", (node, row[0]))
+            if not row:
+                return self._send(204)
+            manifest = json.loads(row[3])
+            downloads = {f["sha256"]: blobs.download(row[2], f["sha256"], f["size"])
+                         for f in manifest["files"]}
+            self._send(200, {"submission_id": row[0], "task": row[1], "submitter": row[2],
+                             "manifest": manifest, "bundle_id": manifest_id(manifest),
+                             "downloads": downloads})
 
         def _node_post(self, p: str) -> None:
             node = self._node()
             if node is None:
                 return
             try:
-                body = self._json_body()
+                body = self._json_body(64 << 10)
             except ValueError:
                 return self._err(413, "too_large", "Body too large.")
             if p == "/v1/node/hello":
@@ -344,11 +470,14 @@ def make_handler(store: HubStore, public_url: str, repo_root: Path, max_upload_m
                     return self._err(404, "not_found", "No such job.")
                 store.q("UPDATE submissions SET status='done', result=? WHERE id=?",
                         (json.dumps(body), sid))
-                (store.state / "bundles" / f"{sid}.tar.gz").unlink(missing_ok=True)
                 return self._send(200, {"ok": True})
             self._err(404, "not_found", "No such endpoint.")
 
     return Handler
+
+
+def make_blobs(state: Path, public_url: str, bucket: str | None):
+    return GCSBlobs(bucket) if bucket else DiskBlobs(state / "blobs", public_url)
 
 
 # ---------------------------------------------------------------- admin CLI
@@ -361,30 +490,37 @@ def _repo_root() -> Path:
 
 
 def provider_message(public_url: str, code: str, c: Contract) -> str:
-    """What we send the provider: everything they need, nothing else."""
-    model_sees = [f.name for f in c.inputs]
-    answer = [f.name for f in c.answers if f.name not in c.key]
-    cols = ", ".join(dict.fromkeys(model_sees + [f.name for f in c.answers]))
+    """The email we send a provider. The same for everyone except the code and,
+    for GPU tasks, the machine line: their data's format was agreed during
+    intake, and `connect` itself shows them exactly what the model will and
+    won't see before they approve."""
+    lim = c.limits
+    machine = ("a Linux machine that stays on, with an NVIDIA GPU "
+               f"({lim.gpu_memory_gb or 24} GB or more of GPU memory), 64 GB RAM and "
+               f"{max(300, lim.max_bundle_gb * 4)} GB free disk"
+               if lim.gpus else
+               "a Linux machine that stays on (4 CPUs, 16 GB RAM, 150 GB free disk)")
     return f"""\
-Subject: Connecting your data to BioModelBench ({c.title})
+Subject: Connecting your data to BioModelBench
 
-Hi! Here's how to connect your data. It takes one command.
+Hi! Thanks for taking part. Connecting your data takes one command.
 
-You need:
-  • A Linux machine that stays on (4 CPUs, 16 GB RAM). The server your data
-    is already on is ideal.
-  • Your data as one file (CSV is fine) with these columns:
-        {cols}
-    Other columns are fine; they're ignored. The model will only ever see
-    {", ".join(model_sees)}. It never sees {", ".join(answer)}.
+You need {machine}. The server your data is already on is ideal.
 
-On that machine, run this (put in the path to your file):
+On that machine, run this, replacing the last part with the location of the
+data you described to us (a file or a folder):
 
-    curl -fsSL {public_url}/install.sh | sh -s -- {code} --data /path/to/your_data.csv
+    curl -fsSL {public_url}/install.sh | sh -s -- {code} --data /path/to/your/data
 
-It takes about 10 minutes and may ask for your password once. It checks your
-file, tests its own security, then shows you exactly what you're agreeing to
-and asks you to type y. That's it. Only scores ever leave your machine.
+It takes about 15 minutes and may ask for your password once. It checks your
+data, tests its own security, then shows you exactly what the model will and
+won't see and asks you to type y. That's it. Only scores ever leave your
+machine.
+
+If you ever need to:
+    ~/bmb-eval/bmb-eval status     check it's running
+    ~/bmb-eval/bmb-eval stop       stop everything immediately
+    ~/bmb-eval/bmb-eval resume     start again
 
 Guide and FAQ for your IT team: {public_url}/guide
 """
@@ -399,7 +535,8 @@ def main(argv=None) -> None:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8790)
     p.add_argument("--public-url", required=True, help="https URL providers and agents use")
-    p.add_argument("--max-upload-mb", type=int, default=2048)
+    p.add_argument("--bucket", help="Cloud Storage bucket for model files (default: hub disk)")
+    p.add_argument("--max-bundle-gb", type=int, default=128)
 
     p = sub.add_parser("new-task", help="write a contract + scorer from a column list")
     p.add_argument("task")
@@ -409,7 +546,7 @@ def main(argv=None) -> None:
     p.add_argument("--kind", default="regression", choices=["regression", "classification"])
     p.add_argument("--tasks-dir", default="tasks")
 
-    p = sub.add_parser("enroll", help="make a connect code for a task; prints the provider message")
+    p = sub.add_parser("enroll", help="make a connect code for a task; prints the provider email")
     p.add_argument("task_dir")
     p.add_argument("--public-url", required=True)
 
@@ -432,9 +569,12 @@ def main(argv=None) -> None:
 
     store = HubStore(state)
     if args.cmd == "serve":
-        httpd = ThreadingHTTPServer((args.host, args.port), make_handler(
-            store, args.public_url.rstrip("/"), _repo_root(), args.max_upload_mb))
-        print(f"bmb-hub on http://{args.host}:{args.port} (public: {args.public_url})")
+        url = args.public_url.rstrip("/")
+        handler = make_handler(store, make_blobs(state, url, args.bucket), url, _repo_root(),
+                               args.max_bundle_gb)
+        httpd = ThreadingHTTPServer((args.host, args.port), handler)
+        print(f"bmb-hub on http://{args.host}:{args.port} (public: {url}; "
+              f"model files: {'gs://' + args.bucket if args.bucket else 'hub disk'})")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
 import tarfile
@@ -16,6 +17,8 @@ from pathlib import Path
 import pytest
 
 from bmb_eval import approval, audit, leakage, scaffold
+from conftest import sequence_data
+from bmb_eval.blobs import BlobCache, check_manifest, manifest_for
 from bmb_eval.bundle import pack_dir, unpack
 from bmb_eval.client import Client
 from bmb_eval.config import Config
@@ -28,14 +31,15 @@ from bmb_eval import cli, hub as hub_mod
 from bmb_eval.node import HubAPI, HubError, Worker, paused_path
 
 REPO = Path(__file__).resolve().parents[1]
-TASK = "example_regression"
-EXAMPLE_BUNDLE = REPO / "examples" / "bundles" / "example_baseline"
+TASK = "sequence_regression"
+EXAMPLE_TASK = REPO / "examples" / "tasks" / TASK
+EXAMPLE_BUNDLE = EXAMPLE_TASK / "bundle"
 
 
 @pytest.fixture
 def node_dir(tmp_path):
-    shutil.copytree(REPO / "tasks", tmp_path / "tasks")
-    inp, ans = scaffold.example_private_data(tmp_path / "private_data" / TASK)
+    shutil.copytree(EXAMPLE_TASK, tmp_path / "tasks" / TASK, ignore=shutil.ignore_patterns("bundle"))
+    inp, ans = sequence_data(tmp_path / "private_data" / TASK)
     (tmp_path / "config.yaml").write_text(json.dumps({
         "node_name": "test",
         "sandbox": {"backend": "local", "i_understand_local_backend_is_not_isolated": True},
@@ -107,7 +111,7 @@ def test_validation_error_detail_is_gated(cfg):
 # ---------------------------------------------------------------------- gate
 
 def _contract():
-    return Contract.load(REPO / "tasks" / TASK / "contract.yaml")
+    return Contract.load(EXAMPLE_TASK / "contract.yaml")
 
 
 @pytest.mark.parametrize("raw", [
@@ -167,23 +171,6 @@ def test_public_contract_hides_answers_and_round_trips():
     assert "answers" not in pub and "fitness" not in json.dumps(pub["inputs"])
     c2 = Contract.from_dict(json.loads(json.dumps(pub)), public=True)
     assert c2.public() == pub
-
-
-def test_scaffold_does_not_publish_private_bounds(tmp_path):
-    inp, ans = scaffold.example_private_data(tmp_path / "d")
-    d = scaffold.add_task("t", tmp_path / "tasks", inp, ans, ["variant_id"], "classification",
-                          target="fitness")
-    c = Contract.load(d / "contract.yaml")
-    assert all(f.min is None and f.max is None and f.allowed is None for f in c.inputs)
-
-
-def test_scaffold_refuses_target_in_inputs(tmp_path):
-    import pandas as pd
-    pd.DataFrame({"id": ["a"], "y": [1.0]}).to_parquet(tmp_path / "i.parquet")
-    pd.DataFrame({"id": ["a"], "y": [1.0]}).to_parquet(tmp_path / "a.parquet")
-    with pytest.raises(SystemExit):
-        scaffold.add_task("t", tmp_path / "tasks", tmp_path / "i.parquet",
-                          tmp_path / "a.parquet", ["id"], "regression")
 
 
 def test_synth_inputs_match_contract():
@@ -274,7 +261,8 @@ def hub(tmp_path):
     store = hub_mod.HubStore(tmp_path / "hub_state")
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), None)
     url = f"http://127.0.0.1:{httpd.server_address[1]}"
-    httpd.RequestHandlerClass = hub_mod.make_handler(store, url, REPO, 64)
+    blobs = hub_mod.DiskBlobs(tmp_path / "hub_state" / "blobs", url)
+    httpd.RequestHandlerClass = hub_mod.make_handler(store, blobs, url, REPO, 64)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     yield store, url
     httpd.shutdown()
@@ -285,7 +273,7 @@ def provider_files(tmp_path):
     """The provider's one CSV (with an extra column we never asked for), and the
     task we wrote for them without seeing the data."""
     import pandas as pd
-    inp, ans = scaffold.example_private_data(tmp_path / "raw")
+    inp, ans = sequence_data(tmp_path / "raw")
     df = pd.read_parquet(inp).merge(pd.read_parquet(ans), on="variant_id")
     df["lab_notes"] = "do not share"
     df.to_csv(tmp_path / "my_data.csv", index=False)
@@ -326,7 +314,9 @@ def test_provider_connects_and_agent_gets_scores(connected):
     w.drain()
     res = agent.status(sid)
     assert res["status"] == "done" and res["result"]["metrics"]["spearman"] > 0.5
-    assert not (store.state / "bundles" / f"{sid}.tar.gz").exists()
+    # The hub holds only the model's files (by hash), nothing from the provider.
+    held = {p.name for p in (store.state / "blobs").iterdir() if not p.name.startswith(".")}
+    assert held == {f["sha256"] for f in manifest_for(EXAMPLE_BUNDLE)["files"]}
 
 
 def test_connect_code_is_single_use(hub, connected, provider_files):
@@ -462,4 +452,105 @@ def test_hub_new_task_and_provider_message(tmp_path, capsys):
     msg = capsys.readouterr().out
     code = re.search(r"sh -s -- ([A-Z0-9-]{14}) --data", msg).group(1)
     assert f"curl -fsSL https://hub.example.org/install.sh | sh -s -- {code} --data" in msg
-    assert "id, seq, kd" in msg and "never sees kd" in msg
+    email = msg[msg.index("Subject:"):]
+    assert "/guide" in email and "kd" not in email    # same email for every provider
+
+
+# --------------------------------------------------------- big-model transfer
+
+def _big_bundle(tmp_path, name="m", head="0"):
+    d = tmp_path / name
+    (d / "weights").mkdir(parents=True)
+    (d / "predict.py").write_text((EXAMPLE_BUNDLE / "predict.py").read_text())
+    (d / "weights" / "model.json").write_text((EXAMPLE_BUNDLE / "weights" / "model.json").read_text())
+    (d / "weights" / "base.bin").write_bytes(b"\x07" * (3 << 20))   # stands in for a 20 GB base
+    (d / "weights" / "head.bin").write_bytes(head.encode() * 1024)
+    return d
+
+
+def test_resubmission_uploads_and_downloads_only_changes(connected, tmp_path, monkeypatch):
+    cfg, store, url, agent = connected
+    w = Worker(cfg)
+    puts, gets = [], []
+    real_put, real_dl = agent._put, w.api.download
+    monkeypatch.setattr(agent, "_put", lambda up, p: (puts.append(p.name), real_put(up, p)))
+    monkeypatch.setattr(w.api, "download", lambda info, c, sha, size: (gets.append(size), real_dl(info, c, sha, size)))
+    a = agent.submit_async("binding", _big_bundle(tmp_path, "v1", "a"))["submission_id"]
+    w.drain()
+    assert sorted(puts) == ["base.bin", "head.bin", "model.json", "predict.py"]
+    puts.clear(); gets.clear()
+    b = agent.submit_async("binding", _big_bundle(tmp_path, "v2", "b"))["submission_id"]
+    w.drain()
+    assert puts == ["head.bin"] and gets == [1024]           # the 3 MB "base" never moved again
+    assert agent.status(a)["result"]["status"] == agent.status(b)["result"]["status"] == "ok"
+
+
+def test_corrupted_model_file_is_rejected(connected, tmp_path):
+    cfg, store, url, agent = connected
+    sid = agent.submit_async("binding", _big_bundle(tmp_path))["submission_id"]
+    # Tamper with a stored file after upload (e.g. a storage fault).
+    sha = manifest_for(_big_bundle(tmp_path, "again"))["files"][-1]["sha256"]
+    p = store.state / "blobs" / sha
+    p.chmod(0o644)
+    p.write_bytes(b"tampered" + p.read_bytes()[8:])
+    Worker(cfg).drain()
+    assert agent.status(sid)["result"]["error"]["code"] == "bundle_invalid"
+
+
+def test_commit_requires_every_file(connected, tmp_path):
+    cfg, store, url, agent = connected
+    d = _big_bundle(tmp_path)
+    r = agent._req("POST", "/v1/tasks/binding/submissions", {"manifest": manifest_for(d)})
+    res = agent._req("POST", f"/v1/submissions/{r['submission_id']}/commit")
+    assert res["error"]["code"] == "files_missing" and len(res["error"]["missing"]) == 4
+
+
+@pytest.mark.parametrize("path", ["../x.py", "/etc/passwd", "a/../../b"])
+def test_manifest_paths_cannot_escape(path):
+    m = {"files": [{"path": "predict.py", "sha256": "0" * 64, "size": 1},
+                   {"path": path, "sha256": "1" * 64, "size": 1}]}
+    with pytest.raises(EvalError) as e:
+        check_manifest(m, 1 << 30)
+    assert e.value.code == "bundle_unsafe"
+
+
+def test_manifest_size_limit():
+    m = {"files": [{"path": "predict.py", "sha256": "0" * 64, "size": 2 << 30}]}
+    with pytest.raises(EvalError) as e:
+        check_manifest(m, 1 << 30)
+    assert e.value.code == "bundle_too_large"
+
+
+def test_cache_evicts_least_recently_used(tmp_path):
+    import hashlib
+    c = BlobCache(tmp_path)
+    shas = []
+    for i in range(3):
+        data = bytes([i]) * 1000
+        sha = hashlib.sha256(data).hexdigest()
+        c.put(sha, 1000, io.BytesIO(data).read)
+        os.utime(c.path(sha), (i, i))
+        shas.append(sha)
+    c.evict(2000)
+    assert not c.path(shas[0]).exists() and c.path(shas[2]).exists()
+
+
+def test_gcs_signed_urls_offline():
+    """The Cloud Storage path signs per-agent PUT/GET links (checked offline
+    with a throwaway service-account key; no network)."""
+    pytest.importorskip("google.cloud.storage")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from google.oauth2 import service_account
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()).decode()
+    creds = service_account.Credentials.from_service_account_info({
+        "type": "service_account", "client_email": "hub@p.iam.gserviceaccount.com",
+        "private_key": key, "token_uri": "https://oauth2.googleapis.com/token", "project_id": "p"})
+    g = hub_mod.GCSBlobs("p-bmb-models", credentials=creds, project="p")
+    sha = "a" * 64
+    up, down = g.upload("agent-1", sha, 10), g.download("agent-1", sha, 10)
+    assert up["method"] == "PUT" and up["auth"] is False and not down["auth"]
+    assert "p-bmb-models/blobs/" in up["url"] and sha in up["url"] and "X-Goog-Signature" in up["url"]
+    assert g._name("agent-1", sha) != g._name("agent-2", sha)   # per-agent storage

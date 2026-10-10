@@ -1,7 +1,7 @@
 """Sandbox backends.
 
 ContainerSandbox is the production backend, driving either docker or podman
-(same flags): no network, read-only root, all capabilities dropped, no new
+(same flags; GPUs via the NVIDIA container toolkit): no network, read-only root, all capabilities dropped, no new
 privileges, memory/cpu/pid/file limits, no container logging, and private
 files bind-mounted one by one (never their parent directory), read-only.
 The container runs as the operator's uid so it can read exactly the files
@@ -66,7 +66,8 @@ def detect_engine() -> str | None:
 
 
 def container_cmd(engine: str, image: str, runtime: str | None, *, name: str, entry: str,
-                  mounts: list[Mount], env: dict[str, str], limits: Limits) -> list[str]:
+                  mounts: list[Mount], env: dict[str, str], limits: Limits,
+                  gpus: int = 0) -> list[str]:
     uid = f"{os.getuid()}:{os.getgid()}"
     cmd = [
         engine, "run", "--rm", "-i", "--name", name,
@@ -82,7 +83,7 @@ def container_cmd(engine: str, image: str, runtime: str | None, *, name: str, en
         "--cpus", str(limits.cpus),
         "--ulimit", "core=0", "--ulimit", "nofile=4096:4096",
         "--user", uid,
-        "--ipc", "private",
+        "--ipc", "private", "--shm-size", f"{limits.shm_mb}m",
         "--hostname", "sandbox",
         "-e", "HOME=/tmp", "-e", "TMPDIR=/tmp", "-e", "PYTHONHASHSEED=0",
         "-e", "PYTHONDONTWRITEBYTECODE=1",
@@ -91,6 +92,9 @@ def container_cmd(engine: str, image: str, runtime: str | None, *, name: str, en
         cmd += ["--userns", "keep-id"]  # rootless: container uid == operator uid
     if runtime:
         cmd += ["--runtime", runtime]
+    if gpus:
+        # Podman uses CDI device names; Docker the NVIDIA runtime hook.
+        cmd += (["--device", "nvidia.com/gpu=all"] if engine == "podman" else ["--gpus", "all"])
     for m in mounts:
         cmd += ["-v", f"{m.host.resolve()}:{m.container}:ro", "-e", f"{m.env}={m.container}"]
     for k, v in env.items():
@@ -106,9 +110,10 @@ class ContainerSandbox:
         self.runtime = runtime
 
     def run(self, *, name: str, entry: str, mounts: list[Mount], env: dict[str, str],
-            limits: Limits, timeout_s: int, stdout_cap: int, stdin: bytes = b"") -> Result:
+            limits: Limits, timeout_s: int, stdout_cap: int, stdin: bytes = b"",
+            gpus: int = 0) -> Result:
         cmd = container_cmd(self.engine, self.image, self.runtime, name=name, entry=entry,
-                            mounts=mounts, env=env, limits=limits)
+                            mounts=mounts, env=env, limits=limits, gpus=gpus)
         # Killing the CLI client does not stop the container; kill it by name.
         return _run(cmd, timeout_s, stdout_cap, stdin, on_kill=lambda: subprocess.run(
             [self.engine, "kill", name], capture_output=True))
@@ -133,7 +138,8 @@ class LocalSandbox:
     """Unisolated. Tests and dry runs only."""
 
     def run(self, *, name: str, entry: str, mounts: list[Mount], env: dict[str, str],
-            limits: Limits, timeout_s: int, stdout_cap: int, stdin: bytes = b"") -> Result:
+            limits: Limits, timeout_s: int, stdout_cap: int, stdin: bytes = b"",
+            gpus: int = 0) -> Result:
         e = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR")}
         e.update(env)
         e["PYTHONHASHSEED"] = "0"

@@ -1,7 +1,8 @@
 #!/bin/sh
 # BioModelBench evaluation node: the one command providers run.
 #   curl -fsSL https://<hub>/install.sh | sh -s -- <CODE> --data <file>
-# Installs Podman if needed, downloads bmb-eval to ~/bmb-eval, then connects.
+# Installs Podman (and GPU container support on GPU machines) if needed,
+# downloads bmb-eval to ~/bmb-eval, then connects.
 # Without arguments it only installs or updates. Safe to re-run.
 set -eu
 HUB="${BMB_HUB:-__BMB_HUB__}"
@@ -33,6 +34,31 @@ if ! engine_ok; then
   fi
   # Keep the evaluator running after you log out.
   sudo loginctl enable-linger "$(id -un)" 2>/dev/null || true
+fi
+
+# GPU machines: let containers use the GPU (NVIDIA container toolkit).
+if [ "$ENGINE" != "local" ] && command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1 &&
+   ! command -v nvidia-ctk >/dev/null; then
+  say "Setting up GPU access for containers"
+  if command -v apt-get >/dev/null; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey |
+      sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list |
+      sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' |
+      sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+    sudo apt-get update -qq && sudo apt-get install -y -qq nvidia-container-toolkit
+  elif command -v dnf >/dev/null; then
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo |
+      sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo >/dev/null
+    sudo dnf install -y -q nvidia-container-toolkit
+  fi
+fi
+if command -v nvidia-ctk >/dev/null; then
+  if command -v podman >/dev/null; then
+    sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml >/dev/null 2>&1 || true
+  elif command -v docker >/dev/null && ! docker info 2>/dev/null | grep -q nvidia; then
+    sudo nvidia-ctk runtime configure --runtime=docker >/dev/null && sudo systemctl restart docker
+  fi
 fi
 
 say "Downloading the evaluator to $DIR"

@@ -1,0 +1,24 @@
+# Property prediction: one numeric endpoint value per (molecule, endpoint) row.
+# Shows: per-group metrics (one MAE per endpoint) plus a macro-average headline.
+# Provider data: one table with the columns below (CSV is fine).
+id: property_prediction
+version: 1
+title: Property prediction (example)
+description: Predict the endpoint value for each molecule-endpoint pair, in the endpoint's units.
+key: [sample_id]
+inputs:
+  - {name: sample_id, type: string, description: row id}
+  - {name: smiles, type: string, description: SMILES string}
+  - {name: endpoint, type: string, allowed: [solubility, logD, clearance], description: named endpoint}
+  - {name: assay, type: string, nullable: true, description: assay / experiment context}
+outputs:
+  - {name: value, type: float, min: -1000, max: 1000, description: predicted endpoint value}
+answers:
+  - {name: sample_id, type: string}
+  - {name: measured, type: float}
+metrics:
+  - {name: mae, type: float, min: 0, max: 100, goal: min, per: [solubility, logD, clearance]}
+  - {name: spearman_macro, type: float, nullable: true, min: -1, max: 1, goal: max}
+headline: spearman_macro
+export: {decimals: 3}
+limits: {submissions_per_day: 20, submissions_total: 200}

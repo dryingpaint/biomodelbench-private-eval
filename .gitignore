@@ -6,6 +6,8 @@ __pycache__/
 
 # Provider-local state. Never commit: holds private data paths, tokens, run logs.
 config.yaml
+# Node-local: tasks connected on this machine.
+/tasks/
 state/
 private_data/
 approved.lock.json

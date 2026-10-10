@@ -23,4 +23,8 @@ say "Preparing the sandbox"
 # A first install skips this: `connect` runs the self-test once, on your data.
 if [ -z "${BMB_SKIP_SELFTEST:-}" ]; then
   ./bmb-eval selftest && ./bmb-eval approve >/dev/null
+  # Updating: restart the background service so it runs the new code.
+  if systemctl --user is-enabled bmb-eval >/dev/null 2>&1; then
+    systemctl --user restart bmb-eval && echo "Updated and restarted."
+  fi
 fi

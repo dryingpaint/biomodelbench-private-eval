@@ -146,12 +146,21 @@ class Worker:
         did = False
         accepting = self.accepting()
         if time.time() - self._last_hello > HELLO_S:
-            held = [p.stem for p in self.queue_dir.glob("*.json")]
+            # Held = anything not yet delivered, including finished results the
+            # hub hasn't received; otherwise the hub would re-queue them.
+            held = sorted({p.stem for p in self.queue_dir.glob("*.json")} | set(self.store.unposted()))
             self.api.hello({t: b.contract.public() for t, b in self.cfg.tasks.items()},
                            accepting, held)
             self._last_hello = time.time()
         for sid, payload in self.store.released_unposted():
-            self.api.result(sid, payload)
+            try:
+                self.api.result(sid, payload)
+            except HubError as e:
+                if "No such job" not in str(e):
+                    raise          # hub unreachable: retry the whole step later
+                # The hub no longer knows this job (e.g. it was deleted); don't
+                # let one undeliverable result block all other work.
+                audit.record(self.cfg.state_dir, "result_dropped", run_id=sid, error=str(e)[:200])
             self.store.mark_posted(sid)
             did = True
         # Finish anything interrupted by a restart before taking new work.

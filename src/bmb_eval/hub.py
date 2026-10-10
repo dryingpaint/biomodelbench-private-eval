@@ -524,10 +524,13 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._send(200, {"ok": True})
             if m := re.fullmatch(r"/v1/node/results/([\w-]{1,64})", p):
                 sid = m.group(1)
-                if not store.q("SELECT 1 FROM submissions WHERE id=? AND node_id=?", (sid, node), one=True):
+                # Accept from the node that serves the task, even if the job was
+                # re-queued while its result was in flight.
+                if not store.q("SELECT 1 FROM submissions s JOIN node_tasks t ON t.task = s.task "
+                               "WHERE s.id=? AND t.node_id=?", (sid, node), one=True):
                     return self._err(404, "not_found", "No such job.")
-                store.q("UPDATE submissions SET status='done', result=? WHERE id=?",
-                        (json.dumps(body), sid))
+                store.q("UPDATE submissions SET status='done', node_id=?, result=? WHERE id=?",
+                        (node, json.dumps(body), sid))
                 return self._send(200, {"ok": True})
             self._err(404, "not_found", "No such endpoint.")
 

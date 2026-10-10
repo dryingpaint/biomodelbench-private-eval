@@ -90,6 +90,12 @@ class Store:
                 "AND release_at <= ? ORDER BY created", (time.time(),)).fetchall()
         return [(r[0], json.loads(r[1])) for r in rows]
 
+    def unposted(self) -> list[str]:
+        """Every job this node holds whose result the hub hasn't received yet."""
+        with self.lock:
+            return [r[0] for r in self.db.execute(
+                "SELECT id FROM submissions WHERE posted=0").fetchall()]
+
     def mark_posted(self, sid: str) -> None:
         with self.lock, self.db:
             self.db.execute("UPDATE submissions SET posted=1 WHERE id=?", (sid,))

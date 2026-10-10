@@ -570,3 +570,30 @@ def test_guide_page(hub):
     assert f"curl -fsSL {url}/install.sh" in guide and "&lt;hub address&gt;" not in guide
     head = urllib.request.urlopen(urllib.request.Request(url + "/install.sh", method="HEAD"))
     assert head.status == 200 and int(head.headers["Content-Length"]) > 100 and head.read() == b""
+
+
+def test_result_in_flight_survives_hub_restart(connected, monkeypatch):
+    """A finished result the hub hasn't received yet is still 'held', so the hub
+    doesn't re-queue it; and if a job was re-queued anyway, the owning node's
+    result is still accepted and nothing blocks new work."""
+    cfg, store, url, agent = connected
+    w = Worker(cfg)
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    real = w.api.result
+    monkeypatch.setattr(w.api, "result", lambda *a: (_ for _ in ()).throw(HubError("cannot reach hub")))
+    with pytest.raises(HubError):
+        w.drain()                                  # ran the job; delivery failed
+    assert sid in w.store.unposted()
+    w._last_hello = 0
+    monkeypatch.setattr(w.api, "result", lambda *a: None)
+    w.step()                                       # hello reports it as held
+    assert store.q("SELECT status FROM submissions WHERE id=?", (sid,), one=True)[0] == "assigned"
+    store.q("UPDATE submissions SET status='queued', node_id=NULL WHERE id=?", (sid,))   # force a re-queue
+    monkeypatch.setattr(w.api, "result", real)
+    w.store.db.execute("UPDATE submissions SET posted=0 WHERE id=?", (sid,))
+    w.store.db.commit()
+    w.drain()
+    assert agent.status(sid)["status"] == "done"
+    sid2 = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain()
+    assert agent.status(sid2)["result"]["status"] == "ok"   # new work still flows

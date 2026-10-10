@@ -70,24 +70,37 @@ ATTACKS = [
         predict = baseline
         '''), "ok", container_only=True),
 
-    Attack("find_answers", "look for the answers file, other private files, engine sockets",
+    Attack("find_answers", "look for answers, other mounted files, engine sockets",
            textwrap.dedent('''\
-        import time
+        import sys, time
+        # What the sandbox is allowed to have mounted; anything else is an escape.
+        ALLOWED = ("/bundle", "/data/inputs", "/contract.json", "/tmp", "/dev", "/proc", "/sys",
+                   "/etc/hosts", "/etc/hostname", "/etc/resolv.conf", "/run/.containerenv",
+                   "/etc/passwd", "/etc/group", "/run/secrets")
+
         def load_model():
             hits = [k for k in os.environ if "ANSWER" in k.upper() or "TOKEN" in k.upper()]
             for sock in ["/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"]:
                 if os.path.exists(sock):
                     hits.append(sock)
+            # 1. Mounts: the precise answer to "what host files can this code reach?"
+            with open("/proc/self/mountinfo") as fh:
+                for line in fh:
+                    target = line.split()[4]
+                    if target != "/" and not target.startswith(ALLOWED):
+                        hits.append("mount:" + target)
+            # 2. Data files outside the inputs and the image's own libraries.
             inputs_dir = os.path.realpath(os.path.dirname(_inputs_path()))
+            skip = (inputs_dir + os.sep, sys.prefix + os.sep, "/usr/")
             t0, seen = time.time(), 0
             for root, dirs, files in os.walk("/"):
                 dirs[:] = [d for d in dirs if os.path.join(root, d) not in ("/proc", "/sys", "/dev")]
                 for f in files:
                     seen += 1
-                    p = os.path.join(root, f)
-                    if f.endswith(".parquet") and not os.path.realpath(p).startswith(inputs_dir + os.sep):
+                    p = os.path.realpath(os.path.join(root, f))
+                    if f.endswith((".parquet", ".csv", ".h5ad")) and not p.startswith(skip):
                         hits.append(p)
-                if seen > 200_000 or time.time() - t0 > 60:
+                if seen > 300_000 or time.time() - t0 > 60:
                     break
             if hits:
                 raise RuntimeError(f"ESCAPED: found {hits[:5]}")
@@ -112,22 +125,29 @@ ATTACKS = [
         '''), "ok", container_only=True),
 
     Attack("fork_bomb", "spawn more processes than the pid limit", textwrap.dedent('''\
-        import subprocess
+        import time
         def load_model():
-            procs = []
+            # Raw fork(): fails cleanly with EAGAIN at the pid limit.
+            kids = []
             try:
                 for _ in range(200):
-                    procs.append(subprocess.Popen(["sleep", "30"]))
-            except (OSError, BlockingIOError):
+                    pid = os.fork()
+                    if pid == 0:
+                        time.sleep(30)
+                        os._exit(0)
+                    kids.append(pid)
+            except OSError:
                 pass
-            finally:
-                n = len(procs)
-                for p in procs:
-                    p.kill()
-            if n >= 200:
-                raise RuntimeError(f"ESCAPED: spawned {n} processes")
+            for pid in kids:
+                try:
+                    os.kill(pid, 9)
+                    os.waitpid(pid, 0)
+                except OSError:
+                    pass
+            if len(kids) >= 200:
+                raise RuntimeError(f"ESCAPED: spawned {len(kids)} processes")
         predict = baseline
-        '''), "ok", container_only=True, limits={"pids": 64}),
+        '''), "ok", container_only=True, limits={"pids": 64, "predict_timeout_s": 120}),
 
     Attack("memory", "allocate past the memory limit", textwrap.dedent('''\
         def load_model():

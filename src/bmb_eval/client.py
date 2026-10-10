@@ -27,18 +27,29 @@ class Client:
         self.token = token
         self.timeout = timeout
 
-    def _req(self, method: str, path: str, body: dict | None = None) -> dict:
+    def _req(self, method: str, path: str, body: dict | None = None, attempts: int = 6) -> dict:
+        """JSON request. Temporary failures (hub restarting, network blips) are
+        retried with backoff, so long waits survive a hub update."""
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(self.url + path, data=data, method=method, headers={
-            "Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.loads(r.read())
-        except urllib.error.HTTPError as e:
+        for attempt in range(attempts):
+            req = urllib.request.Request(self.url + path, data=data, method=method, headers={
+                "Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
             try:
-                return json.loads(e.read())
-            except Exception:
-                raise e
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                if e.code in (502, 503, 504) and attempt < attempts - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                try:
+                    return json.loads(e.read())
+                except Exception:
+                    raise e
+            except (urllib.error.URLError, OSError):
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(2 ** attempt)
+        raise RuntimeError("unreachable")
 
     def tasks(self) -> dict:
         return self._req("GET", "/v1/tasks")

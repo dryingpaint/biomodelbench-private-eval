@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Runs the CLI from this checkout's virtualenv with this checkout's config.yaml.
+here="$(cd "$(dirname "$0")" && pwd)"
+export BMB_CONFIG="${BMB_CONFIG:-$here/config.yaml}"
+exec "$here/.venv/bin/bmb-eval" "$@"

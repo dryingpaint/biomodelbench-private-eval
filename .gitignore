@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.DS_Store
+
+# Provider-local state. Never commit: holds private data paths, tokens, run logs.
+config.yaml
+state/
+private_data/
+approved.lock.json
+hub_state/

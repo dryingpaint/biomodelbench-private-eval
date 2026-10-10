@@ -1,0 +1,669 @@
+"""bmb-eval command line.
+
+Providers need two commands: `connect` (once) and, rarely, `stop`.
+Everything else is for troubleshooting, operators, or agents.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+import yaml
+
+from . import approval, audit, leakage, scaffold
+from .config import save_yaml
+from .sandbox import ENGINES, detect_engine, make as make_sandbox
+
+IMAGE = "bmb-eval-sandbox:latest"
+EXAMPLE = "example_regression"
+
+
+def _cfg(args):
+    from .config import Config
+    return Config.load(args.config)
+
+
+def _repo_root() -> Path:
+    """Directory holding sandbox/Dockerfile (the install directory)."""
+    for d in [Path(os.environ.get("BMB_CONFIG", "config.yaml")).resolve().parent, Path.cwd(),
+              *Path(__file__).resolve().parents]:
+        if (d / "sandbox" / "Dockerfile").is_file():
+            return d
+    raise SystemExit("cannot find sandbox/Dockerfile; run from the bmb-eval directory")
+
+
+# ------------------------------------------------------------------- setup
+
+def cmd_init(args) -> None:
+    cfg_path = Path(args.config)
+    if cfg_path.exists() and not args.force:
+        raise SystemExit(f"{cfg_path} exists (use --force to overwrite)")
+    engine = args.engine
+    if engine == "auto":
+        engine = detect_engine()
+        if engine is None:
+            raise SystemExit(
+                "No running container engine found. Install Podman:\n"
+                "  Ubuntu/Debian:  sudo apt-get install -y podman\n"
+                "  RHEL/Fedora:    sudo dnf install -y podman")
+    runtime = "runsc" if engine in ENGINES and _has_gvisor(engine) else None
+
+    root = cfg_path.resolve().parent
+    tasks = {}
+    if args.example:
+        inp, ans = scaffold.example_private_data(root / "private_data" / EXAMPLE)
+        tasks[EXAMPLE] = {"dir": f"tasks/{EXAMPLE}",
+                          "inputs": str(inp.relative_to(root)),
+                          "answers": str(ans.relative_to(root))}
+    raw = {
+        "node_name": socket.gethostname().split(".")[0],
+        "sandbox": {"backend": engine, "image": IMAGE, "runtime": runtime},
+        "alerts": {"webhook_url": None, "infra_failure_threshold": 3},
+        "retain_bundles": False,
+        "tasks": tasks,
+    }
+    if engine == "local":
+        raw["sandbox"]["i_understand_local_backend_is_not_isolated"] = True
+    save_yaml(cfg_path, raw)
+    print(f"wrote {cfg_path}  (sandbox: {engine}" + (", gVisor" if runtime else "") + ")")
+
+
+def _has_gvisor(engine: str) -> bool:
+    if engine == "docker":
+        r = subprocess.run(["docker", "info", "--format", "{{json .Runtimes}}"],
+                           capture_output=True, text=True)
+        return "runsc" in r.stdout
+    return shutil.which("runsc") is not None
+
+
+def cmd_build_image(args) -> None:
+    """Load the prebuilt sandbox image from the hub if offered, else build it."""
+    cfg = _cfg(args)
+    engine = cfg.backend
+    if engine not in ENGINES:
+        print("local backend: no image needed")
+        return
+    if args.from_url:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".tar") as f:
+                print("downloading the sandbox image...")
+                with urllib.request.urlopen(args.from_url, timeout=600) as r:
+                    shutil.copyfileobj(r, f)
+                f.flush()
+                subprocess.run([engine, "load", "-i", f.name], check=True, capture_output=True)
+            print("sandbox image ready")
+            return
+        except Exception as e:
+            print(f"prebuilt image unavailable ({type(e).__name__}); building locally instead")
+    root = _repo_root()
+    print("building the sandbox image (a few minutes the first time)...")
+    subprocess.run([engine, "build", "-q", "-t", IMAGE, "-f", str(root / "sandbox" / "Dockerfile"),
+                    str(root)], check=True)
+    print("sandbox image ready")
+
+
+# ----------------------------------------------------------------- connect
+
+REASON_TEXT = {
+    "null_not_allowed": "has empty values",
+    "wrong_type": "has values of the wrong type (expected {type})",
+    "non_finite": "has infinite or NaN values",
+    "below_min": "has values below the allowed range",
+    "above_max": "has values above the allowed range",
+    "not_in_allowed_values": "has values that aren't in the allowed list",
+}
+
+
+def data_problems(t) -> list[str]:
+    """Plain-language problems with a task's data files, or []."""
+    import pandas as pd
+
+    from .contract import check_frame
+    c = t.contract
+    out = []
+    frames = {}
+    for label, path, fields in (("inputs", t.inputs, c.inputs), ("answers", t.answers, c.answers)):
+        if not path.exists():
+            if out:
+                continue
+            out.append(f"Can't find your data file at {path}.")
+            continue
+        df = pd.read_parquet(path)
+        frames[label] = df
+        bad = check_frame(fields, df, strict_columns=False, key=c.key)
+        if not bad:
+            continue
+        col, reason = bad
+        if reason == "missing_column":
+            out.append(f"Your data file has no column '{col}'. "
+                       f"Columns found: {', '.join(map(str, df.columns))}.")
+        elif reason == "duplicate_keys":
+            out.append(f"Some IDs ('{col}') appear more than once in your data file.")
+        else:
+            ftype = next((f.type for f in fields if f.name == col), "")
+            out.append(f"Column '{col}' in your data file "
+                       + REASON_TEXT.get(reason, reason).format(type=ftype) + ".")
+    if len(frames) == 2 and not out:
+        ik = set(map(tuple, frames["inputs"][c.key].astype(str).to_numpy()))
+        ak = set(map(tuple, frames["answers"][c.key].astype(str).to_numpy()))
+        if ik != ak:
+            out.append(f"The inputs and answers must list the same IDs: {len(ik - ak)} input "
+                       f"rows have no answer and {len(ak - ik)} answers have no input row.")
+    return out
+
+
+def _read_table(path: Path):
+    """Read the provider's file (.csv, .tsv, .txt or .parquet) as a DataFrame."""
+    import pandas as pd
+    if not path.is_file():
+        raise SystemExit(f"Can't find {path}")
+    if path.suffix == ".parquet":
+        return pd.read_parquet(path)
+    if path.suffix not in (".csv", ".tsv", ".txt"):
+        raise SystemExit(f"{path.name}: please provide a .csv, .tsv or .parquet file")
+    return pd.read_csv(path, sep="\t" if path.suffix in (".tsv", ".txt") else ",")
+
+
+def _user_path(p: str) -> Path:
+    """Resolve a path the way the user typed it (install.sh changes directory)."""
+    q = Path(p).expanduser()
+    return q if q.is_absolute() else (Path(os.environ.get("BMB_CALLER_CWD", ".")) / q).resolve()
+
+
+def _split_data(df, c, dest: Path) -> tuple[Path, Path]:
+    """One provider file -> inputs.parquet (only what the model may see) and
+    answers.parquet (key + answer columns). Other columns are dropped."""
+    dest.mkdir(parents=True, exist_ok=True)
+    want_in = [f.name for f in c.inputs]
+    want_ans = [f.name for f in c.answers]
+    missing = [col for col in dict.fromkeys(want_in + want_ans) if col not in df.columns]
+    if missing:
+        print("\nThere's a problem with your data file:")
+        for col in missing:
+            print(f"  • It has no column '{col}'.")
+        print(f"  Columns found: {', '.join(map(str, df.columns))}")
+        raise SystemExit("\nFix the file and run the same command again.")
+    df[want_in].to_parquet(dest / "inputs.parquet", index=False)
+    df[want_ans].to_parquet(dest / "answers.parquet", index=False)
+    return dest / "inputs.parquet", dest / "answers.parquet"
+
+
+def _bind_task(cfg_path: Path, task: str, task_dir: Path, inputs: Path, answers: Path) -> None:
+    raw = yaml.safe_load(cfg_path.read_text()) or {}
+    raw.setdefault("tasks", {})[task] = {
+        "dir": str(task_dir.relative_to(cfg_path.parent)),
+        "inputs": str(inputs), "answers": str(answers)}
+    save_yaml(cfg_path, raw)
+
+
+def _selftest(cfg, task: str, verbose: bool) -> int:
+    from .redteam import ATTACKS, bundle_bytes
+    from .runner import Runner
+    import pandas as pd
+    t = cfg.tasks[task]
+    first_row = " ".join(map(str, pd.read_parquet(
+        t.inputs, columns=[f.name for f in t.contract.inputs]).iloc[0].tolist()))
+    runner = Runner(cfg, send_alerts=False)
+    local = cfg.backend == "local"
+    failed = 0
+    for a in ATTACKS:
+        if a.container_only and local:
+            if verbose:
+                print(f"  SKIP  {a.name:14s} {a.what} (local backend has no isolation)")
+            continue
+        p = runner.evaluate(task, bundle_bytes(a), submitter="selftest", limits_override=a.limits)
+        got = "ok" if p["status"] == "ok" else p["error"]["code"]
+        leaked = first_row in json.dumps(p)
+        ok = got == a.expect and not leaked
+        failed += not ok
+        if verbose or not ok:
+            why = "" if ok else f"  expected {a.expect}, got {got}" + (
+                ", PRIVATE DATA IN PAYLOAD" if leaked else "")
+            print(f"  {'PASS' if ok else 'FAIL'}  {a.name:14s} {a.what}{why}")
+    audit.record(cfg.state_dir, "selftest", task=task, backend=cfg.backend, failed=failed)
+    return failed
+
+
+def _kb(bits: float) -> str:
+    b = bits / 8
+    return f"{b:,.0f} bytes" if b < 1000 else f"{b / 1000:.1f} KB"
+
+
+def _summary(c, n_rows: int) -> str:
+    b = leakage.budget(c)
+    lim = c.limits
+    total = f", {lim.submissions_total} in total" if lim.submissions_total else ""
+    worst = (f"at most ~{_kb(b.lifetime)} of information about your data, "
+             f"across all {lim.submissions_total} evaluations"
+             if b.lifetime else f"at most ~{b.per_submission:.0f} bits per evaluation")
+    hidden = [f.name for f in c.answers if f.name not in c.key]
+    return "\n".join([
+        f"  Task:                {c.title}",
+        f"  Rows:                {n_rows:,}",
+        f"  The model will see:  {', '.join(f.name for f in c.inputs)}",
+        f"  Never shared:        {', '.join(hidden)}",
+        f"  Evaluations:         at most {lim.submissions_per_day}/day per agent{total}",
+        f"  What leaves:         only scores ({', '.join(m.name for m in c.metrics)}), "
+        f"{c.decimals} decimals",
+        f"  Worst case:          a model built to extract data could learn {worst}",
+    ])
+
+
+def cmd_connect(args) -> None:
+    from .config import Config
+    from .node import HubAPI, HubError, parse_connect
+    hub_url, code = parse_connect(args.code, args.hub)
+    cfg_path = Path(args.config).resolve()
+    root = cfg_path.parent
+
+    # 1. Fetch the task package (does not use up the code).
+    try:
+        pkg = HubAPI(hub_url).enrollment(code)
+    except HubError as e:
+        raise SystemExit(f"Couldn't use that connect link: {e}")
+    task = pkg["task"]
+    print(f"Connecting to BioModelBench for task '{task}'...")
+
+    # 2. Node config, sandbox image and task files.
+    if not cfg_path.exists():
+        cmd_init(argparse.Namespace(config=str(cfg_path), engine="auto", example=False,
+                                    force=False))
+    cfg = Config.load(cfg_path)
+    if cfg.backend in ENGINES and make_sandbox(cfg).image_id() == "missing":
+        cmd_build_image(argparse.Namespace(config=str(cfg_path), from_url=f"{hub_url}/sandbox-image.tar"))
+    task_dir = root / "tasks" / task
+    task_dir.mkdir(parents=True, exist_ok=True)
+    for name, text in pkg["files"].items():
+        if "/" in name or name.startswith("."):
+            raise SystemExit("unexpected file in task package")
+        (task_dir / name).write_text(text)
+
+    # 3. Their data: one file, split locally into what the model sees and the answers.
+    from .contract import Contract
+    df = _read_table(_user_path(args.data))
+    inputs, answers = _split_data(df, Contract.load(task_dir / "contract.yaml"),
+                                  root / "private_data" / task)
+    _bind_task(cfg_path, task, task_dir, inputs, answers)
+    cfg = Config.load(cfg_path)
+    problems = data_problems(cfg.tasks[task])
+    if problems:
+        print("\nThere's a problem with your data file:")
+        for p in problems:
+            print(f"  • {p}")
+        raise SystemExit("\nFix the file and run the same command again.")
+    print(f"✓ Your data looks good ({len(df):,} rows)")
+
+    # 4. Prove the sandbox holds on this machine, with this data.
+    print("  Testing this machine's security (about a minute)...")
+    if _selftest(cfg, task, verbose=False):
+        raise SystemExit("\nThe security self-test failed, so nothing was started. "
+                         "Please send the lines above to BioModelBench.")
+    print("✓ Security self-test passed")
+
+    # 5. Informed approval.
+    print("\n" + _summary(cfg.tasks[task].contract, len(df)) + "\n")
+    if not args.yes and _ask("Approve and start? [y/N] ") not in ("y", "yes"):
+            raise SystemExit("Not started. Nothing was shared. "
+                             "Run the same command again whenever you're ready.")
+
+    # 6. Lock, activate, run.
+    fp = approval.approve(cfg)
+    audit.record(cfg.state_dir, "approved", fingerprint=fp)
+    api = HubAPI(hub_url, (cfg.hub or {}).get("secret"))
+    try:
+        creds = api.activate(code, cfg.node_name)
+    except HubError as e:
+        raise SystemExit(f"Couldn't finish connecting: {e}")
+    raw = yaml.safe_load(cfg_path.read_text())
+    hub = raw.get("hub") or {"url": hub_url}
+    hub["node_id"] = creds["node_id"]
+    if "secret" in creds:
+        hub["secret"] = creds["secret"]
+    raw["hub"] = hub
+    save_yaml(cfg_path, raw)
+    audit.record(cfg.state_dir, "connected", hub=hub_url, task=task, node_id=creds["node_id"])
+
+    started = not args.no_service and _install_service(Config.load(cfg_path))
+    print(f"\n✓ Connected. Task '{task}' is live.")
+    if started:
+        print("  The node runs in the background and restarts on reboot. You can log out.")
+    else:
+        print(f"  Start the node with:  {root}/bmb-eval run")
+    print(f"  Check on it:  {root}/bmb-eval status      Emergency stop:  {root}/bmb-eval stop")
+
+
+def _ask(prompt: str) -> str:
+    """Prompt on the terminal, even when stdin is the piped install script."""
+    try:
+        if sys.stdin.isatty():
+            return input(prompt).strip().lower()
+        # Separate handles: a tty isn't seekable, so "r+" fails.
+        with open("/dev/tty", "w") as out, open("/dev/tty") as inp:
+            out.write(prompt)
+            out.flush()
+            return inp.readline().strip().lower()
+    except (OSError, EOFError):
+        raise SystemExit("Run this in a terminal so you can approve it.")
+
+
+def _install_service(cfg) -> bool:
+    if platform.system() != "Linux" or not shutil.which("systemctl"):
+        return False
+    exe = shutil.which("bmb-eval") or f"{sys.executable} -m bmb_eval.cli"
+    unit = Path.home() / ".config/systemd/user/bmb-eval.service"
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text(f"""[Unit]
+Description=BioModelBench evaluation node
+After=network-online.target
+
+[Service]
+WorkingDirectory={cfg.path.parent}
+Environment=BMB_CONFIG={cfg.path}
+ExecStart={exe} --config {cfg.path} run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+""")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    r = subprocess.run(["systemctl", "--user", "enable", "--now", "bmb-eval"], capture_output=True)
+    if r.returncode != 0:
+        return False
+    subprocess.run(["systemctl", "--user", "restart", "bmb-eval"], capture_output=True)
+    user = os.environ.get("USER", "")
+    if subprocess.run(["loginctl", "enable-linger", user], capture_output=True).returncode != 0:
+        print(f"  NOTE: so the node keeps running after you log out, run once:\n"
+              f"    sudo loginctl enable-linger {user}")
+    return True
+
+
+def cmd_install_service(args) -> None:
+    if not _install_service(_cfg(args)):
+        raise SystemExit("could not install a systemd user service; use `bmb-eval run`")
+    print("service installed; logs: journalctl --user -u bmb-eval -f")
+
+
+def cmd_run(args) -> None:
+    from .node import Worker
+    Worker(_cfg(args)).run_forever()
+
+
+# ------------------------------------------------------------- day to day
+
+def cmd_status(args) -> None:
+    from .node import paused_path
+    from .store import Store
+    cfg = _cfg(args)
+    ok, n, msg = audit.verify(cfg.state_dir)
+    drift = approval.diff(cfg)
+    running = subprocess.run(["systemctl", "--user", "is-active", "bmb-eval"],
+                             capture_output=True, text=True).stdout.strip() if shutil.which("systemctl") else "?"
+    print(f"connected   {cfg.hub.get('url', 'NO (run the connect command)')}")
+    print(f"service     {running}")
+    print(f"accepting   {'NO: stopped (bmb-eval resume)' if paused_path(cfg).exists() else 'NO: settings changed (bmb-eval approve)' if drift else 'yes'}")
+    print(f"sandbox     {cfg.backend}{' + gVisor' if cfg.runtime else ''}")
+    print(f"audit log   {n} entries, {msg}")
+    counts = Store(cfg.state_dir).summary()
+    for task in cfg.tasks:
+        if task != EXAMPLE:
+            c = counts.get(task, {})
+            print(f"task        {task}: {c.get('done', 0)} evaluated, "
+                  f"{c.get('queued', 0) + c.get('running', 0)} in progress")
+
+
+def cmd_stop(args) -> None:
+    from . import alerts
+    from .node import paused_path
+    cfg = _cfg(args)
+    paused_path(cfg).write_text("paused\n")
+    n = make_sandbox(cfg).kill_all()
+    audit.record(cfg.state_dir, "stopped", killed=n)
+    alerts.send(cfg, "control", f"stopped by operator; {n} running evaluation(s) killed")
+    print(f"Stopped. No new evaluations will run ({n} running one(s) killed).\n"
+          f"Resume any time with: bmb-eval resume")
+
+
+def cmd_resume(args) -> None:
+    from .node import paused_path
+    cfg = _cfg(args)
+    paused_path(cfg).unlink(missing_ok=True)
+    audit.record(cfg.state_dir, "resumed")
+    print("Resumed.")
+
+
+def cmd_approve(args) -> None:
+    cfg = _cfg(args)
+    for d in approval.diff(cfg):
+        print("  changed:", d)
+    fp = approval.approve(cfg)
+    audit.record(cfg.state_dir, "approved", fingerprint=fp)
+    print("Approved. The node will accept evaluations with these settings.")
+
+
+# ------------------------------------------------------------ troubleshoot
+
+def cmd_check(args) -> None:
+    cfg = _cfg(args)
+    errors, warnings = [], []
+    if cfg.backend == "local":
+        errors.append("sandbox.backend is local: submitted code would NOT be isolated")
+    elif subprocess.run([cfg.backend, "info"], capture_output=True).returncode != 0:
+        errors.append(f"{cfg.backend} is not running")
+    elif make_sandbox(cfg).image_id() == "missing":
+        errors.append(f"sandbox image {cfg.image} missing (bmb-eval build-image)")
+    elif not cfg.runtime:
+        warnings.append("gVisor not configured (optional hardening; see docs/PROVIDER_SETUP.md)")
+    for tid, t in cfg.tasks.items():
+        print(f"\n== {tid}")
+        errors += [f"{tid}: {p}" for p in data_problems(t)]
+        print("   " + leakage.describe(t.contract).replace("\n", "\n   "))
+        if leakage.budget(t.contract).per_submission == float("inf"):
+            errors.append(f"{tid}: a metric has no min/max bounds")
+    print()
+    for w in warnings:
+        print(f"WARN  {w}")
+    for e in errors:
+        print(f"FAIL  {e}")
+    if approval.diff(cfg):
+        print("NOTE  settings not yet approved (bmb-eval approve)")
+    if errors:
+        sys.exit(1)
+    print("check passed")
+
+
+def cmd_selftest(args) -> None:
+    cfg = _cfg(args)
+    task = args.task or (EXAMPLE if EXAMPLE in cfg.tasks else next(iter(cfg.tasks), None))
+    if task is None:
+        print("no task connected yet; the self-test runs when you connect")
+        return
+    print(f"security self-test (task {task!r}, sandbox {cfg.backend}"
+          + (" + gVisor" if cfg.runtime else "") + ")")
+    failed = _selftest(cfg, task, verbose=True)
+    if cfg.backend == "local":
+        print("\nlocal backend: isolation NOT tested and NOT present.")
+    if failed:
+        print(f"\n{failed} check(s) failed. Please send this output to BioModelBench.")
+        sys.exit(1)
+    print("\nall checks passed")
+
+
+def cmd_add_task(args) -> None:
+    cfg_path = Path(args.config).resolve()
+    dest = cfg_path.parent / "private_data" / args.task
+    dest.mkdir(parents=True, exist_ok=True)
+    inputs, answers = dest / "inputs.parquet", dest / "answers.parquet"
+    _read_table(_user_path(args.inputs)).to_parquet(inputs, index=False)
+    _read_table(_user_path(args.answers)).to_parquet(answers, index=False)
+    d = scaffold.add_task(args.task, cfg_path.parent / "tasks", inputs, answers,
+                          args.key, args.kind, args.target)
+    _bind_task(cfg_path, args.task, d, inputs, answers)
+    print(f"created {d}/contract.yaml and {d}/score.py")
+
+
+def cmd_eval(args) -> None:
+    from .bundle import pack_dir
+    from .runner import Runner
+    cfg = _cfg(args)
+    p = Path(args.bundle)
+    data = pack_dir(p) if p.is_dir() else p.read_bytes()
+    print(json.dumps(Runner(cfg).evaluate(args.task, data, submitter="operator"), indent=2))
+
+
+def cmd_contract(args) -> None:
+    print(json.dumps(_cfg(args).tasks[args.task].contract.public(), indent=2))
+
+
+def cmd_audit(args) -> None:
+    ok, n, msg = audit.verify(_cfg(args).state_dir)
+    print(f"{n} entries: {msg}")
+    sys.exit(0 if ok else 1)
+
+
+# ------------------------------------------------------------------- agent
+
+def _load_public(path: str):
+    from .contract import Contract
+    return Contract.from_dict(json.loads(Path(path).read_text()), public=True)
+
+
+def cmd_submit(args) -> None:
+    from .client import Client
+    token = args.token or os.environ.get("BMB_TOKEN")
+    if not token:
+        raise SystemExit("pass --token or set BMB_TOKEN")
+    c = Client(args.hub, token)
+    res = c.submit(args.task, args.bundle) if args.wait else c.submit_async(args.task, args.bundle)
+    print(json.dumps(res, indent=2))
+
+
+def cmd_synth(args) -> None:
+    df = scaffold.synth_inputs(_load_public(args.contract), n=args.n)
+    df.to_parquet(args.out, index=False)
+    print(f"wrote {len(df)} synthetic rows to {args.out}")
+
+
+def cmd_dryrun(args) -> None:
+    """Run predict + validate on synthetic inputs, unisolated, with full logs.
+    For agents iterating on a bundle before spending a private evaluation."""
+    from .sandbox import LocalSandbox, Mount
+    c = _load_public(args.contract)
+    bundle = Path(args.bundle).resolve()
+    with tempfile.TemporaryDirectory() as tmp:
+        inputs = Path(tmp) / "inputs.parquet"
+        scaffold.synth_inputs(c, n=args.n).to_parquet(inputs, index=False)
+        env = {"BMB_CONTRACT": json.dumps(c.public())}
+        lim = c.limits
+        sb = LocalSandbox()
+        r = sb.run(name="dryrun-predict", entry="predict", env=env, limits=lim,
+                   mounts=[Mount("BMB_BUNDLE", bundle, ""), Mount("BMB_INPUTS", inputs, "")],
+                   timeout_s=lim.predict_timeout_s, stdout_cap=lim.max_predictions_mb << 20)
+        sys.stderr.write(r.stderr)
+        if r.exit_code != 0 or r.timed_out or r.stdout_overflow or not r.stdout:
+            raise SystemExit(f"predict failed: exit={r.exit_code} timed_out={r.timed_out} "
+                             f"overflow={r.stdout_overflow} bytes={len(r.stdout)}")
+        v = sb.run(name="dryrun-validate", entry="validate", env=env, limits=lim,
+                   mounts=[Mount("BMB_INPUTS", inputs, "")], stdin=r.stdout,
+                   timeout_s=lim.validate_timeout_s, stdout_cap=lim.max_predictions_mb << 20)
+        if v.exit_code != 0:
+            sys.stderr.write(v.stderr)
+            raise SystemExit(f"predictions rejected: {v.stdout.decode(errors='replace')}")
+    print(f"ok: predict ran in {r.seconds}s and its predictions pass the contract "
+          f"({args.n} synthetic rows). Metrics need the private node.")
+
+
+# -------------------------------------------------------------------- main
+
+def main(argv=None) -> None:
+    ap = argparse.ArgumentParser(
+        prog="bmb-eval",
+        description="BioModelBench evaluation node. Providers: `connect` once; "
+                    "`status`, `stop`, `resume` as needed.")
+    ap.add_argument("--config", default=os.environ.get("BMB_CONFIG", "config.yaml"))
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="command")
+
+    # Providers
+    p = sub.add_parser("connect", help="connect this machine using the code BioModelBench sent you")
+    p.add_argument("code", help="XXXX-XXXX-XXXX, or https://<hub>/c/XXXX-XXXX-XXXX")
+    p.add_argument("--data", required=True, help="your data file (.csv, .tsv or .parquet)")
+    p.add_argument("--hub", default=os.environ.get("BMB_HUB"), help=argparse.SUPPRESS)
+    p.add_argument("--yes", action="store_true", help="approve without asking")
+    p.add_argument("--no-service", action="store_true", help="don't install the background service")
+    p.set_defaults(fn=cmd_connect)
+    sub.add_parser("status", help="is everything running?").set_defaults(fn=cmd_status)
+    sub.add_parser("stop", help="emergency stop: refuse new work, kill running evaluations"
+                   ).set_defaults(fn=cmd_stop)
+    sub.add_parser("resume", help="undo stop").set_defaults(fn=cmd_resume)
+    sub.add_parser("approve", help="accept changed settings").set_defaults(fn=cmd_approve)
+
+    # Setup and troubleshooting
+    p = sub.add_parser("init", help="(setup) write config.yaml")
+    p.add_argument("--engine", default="auto", choices=["auto", *ENGINES, "local"])
+    p.add_argument("--example", action="store_true", help="add a demo task with fake data")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_init)
+    p = sub.add_parser("build-image", help="(setup) get or build the sandbox image")
+    p.add_argument("--from", dest="from_url", help="URL of a prebuilt image tarball")
+    p.set_defaults(fn=cmd_build_image)
+    sub.add_parser("run", help="(service) run the node in the foreground").set_defaults(fn=cmd_run)
+    sub.add_parser("install-service", help="(service) reinstall the background service"
+                   ).set_defaults(fn=cmd_install_service)
+    sub.add_parser("check", help="(troubleshoot) check data, sandbox, leakage budget"
+                   ).set_defaults(fn=cmd_check)
+    p = sub.add_parser("selftest", help="(troubleshoot) run attack bundles against the sandbox")
+    p.add_argument("--task")
+    p.set_defaults(fn=cmd_selftest)
+    p = sub.add_parser("eval", help="(troubleshoot) evaluate a bundle locally")
+    p.add_argument("task")
+    p.add_argument("bundle")
+    p.set_defaults(fn=cmd_eval)
+    p = sub.add_parser("audit", help="(troubleshoot) verify the audit log")
+    p.add_argument("action", choices=["verify"])
+    p.set_defaults(fn=cmd_audit)
+    p = sub.add_parser("add-task", help="(operator) create a task from data files, without the hub")
+    p.add_argument("task")
+    p.add_argument("--inputs", required=True)
+    p.add_argument("--answers", required=True)
+    p.add_argument("--key", required=True, nargs="+")
+    p.add_argument("--kind", default="regression", choices=sorted(scaffold.SCORERS))
+    p.add_argument("--target")
+    p.set_defaults(fn=cmd_add_task)
+    p = sub.add_parser("contract", help="(operator) print a task's public contract")
+    p.add_argument("task")
+    p.set_defaults(fn=cmd_contract)
+
+    # Agents
+    p = sub.add_parser("submit", help="(agent) submit a bundle to the hub")
+    p.add_argument("--hub", required=True)
+    p.add_argument("--token")
+    p.add_argument("--no-wait", dest="wait", action="store_false")
+    p.add_argument("task")
+    p.add_argument("bundle")
+    p.set_defaults(fn=cmd_submit)
+    p = sub.add_parser("synth", help="(agent) synthetic inputs from a public contract")
+    p.add_argument("contract")
+    p.add_argument("--out", default="synthetic_inputs.parquet")
+    p.add_argument("-n", type=int, default=200)
+    p.set_defaults(fn=cmd_synth)
+    p = sub.add_parser("dryrun", help="(agent) run a bundle on synthetic inputs with full logs")
+    p.add_argument("contract")
+    p.add_argument("bundle")
+    p.add_argument("-n", type=int, default=200)
+    p.set_defaults(fn=cmd_dryrun)
+
+    args = ap.parse_args(argv)
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

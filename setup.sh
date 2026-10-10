@@ -7,26 +7,12 @@ cd "$(dirname "$0")"
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 say "Installing"
-PY=""
-for c in python3.13 python3.12 python3.11 python3; do
-  if command -v "$c" >/dev/null && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
-    PY="$c"; break
-  fi
-done
-if command -v uv >/dev/null; then
-  [ -d .venv ] || uv venv -q --python 3.12 .venv
-  uv pip install -q --python .venv/bin/python -e .
-elif [ -n "$PY" ]; then
-  [ -d .venv ] || "$PY" -m venv .venv
-  .venv/bin/pip install -q --upgrade pip
-  .venv/bin/pip install -q -e .
-else
-  # No Python 3.11+ (e.g. Ubuntu 22.04, RHEL 9): uv brings its own, into ~/.local.
-  curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
-  export PATH="$HOME/.local/bin:$PATH"
-  uv venv -q --python 3.12 .venv
-  uv pip install -q --python .venv/bin/python -e .
-fi
+# uv installs without sudo and brings its own Python, so this works the same on
+# every distribution (stock Ubuntu's python3 can't create virtualenvs).
+export PATH="$HOME/.local/bin:$PATH"
+command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+[ -x .venv/bin/python ] || { rm -rf .venv; uv venv -q --python 3.12 .venv; }
+uv pip install -q --python .venv/bin/python -e .
 
 [ -f config.yaml ] || ./bmb-eval init --engine "${BMB_ENGINE:-auto}"
 

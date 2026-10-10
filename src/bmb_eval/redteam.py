@@ -84,11 +84,16 @@ ATTACKS = [
                 if os.path.exists(sock):
                     hits.append(sock)
             # 1. Mounts: the precise answer to "what host files can this code reach?"
+            #    Memory-only and kernel filesystems are private to the container.
+            private = {"tmpfs", "proc", "sysfs", "devpts", "mqueue", "cgroup", "cgroup2",
+                       "devtmpfs", "shm", "overlay"}
             with open("/proc/self/mountinfo") as fh:
                 for line in fh:
-                    target = line.split()[4]
-                    if target != "/" and not target.startswith(ALLOWED):
-                        hits.append("mount:" + target)
+                    fields = line.split()
+                    target, fstype = fields[4], fields[fields.index("-") + 1]
+                    if fstype in private or target == "/" or target.startswith(ALLOWED):
+                        continue
+                    hits.append(f"mount:{target} ({fstype})")
             # 2. Data files outside the inputs and the image's own libraries.
             inputs_dir = os.path.realpath(os.path.dirname(_inputs_path()))
             skip = (inputs_dir + os.sep, sys.prefix + os.sep, "/usr/")

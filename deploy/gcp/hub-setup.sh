@@ -32,9 +32,12 @@ gcloud services enable compute.googleapis.com storage.googleapis.com iamcredenti
 say "Service account"
 exists gcloud iam service-accounts describe "$SA" --project "$PROJECT" ||
   gcloud iam service-accounts create "$NAME" --display-name "BioModelBench hub" --project "$PROJECT"
-# The hub signs upload/download links as itself.
+# The hub signs upload/download links as itself. (Editors may not be allowed
+# to set a service account's own policy; a project-level grant also works.)
 gcloud iam service-accounts add-iam-policy-binding "$SA" --project "$PROJECT" \
-  --member "serviceAccount:$SA" --role roles/iam.serviceAccountTokenCreator >/dev/null
+  --member "serviceAccount:$SA" --role roles/iam.serviceAccountTokenCreator >/dev/null 2>&1 ||
+  gcloud projects add-iam-policy-binding "$PROJECT" --condition None \
+    --member "serviceAccount:$SA" --role roles/iam.serviceAccountTokenCreator >/dev/null
 
 say "Bucket gs://$BUCKET for model files"
 exists gcloud storage buckets describe "gs://$BUCKET" ||
@@ -43,7 +46,9 @@ exists gcloud storage buckets describe "gs://$BUCKET" ||
 # Model files are kept 30 days; a later submission re-uploads anything expired.
 gcloud storage buckets update "gs://$BUCKET" --lifecycle-file lifecycle.json >/dev/null
 gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" \
-  --member "serviceAccount:$SA" --role roles/storage.objectAdmin >/dev/null
+  --member "serviceAccount:$SA" --role roles/storage.objectAdmin >/dev/null 2>&1 ||
+  gcloud projects add-iam-policy-binding "$PROJECT" --condition None \
+    --member "serviceAccount:$SA" --role roles/storage.objectAdmin >/dev/null
 
 say "Static IP and firewall"
 exists gcloud compute addresses describe "$NAME" --region "$REGION" --project "$PROJECT" ||

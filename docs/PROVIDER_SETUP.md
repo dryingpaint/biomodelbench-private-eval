@@ -6,14 +6,10 @@ them on your data and sends back only the scores. Your data never leaves.
 ## What you need
 
 - **A Linux machine that stays on.** The server your data is already on is
-  ideal. Our email says what it needs: CPU-only tasks need 4 CPUs, 16 GB RAM
-  and 150 GB free disk. Tasks with large models also need an NVIDIA GPU, 64 GB
-  RAM and about 300 GB free disk. If you don't have a suitable machine, talk to
-  us and we'll help you set one up.
+  ideal. If you don't have a suitable machine, talk to us and we'll help you
+  set one up.
 - **The data you described to us**, as one file or one folder, in whatever
   format it's already in.
-
-## The one step
 
 Run the command from our email on that machine:
 

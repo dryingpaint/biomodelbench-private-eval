@@ -33,12 +33,20 @@ SANDBOX_FILES="sandbox/Dockerfile sandbox/requirements.txt src/bmb_eval/__init__
 STAMP="$(cd "$CODE" && cat $SANDBOX_FILES | sha256sum | cut -c1-16)"
 # Built as root: a boot script has no user login session, which rootless
 # Podman needs. The image is only exported as a file for providers.
-if [ "$(cat "$STATE/sandbox-image.stamp" 2>/dev/null)" != "$STAMP" ]; then
+# Published only once complete, flushed to disk and readable, with a checksum
+# providers verify (a reset right after writing once truncated it).
+if [ "$(cat "$STATE/sandbox-image.stamp" 2>/dev/null)" != "$STAMP" ] ||
+   ! sha256sum --status -c "$STATE/sandbox-image.tar.sha256" 2>/dev/null; then
+  rm -f "$STATE/sandbox-image.stamp"
   (cd "$CODE" && podman build -q -t bmb-eval-sandbox:latest -f sandbox/Dockerfile . >/dev/null)
   podman save -o "$STATE/sandbox-image.tar.tmp" bmb-eval-sandbox:latest
+  sync
+  tar -tf "$STATE/sandbox-image.tar.tmp" >/dev/null
   mv "$STATE/sandbox-image.tar.tmp" "$STATE/sandbox-image.tar"
+  (cd "$STATE" && sha256sum sandbox-image.tar > sandbox-image.tar.sha256)
   echo "$STAMP" > "$STATE/sandbox-image.stamp"
-  chown bmb "$STATE/sandbox-image.tar" "$STATE/sandbox-image.stamp"
+  sync
+  chown bmb "$STATE"/sandbox-image.*
 fi
 
 cat > /etc/systemd/system/bmb-hub.service <<UNIT

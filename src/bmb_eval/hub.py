@@ -339,6 +339,9 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                                   ctype="text/markdown; charset=utf-8")
             if p == "/sandbox-image.tar" and image_tar.is_file():
                 return self._send_file(image_tar, "application/x-tar")
+            if p == "/sandbox-image.tar.sha256" and image_tar.with_suffix(".tar.sha256").is_file():
+                return self._send(200, body=image_tar.with_suffix(".tar.sha256").read_bytes(),
+                                  ctype="text/plain")
             if m := re.fullmatch(r"/v1/enroll/([A-Z0-9-]{14})", p):
                 e = store.enrollment(m.group(1))
                 if e is None or e[2] is not None:

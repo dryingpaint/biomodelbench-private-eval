@@ -66,7 +66,7 @@ say "VM $NAME"
 if exists gcloud compute instances describe "$NAME" --zone "$ZONE" --project "$PROJECT"; then
   gcloud compute instances add-metadata "$NAME" --zone "$ZONE" --project "$PROJECT" \
     --metadata "domain=$DOMAIN,bucket=$BUCKET,repo=$REPO" --metadata-from-file startup-script=hub-vm-startup.sh
-  echo "VM exists; settings updated. Apply with: gcloud compute instances reset $NAME --zone $ZONE"
+  echo "VM exists; settings updated. Apply with: gcloud compute ssh $NAME --zone $ZONE -- sudo reboot"
 else
   gcloud compute instances create "$NAME" --project "$PROJECT" --zone "$ZONE" \
     --machine-type e2-standard-2 --boot-disk-size 100GB --boot-disk-type pd-balanced \

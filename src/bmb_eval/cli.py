@@ -86,16 +86,24 @@ def cmd_build_image(args) -> None:
         return
     if args.from_url:
         try:
-            with tempfile.NamedTemporaryFile(suffix=".tar") as f:
-                print("downloading the sandbox image...")
+            import hashlib
+            with urllib.request.urlopen(args.from_url + ".sha256", timeout=60) as r:
+                want = r.read().decode().split()[0]
+            with tempfile.NamedTemporaryFile(suffix=".tar", dir=Path.home()) as f:
+                print("downloading the sandbox image (several GB)...")
+                h = hashlib.sha256()
                 with urllib.request.urlopen(args.from_url, timeout=600) as r:
-                    shutil.copyfileobj(r, f)
+                    while chunk := r.read(8 << 20):
+                        h.update(chunk)
+                        f.write(chunk)
                 f.flush()
+                if h.hexdigest() != want:
+                    raise ValueError("checksum mismatch")
                 subprocess.run([engine, "load", "-i", f.name], check=True, capture_output=True)
             print("sandbox image ready")
             return
         except Exception as e:
-            print(f"prebuilt image unavailable ({type(e).__name__}); building locally instead")
+            print(f"prebuilt image unavailable ({type(e).__name__}: {e}); building locally instead")
     root = _repo_root()
     print("building the sandbox image (a few minutes the first time)...")
     subprocess.run([engine, "build", "-q", "-t", IMAGE, "-f", str(root / "sandbox" / "Dockerfile"),

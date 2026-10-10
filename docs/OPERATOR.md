@@ -39,8 +39,9 @@ head -3` prints the installer.
 GB, and caching on providers' machines means a shared base model is downloaded
 once per provider.
 
-**Updating:** push to the repo, then
-`gcloud compute instances reset bmb-hub --zone us-central1-a`. On boot the VM
+**Updating:** push to the repo, then reboot the VM gracefully:
+`gcloud compute ssh bmb-hub --zone us-central1-a -- sudo reboot`. (Avoid
+`instances reset`, which is a hard power-cycle and can lose recent writes.) On boot the VM
 pulls the code, rebuilds the sandbox image if it changed, and restarts.
 Providers get updates by re-running the install command without arguments;
 their node pauses until they approve the new version.

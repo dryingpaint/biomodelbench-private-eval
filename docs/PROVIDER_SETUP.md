@@ -36,14 +36,14 @@ agreeing to:
 Approve and start? [y/N]
 ```
 
-Type `y`. **You're done.** It runs in the background and restarts after
+Type `y`. It runs in the background and restarts after
 reboots.
 
 If something needs fixing, it says what (for example, *"It has no column
 'sequence'"*, or *"This task needs 40 GB of GPU memory; the GPU here has 24
 GB"*). Fix it and run the same command again.
 
-## If you ever need to
+## Useful commands
 
 | | |
 |---|---|
@@ -62,8 +62,10 @@ no ports, web server or firewall changes are needed.
 
 ### What leaves the machine
 Only scores, such as `{"spearman": 0.712, "pearson": 0.731, "rmse": 0.193}`,
-or a fixed error code such as `predict_timeout`. Your data, the model's
-predictions, error messages and logs never leave.
+or an error from a fixed list (for example `predict_timeout`, or which output
+column was malformed). Your data, the model's predictions, logs and the
+model's own error output never leave, because a model could hide data in its
+error messages.
 
 ### What gets installed
 Podman (container software from your operating system's own package

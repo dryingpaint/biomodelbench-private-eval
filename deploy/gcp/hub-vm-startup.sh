@@ -22,10 +22,14 @@ as_bmb "mkdir -p $STATE"
 
 # Sandbox image providers download (rebuilt only when its inputs change).
 STAMP="$(cd "$CODE" && cat sandbox/Dockerfile sandbox/requirements.txt $(find src/bmb_eval -name '*.py' | sort) | sha256sum | cut -c1-16)"
+# Built as root: a boot script has no user login session, which rootless
+# Podman needs. The image is only exported as a file for providers.
 if [ "$(cat "$STATE/sandbox-image.stamp" 2>/dev/null)" != "$STAMP" ]; then
-  as_bmb "cd $CODE && podman build -q -t bmb-eval-sandbox:latest -f sandbox/Dockerfile . && \
-          podman save -o $STATE/sandbox-image.tar.tmp bmb-eval-sandbox:latest && \
-          mv $STATE/sandbox-image.tar.tmp $STATE/sandbox-image.tar && echo $STAMP > $STATE/sandbox-image.stamp"
+  (cd "$CODE" && podman build -q -t bmb-eval-sandbox:latest -f sandbox/Dockerfile . >/dev/null)
+  podman save -o "$STATE/sandbox-image.tar.tmp" bmb-eval-sandbox:latest
+  mv "$STATE/sandbox-image.tar.tmp" "$STATE/sandbox-image.tar"
+  echo "$STAMP" > "$STATE/sandbox-image.stamp"
+  chown bmb "$STATE/sandbox-image.tar" "$STATE/sandbox-image.stamp"
 fi
 
 cat > /etc/systemd/system/bmb-hub.service <<UNIT

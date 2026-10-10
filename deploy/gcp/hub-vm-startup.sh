@@ -28,7 +28,9 @@ as_bmb "cd $CODE && ~/.local/bin/uv venv -q --python 3.12 .venv 2>/dev/null || t
 as_bmb "mkdir -p $STATE"
 
 # Sandbox image providers download (rebuilt only when its inputs change).
-STAMP="$(cd "$CODE" && cat sandbox/Dockerfile sandbox/requirements.txt $(find src/bmb_eval -name '*.py' | sort) | sha256sum | cut -c1-16)"
+# Only what runs inside the sandbox: contract checks and the three entry points.
+SANDBOX_FILES="sandbox/Dockerfile sandbox/requirements.txt src/bmb_eval/__init__.py src/bmb_eval/contract.py src/bmb_eval/errors.py src/bmb_eval/sandbox_entry/__init__.py src/bmb_eval/sandbox_entry/predict.py src/bmb_eval/sandbox_entry/validate.py src/bmb_eval/sandbox_entry/score.py"
+STAMP="$(cd "$CODE" && cat $SANDBOX_FILES | sha256sum | cut -c1-16)"
 # Built as root: a boot script has no user login session, which rootless
 # Podman needs. The image is only exported as a file for providers.
 if [ "$(cat "$STATE/sandbox-image.stamp" 2>/dev/null)" != "$STAMP" ]; then

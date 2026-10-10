@@ -78,7 +78,7 @@ tasks needing more GPU memory.
 
 ## FAQ for your IT team
 
-**Network?** Outbound HTTPS only: to the BioModelBench hub address, to
+**Network?** Outbound HTTPS only: to the BioModelBench hub (`https://<hub address>`), to
 `storage.googleapis.com` (where models are downloaded from), and during
 install to package mirrors (Ubuntu/Red Hat, PyPI, NVIDIA). No inbound ports,
 no web server, no firewall changes.

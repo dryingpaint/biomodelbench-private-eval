@@ -11,7 +11,7 @@ network, and only a few rounded scores come back.
 | A data provider | [docs/PROVIDER_SETUP.md](docs/PROVIDER_SETUP.md): one command |
 | The BioModelBench team | [docs/OPERATOR.md](docs/OPERATOR.md): bring up the hub, onboard providers ([questions to ask](docs/PROVIDER_INTAKE.md)) |
 | A security reviewer | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) |
-| An agent (or its developer) | [Submitting models](#submitting-models) below |
+| An agent (or its developer) | [Submitting models](#submitting-models) below, and the [API reference](docs/API.md) |
 
 ## How it works
 

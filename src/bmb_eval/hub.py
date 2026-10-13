@@ -631,6 +631,9 @@ def main(argv=None) -> None:
     p.add_argument("task_dir")
     p.add_argument("--public-url", required=True)
 
+    p = sub.add_parser("revoke", help="cancel an unused connect code")
+    p.add_argument("code")
+
     p = sub.add_parser("agent-token", help="create or rotate an agent token")
     p.add_argument("name")
 
@@ -670,6 +673,11 @@ def main(argv=None) -> None:
     elif args.cmd == "enroll":
         code, c = store.add_enrollment(Path(args.task_dir))
         print(provider_message(args.public_url.rstrip("/"), code, c))
+    elif args.cmd == "revoke":
+        with store.lock, store.db:
+            n = store.db.execute("UPDATE enrollments SET used_by='revoked' WHERE code=? AND used_by IS NULL",
+                                 (args.code,)).rowcount
+        print(f"revoked {args.code}" if n else f"{args.code} is unknown or already used")
     elif args.cmd == "agent-token":
         print(store.add_agent(args.name))
     elif args.cmd == "status":

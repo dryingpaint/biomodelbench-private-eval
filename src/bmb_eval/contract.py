@@ -27,7 +27,9 @@ populations). Answers may then be just the key column.
 on their machine, into a validation set (the only one scored during the
 benchmark) and a test set (scored only for final evaluations BioModelBench
 requests, at most `final_evaluations` times, enforced by the node):
-`split: {validation_fraction: 0.5, final_evaluations: 3}`.
+`split: {validation_fraction: 0.5, final_evaluations: 3}`. Add `group_by: <input
+column>` (e.g. smiles) to keep all rows of a group in the same half, so one
+molecule's other endpoints can't leak its test labels.
 
 `per` on a metric expands it into one metric per group, e.g.
 `{name: mae, per: [hERG, AMES]}` -> `mae[hERG]`, `mae[AMES]`. Every group adds
@@ -163,6 +165,7 @@ class Split:
     """Validation/test split of the private rows (see module docstring)."""
     validation_fraction: float
     final_evaluations: int = 3
+    group_by: str | None = None   # input column; rows sharing it stay in one half
 
 
 @dataclass
@@ -257,6 +260,8 @@ class Contract:
         if self.split and not (0 < self.split.validation_fraction < 1
                                and self.split.final_evaluations >= 1):
             raise ValueError("split: validation_fraction must be in (0, 1) and final_evaluations >= 1")
+        if self.split and self.split.group_by and self.split.group_by not in input_names:
+            raise ValueError(f"split.group_by {self.split.group_by!r} is not an input column")
         if self.headline not in {m.name for m in self.metrics}:
             raise ValueError(f"headline {self.headline!r} is not a declared metric")
         for m in self.metrics:

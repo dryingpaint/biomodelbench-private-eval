@@ -742,3 +742,33 @@ def test_existing_databases_gain_split_column(tmp_path):
     hdb.commit()
     hdb.close()
     assert "split" in {r[1] for r in hub_mod.HubStore(h).db.execute("PRAGMA table_info(submissions)")}
+
+
+def test_group_split_keeps_each_molecule_in_one_half(tmp_path):
+    from bmb_eval.prepare import apply_split, prepare
+    import pandas as pd
+    d = scaffold.write_task("grp", tmp_path / "t",
+                            [("row_id", "string", False), ("smiles", "string", False), ("endpoint", "string", False)],
+                            [("row_id", "string", False), ("y", "float", False)], ["row_id"], "regression", "y")
+    text = (d / "contract.yaml").read_text().replace("export:", "split: {validation_fraction: 0.5, group_by: smiles}\n\nexport:")
+    (d / "contract.yaml").write_text(text)
+    c = Contract.load(d / "contract.yaml")
+    rows = [{"row_id": f"r{i}", "smiles": f"C{'C' * (i % 40)}O", "endpoint": f"e{i % 3}", "y": float(i)}
+            for i in range(240)]                     # 40 molecules x 3 endpoints x 2
+    pd.DataFrame(rows).to_csv(tmp_path / "d.csv", index=False)
+    prepare(c, tmp_path / "d.csv", tmp_path / "out")
+    v, t, nv, nt = apply_split(c, tmp_path / "out")
+    vs = set(pd.read_parquet(v / "samples.parquet")["smiles"])
+    ts = set(pd.read_parquet(t / "samples.parquet")["smiles"])
+    assert vs and ts and not (vs & ts) and nv + nt == 240
+
+
+def test_revoked_code_cannot_connect(tmp_path, capsys):
+    store = hub_mod.HubStore(tmp_path / "h")
+    d = scaffold.write_task("t1", tmp_path / "t", [("id", "string", False), ("x", "float", False)],
+                            [("id", "string", False), ("y", "float", False)], ["id"], "regression", "y")
+    code, _ = store.add_enrollment(d)
+    hub_mod.main(["--state", str(tmp_path / "h"), "revoke", code])
+    assert "revoked" in capsys.readouterr().out
+    with pytest.raises(KeyError):
+        store.activate(code, None, "n")

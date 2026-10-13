@@ -195,12 +195,14 @@ def apply_split(c: Contract, dest: Path) -> tuple[Path, Path, int, int]:
     full = dest / "inputs"
     samples = pd.read_parquet(full / "samples.parquet")
     keys = samples[c.key].astype(str).agg("\x1f".join, axis=1)
+    # Rows are assigned by group (e.g. molecule) when group_by is set, else by row.
+    groups = samples[c.split.group_by].astype(str) if c.split.group_by else keys
     split_file = dest / "split.json"
     assignment = json.loads(split_file.read_text()) if split_file.exists() else {}
     rng = np.random.default_rng(_secrets.randbits(64))
-    for k in keys:
-        if k not in assignment:
-            assignment[k] = "validation" if rng.random() < c.split.validation_fraction else "test"
+    for g in groups:
+        if g not in assignment:
+            assignment[g] = "validation" if rng.random() < c.split.validation_fraction else "test"
     split_file.write_text(json.dumps(assignment))
     os.chmod(split_file, 0o600)
 
@@ -210,7 +212,7 @@ def apply_split(c: Contract, dest: Path) -> tuple[Path, Path, int, int]:
         d = dest / f"inputs_{name}"
         shutil.rmtree(d, ignore_errors=True)
         d.mkdir(parents=True)
-        part = samples[keys.map(assignment).eq(name).to_numpy()]
+        part = samples[groups.map(assignment).eq(name).to_numpy()]
         part.to_parquet(d / "samples.parquet", index=False)
         for col in file_cols:                      # only this half's files
             for rel in part[col].dropna():

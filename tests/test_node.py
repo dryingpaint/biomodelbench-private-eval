@@ -927,3 +927,14 @@ def test_update_with_nothing_pending(connected, capsys):
     cfg, *_ = connected
     cli.main(["--config", str(cfg.path), "update", "--yes", "--no-service"])
     assert "up to date" in capsys.readouterr().out
+
+
+
+def test_optional_numeric_output_may_be_left_empty():
+    import pandas as pd
+    from bmb_eval.contract import Field, _check_column
+    f = Field(name="sd", type="float", nullable=True, min=0)
+    assert _check_column(f, pd.Series([None, None], dtype=object)) is None
+    assert _check_column(f, pd.Series([0.5, None], dtype=object)) is None
+    assert _check_column(f, pd.Series(["x", None], dtype=object)) == "wrong_type"
+    assert _check_column(f, pd.Series([-1.0, None], dtype=object)) == "below_min"

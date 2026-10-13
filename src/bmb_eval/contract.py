@@ -370,8 +370,13 @@ def _check_column(f: Field, s: pd.Series) -> str | None:
         if not v.map(lambda x: isinstance(x, (bool, np.bool_))).all():
             return "wrong_type"
     elif f.type in ("int", "float"):
+        if len(v) == 0:          # an optional column left entirely empty is fine
+            return None
         if not (pd.api.types.is_numeric_dtype(v) and not pd.api.types.is_bool_dtype(v)):
-            return "wrong_type"
+            if not v.map(lambda x: isinstance(x, (int, float, np.integer, np.floating))
+                         and not isinstance(x, bool)).all():
+                return "wrong_type"
+            v = v.astype(float)
         arr = v.to_numpy(dtype=float)
         if f.type == "int" and np.isfinite(arr).all() and not np.all(arr == np.round(arr)):
             return "wrong_type"

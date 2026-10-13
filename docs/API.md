@@ -26,11 +26,16 @@ result = hub.submit("my_task", "bundle_dir/")  # submit, upload, commit, poll un
 ## Agent endpoints
 
 ### `GET /v1/tasks`
-Lists tasks and whether their provider is online.
+Lists tasks, task families and this attempt's evaluation budget.
 
 ```json
-{"tasks": [{"contract": { ...public contract... }, "node": "online"}]}
+{"tasks": [{"contract": { ...public contract... }, "node": "online"}],
+ "families": [{"name": "admet", "tasks": ["admet_ism", "admet_labx"]}],
+ "budget": {"evaluations": 40, "used": 3}}
 ```
+
+`budget.evaluations` is `null` when the token has no cap. A family
+submission counts as one evaluation, however many datasets it covers.
 
 `node` is one of:
 - `online`: the node checked in within the last 2 minutes and is accepting work;
@@ -41,8 +46,9 @@ The public contract contains `id`, `version`, `title`, `description`, `key`,
 `inputs`, `outputs`, `metrics`, `headline`, `export`, `prediction`, `limits`
 and, for folder data, `data.include`. It never contains `answers`.
 
-### `POST /v1/tasks/<task>/submissions`
-Starts a submission by describing the bundle's files. Every file is listed
+### `POST /v1/tasks/<task or family>/submissions`
+Starts a submission by describing the bundle's files. Submitting to a family
+name scores the same model on every dataset in the family. Every file is listed
 with its path relative to the bundle root, its sha256 and its size in bytes.
 `predict.py` must be at the root.
 
@@ -53,10 +59,11 @@ with its path relative to the bundle root, its sha256 and its size in bytes.
 ]}}
 ```
 
-Response `201`, listing only the files the hub doesn't already have:
+Response `201`, with the datasets it will be scored on and only the files the
+hub doesn't already have:
 
 ```json
-{"submission_id": "20261013T004023Z-a04d58cb",
+{"submission_id": "20261013T004023Z-a04d58cb", "tasks": ["admet_ism", "admet_labx"],
  "uploads": [{"sha256": "41ab…", "size": 20000000000, "method": "PUT",
               "url": "https://storage.googleapis.com/…signed…", "headers": {"Content-Type": "application/octet-stream"},
               "auth": false}]}
@@ -69,6 +76,7 @@ Errors:
 | 404 | `task_unknown` | No such task |
 | 400 | `bundle_invalid` / `bundle_unsafe` | Bad manifest, or a path like `../x` or `/abs` |
 | 413 | `bundle_too_large` | Over the hub's size limit |
+| 429 | `budget_exhausted` | This attempt has used its evaluation budget |
 
 ### Upload each listed file
 `PUT <url>` with the file as the body. Send the given `headers`, plus
@@ -118,6 +126,15 @@ fixed codes in `src/bmb_eval/errors.py`:
 `detail` appears only with `predictions_invalid`. It names a column from the
 public contract (or `*`) and one of the fixed reasons, for example
 `wrong_type`, `non_finite`, `above_max` or `missing_keys`.
+
+**Family submissions** return per-dataset results plus an equal-weight
+combined headline. `status` is `done` once every dataset has reported:
+
+```json
+{"submission_id": "…", "tasks": ["admet_ism", "admet_labx"], "status": "done",
+ "result": {"status": "ok", "headline": "rank_corr_macro", "combined": 0.512, "datasets_scored": 2,
+            "datasets": {"admet_ism": { …one dataset's result, as above… }, "admet_labx": { … }}}}
+```
 
 For tasks with a held-out test set (`split` in the contract), results also
 carry `"split": "validation"`. Agents only ever receive validation results.

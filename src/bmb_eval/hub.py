@@ -4,7 +4,7 @@ to it, so providers open no ports and run no web server.
 Holds agent submissions (model bundles, as content-addressed files) and the
 gated results nodes send back. Never sees provider data.
 
-    agents   POST /v1/tasks/<task>/submissions   {manifest} -> {submission_id, uploads}
+    agents   POST /v1/tasks/<task|family>/submissions   {manifest} -> {submission_id, uploads}
              PUT  <upload url>                    each file the hub doesn't have yet
              POST /v1/submissions/<id>/commit     queue it once every file is present
              GET  /v1/submissions/<id>            {status: pending|done, result?} (validation runs only)
@@ -44,6 +44,7 @@ from .errors import EvalError
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (name TEXT PRIMARY KEY, token_sha256 TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS families (name TEXT PRIMARY KEY, tasks TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY, secret_sha256 TEXT NOT NULL, name TEXT NOT NULL,
     created REAL NOT NULL, last_seen REAL, accepting INTEGER NOT NULL DEFAULT 0);
@@ -144,10 +145,13 @@ class HubStore:
         state.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(state / "hub.db", check_same_thread=False)
         self.db.executescript(SCHEMA)
-        cols = {r[1] for r in self.db.execute("PRAGMA table_info(submissions)")}
-        if "split" not in cols:   # hubs created before held-out test sets
-            self.db.execute("ALTER TABLE submissions ADD COLUMN split TEXT NOT NULL DEFAULT 'validation'")
-            self.db.commit()
+        # Columns added after the first release; older hub.db files gain them here.
+        for table, col, decl in [("submissions", "split", "TEXT NOT NULL DEFAULT 'validation'"),
+                                 ("submissions", "group_id", "TEXT"),
+                                 ("agents", "eval_budget", "INTEGER")]:
+            if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        self.db.commit()
         self.lock = threading.Lock()
 
     def q(self, sql: str, args=(), one=False):
@@ -178,10 +182,55 @@ class HubStore:
                "VALUES (?,?,?,?, 'queued', NULL, NULL, ?, 'test')", (fid, row[0], row[1], time.time(), row[2]))
         return fid
 
-    def add_agent(self, name: str) -> str:
+    def request_finals(self, sid: str) -> list[str]:
+        """Final evaluations for a task submission, or for every dataset of a
+        family submission."""
+        children = [r[0] for r in self.q("SELECT id FROM submissions WHERE group_id=? "
+                                         "AND split='validation' ORDER BY task", (sid,))]
+        return [self.request_final(c) for c in (children or [sid])]
+
+    def add_agent(self, name: str, evaluations: int | None = None) -> str:
+        """Token for one attempt. `evaluations` caps its submissions across all
+        tasks and families (a family submission counts once); None = no cap."""
         token = "bmba_" + secrets.token_urlsafe(32)
-        self.q("INSERT OR REPLACE INTO agents VALUES (?,?)", (name, _h(token)))
+        self.q("INSERT OR REPLACE INTO agents (name, token_sha256, eval_budget) VALUES (?,?,?)",
+               (name, _h(token), evaluations))
         return token
+
+    def budget(self, agent: str) -> tuple[int | None, int]:
+        """(evaluation budget, evaluations used) for an attempt."""
+        cap = self.q("SELECT eval_budget FROM agents WHERE name=?", (agent,), one=True)[0]
+        used = self.q("SELECT COUNT(DISTINCT COALESCE(group_id, id)) FROM submissions WHERE agent=? "
+                      "AND split='validation' AND status <> 'uploading'", (agent,), one=True)[0]
+        return cap, used
+
+    # ----------------------------------------------------------- families
+
+    def set_family(self, name: str, tasks: list[str]) -> None:
+        self.q("INSERT OR REPLACE INTO families VALUES (?,?)", (name, json.dumps(tasks)))
+
+    def families(self) -> dict[str, list[str]]:
+        return {n: json.loads(t) for n, t in self.q("SELECT name, tasks FROM families ORDER BY name")}
+
+    def group_view(self, gid: str, agent: str | None = None) -> dict | None:
+        """A family submission: per-dataset results plus an equal-weight combined
+        headline. Pending until every dataset has reported."""
+        q = ("SELECT task, status, result FROM submissions WHERE group_id=? AND split='validation'"
+             + (" AND agent=?" if agent else "") + " ORDER BY task")
+        rows = self.q(q, (gid, agent) if agent else (gid,))
+        if not rows:
+            return None
+        out = {"submission_id": gid, "tasks": [r[0] for r in rows],
+               "status": "done" if all(r[1] == "done" for r in rows) else "pending"}
+        if out["status"] == "done":
+            datasets = {t: json.loads(r) for t, _, r in rows}
+            ok = [d for d in datasets.values() if d.get("status") == "ok"]
+            headline = ok[0]["headline"] if ok else None
+            vals = [d["metrics"].get(headline) for d in ok if d["metrics"].get(headline) is not None]
+            out["result"] = {"status": "ok" if vals else "error", "headline": headline,
+                             "combined": round(sum(vals) / len(vals), 4) if vals else None,
+                             "datasets_scored": len(vals), "datasets": datasets}
+        return out
 
     # ----------------------------------------------------------- enrollment
 
@@ -373,12 +422,17 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 now = time.time()
                 rows = store.q("SELECT t.task, t.contract, n.last_seen, n.accepting FROM node_tasks t "
                                "JOIN nodes n ON n.id = t.node_id WHERE t.contract IS NOT NULL")
+                cap, used = store.budget(agent)
                 return self._send(200, {"tasks": [{
                     "contract": json.loads(c),
                     "node": ("offline" if not seen or now - seen > ONLINE_S
                              else "online" if acc else "paused"),
-                } for _, c, seen, acc in rows]})
-            if m := re.fullmatch(r"/v1/submissions/([\w-]{1,64})", p):
+                } for _, c, seen, acc in rows],
+                    "families": [{"name": n, "tasks": t} for n, t in store.families().items()],
+                    "budget": {"evaluations": cap, "used": used}})
+            if m := re.fullmatch(r"/v1/submissions/([\w-]{1,128})", p):
+                if group := store.group_view(m.group(1), agent):
+                    return self._send(200, group)
                 # Final (test set) results are for BioModelBench only, never the agent.
                 row = store.q("SELECT id, task, status, result FROM submissions WHERE id=? AND agent=? "
                               "AND split='validation'", (m.group(1), agent), one=True)
@@ -432,15 +486,29 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._err(401, "unauthorized", "Missing or invalid token.")
             if m := re.fullmatch(r"/v1/tasks/([\w.-]{1,64})/submissions", p):
                 return self._submit(agent, m.group(1))
-            if m := re.fullmatch(r"/v1/submissions/([\w-]{1,64})/commit", p):
+            if m := re.fullmatch(r"/v1/submissions/([\w-]{1,128})/commit", p):
                 return self._commit(agent, m.group(1))
             self._err(404, "not_found", "No such endpoint.")
 
         # ------------------------------------------------------------ agents
 
-        def _submit(self, agent: str, task: str) -> None:
-            if not store.q("SELECT 1 FROM node_tasks WHERE task=?", (task,), one=True):
+        def _budget_left(self, agent: str) -> bool:
+            cap, used = store.budget(agent)
+            if cap is not None and used >= cap:
+                self._err(429, "budget_exhausted",
+                          f"This attempt has used all {cap} of its evaluations.")
+                return False
+            return True
+
+        def _submit(self, agent: str, name: str) -> None:
+            """Submit to one task, or to a family (fans out to each dataset)."""
+            fam = store.families().get(name)
+            enrolled = {r[0] for r in store.q("SELECT task FROM node_tasks")}
+            tasks = [t for t in fam if t in enrolled] if fam else ([name] if name in enrolled else [])
+            if not tasks:
                 return self._err(404, "task_unknown", "Unknown task id.")
+            if not self._budget_left(agent):
+                return
             try:
                 manifest = self._json_body()["manifest"]
                 files = check_manifest(manifest, max_bundle)
@@ -450,9 +518,12 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._err(413 if e.code == "bundle_too_large" else 400, e.code,
                                  e.public()["message"])
             sid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(4)
-            store.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, manifest) "
-                    "VALUES (?,?,?,?, 'uploading', NULL, NULL, ?)",
-                    (sid, task, agent, time.time(), json.dumps(manifest)))
+            for task in tasks:
+                # A family submission is one row per dataset, sharing a group id.
+                rid, gid = (f"{sid}-{task}", sid) if fam else (sid, None)
+                store.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, "
+                        "manifest, group_id) VALUES (?,?,?,?, 'uploading', NULL, NULL, ?, ?)",
+                        (rid, task, agent, time.time(), json.dumps(manifest), gid))
             uploads, seen = [], set()
             for f in files:
                 if f["sha256"] in seen or blobs.has(agent, f["sha256"], f["size"]):
@@ -460,21 +531,24 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 seen.add(f["sha256"])
                 uploads.append({"sha256": f["sha256"], "size": f["size"],
                                 **blobs.upload(agent, f["sha256"], f["size"])})
-            self._send(201, {"submission_id": sid, "uploads": uploads})
+            self._send(201, {"submission_id": sid, "tasks": tasks, "uploads": uploads})
 
         def _commit(self, agent: str, sid: str) -> None:
-            row = store.q("SELECT status, manifest FROM submissions WHERE id=? AND agent=?",
-                          (sid, agent), one=True)
+            row = store.q("SELECT status, manifest FROM submissions WHERE (id=? OR group_id=?) AND agent=? "
+                          "LIMIT 1", (sid, sid, agent), one=True)
             if not row:
                 return self._err(404, "not_found", "No such submission.")
             if row[0] != "uploading":
                 return self._send(200, {"submission_id": sid, "status": "pending"})
+            if not self._budget_left(agent):
+                return
             missing = sorted({f["sha256"] for f in json.loads(row[1])["files"]
                               if not blobs.has(agent, f["sha256"], f["size"])})
             if missing:
                 return self._err(409, "files_missing", "Some files were not uploaded.",
                                  missing=missing)
-            store.q("UPDATE submissions SET status='queued' WHERE id=?", (sid,))
+            store.q("UPDATE submissions SET status='queued' WHERE (id=? OR group_id=?) AND agent=? "
+                    "AND status='uploading'", (sid, sid, agent))
             self._send(202, {"submission_id": sid, "status": "pending"})
 
         def _blob_get(self, sha: str) -> None:
@@ -542,7 +616,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                     if sid not in held:
                         store.q("UPDATE submissions SET status='queued', node_id=NULL WHERE id=?", (sid,))
                 return self._send(200, {"ok": True})
-            if m := re.fullmatch(r"/v1/node/results/([\w-]{1,64})", p):
+            if m := re.fullmatch(r"/v1/node/results/([\w-]{1,128})", p):
                 sid = m.group(1)
                 # Accept from the node that serves the task, even if the job was
                 # re-queued while its result was in flight.
@@ -634,8 +708,14 @@ def main(argv=None) -> None:
     p = sub.add_parser("revoke", help="cancel an unused connect code")
     p.add_argument("code")
 
-    p = sub.add_parser("agent-token", help="create or rotate an agent token")
+    p = sub.add_parser("agent-token", help="create or rotate an agent token (one per attempt)")
     p.add_argument("name")
+    p.add_argument("--evaluations", type=int, help="evaluation budget for this attempt, across all datasets")
+
+    p = sub.add_parser("family", help="group tasks so one submission is scored on all of them")
+    p.add_argument("action", choices=["set", "list"])
+    p.add_argument("name", nargs="?")
+    p.add_argument("tasks", nargs="*")
 
     sub.add_parser("status", help="nodes, tasks and queue")
 
@@ -679,7 +759,16 @@ def main(argv=None) -> None:
                                  (args.code,)).rowcount
         print(f"revoked {args.code}" if n else f"{args.code} is unknown or already used")
     elif args.cmd == "agent-token":
-        print(store.add_agent(args.name))
+        print(store.add_agent(args.name, args.evaluations))
+    elif args.cmd == "family":
+        if args.action == "set":
+            if not args.name or not args.tasks:
+                raise SystemExit("usage: bmb-hub family set <name> <task> [<task> ...]")
+            store.set_family(args.name, args.tasks)
+            print(f"family {args.name}: {', '.join(args.tasks)}")
+        else:
+            for n, t in store.families().items():
+                print(f"{n}: {', '.join(t)}")
     elif args.cmd == "status":
         now = time.time()
         for nid, name, seen, acc in store.q("SELECT id, name, last_seen, accepting FROM nodes"):
@@ -690,8 +779,27 @@ def main(argv=None) -> None:
                 "SELECT task, split, status, COUNT(*) FROM submissions GROUP BY 1, 2, 3"):
             print(f"task {task}: {split} {status} {n}")
     elif args.cmd == "final":
-        fid = store.request_final(args.submission_id)
-        print(f"queued final evaluation {fid}; see `bmb-hub results <task>` when it's done")
+        for fid in store.request_finals(args.submission_id):
+            print(f"queued final evaluation {fid}")
+        print("see `bmb-hub results <task or family>` when they're done")
+    elif args.cmd == "results" and args.task in store.families():
+        tasks = store.families()[args.task]
+        marks = ",".join("?" * len(tasks))
+        groups = store.q(f"SELECT DISTINCT group_id, agent FROM submissions WHERE task IN ({marks}) "
+                         "AND group_id IS NOT NULL" + (" AND agent=?" if args.agent else "")
+                         + " ORDER BY created", (*tasks, *([args.agent] if args.agent else [])))
+        for gid, agent in groups:
+            g = store.group_view(gid) or {}
+            r = g.get("result") or {}
+            per = " ".join(f"{t}={(d.get('metrics') or {}).get(r.get('headline'))}"
+                           for t, d in (r.get("datasets") or {}).items())
+            print(f"{gid:28s} {agent:20s} {g.get('status', ''):8s} combined={r.get('combined')}  {per}")
+            for split, sid, res in store.q("SELECT split, id, result FROM submissions WHERE id LIKE ? "
+                                           "AND split='test' ORDER BY id", (gid + "-%final%",)):
+                d = json.loads(res) if res else {}
+                score = (d.get("metrics") or {}).get(d.get("headline")) if d.get("status") == "ok" else None
+                print(f"    final {sid}: {d.get('headline')}={score}" if score is not None
+                      else f"    final {sid}: {(d.get('error') or {}).get('code', 'pending')}")
     elif args.cmd == "results":
         q = ("SELECT id, agent, split, status, result FROM submissions WHERE task=?"
              + (" AND agent=?" if args.agent else "") + " ORDER BY created")

@@ -772,3 +772,103 @@ def test_revoked_code_cannot_connect(tmp_path, capsys):
     assert "revoked" in capsys.readouterr().out
     with pytest.raises(KeyError):
         store.activate(code, None, "n")
+
+
+# ---------------------------------------- families: one attempt, many datasets
+
+def _fresh_node(root: Path) -> Path:
+    root.mkdir(parents=True)
+    (root / "config.yaml").write_text(json.dumps({
+        "node_name": root.name,
+        "sandbox": {"backend": "local", "i_understand_local_backend_is_not_isolated": True}}))
+    return root
+
+
+def _provider_csv(path: Path, seed: int, n: int = 300) -> Path:
+    import pandas as pd
+    inp, ans = sequence_data(path.parent / f"raw{seed}", n=n, seed=seed)
+    pd.read_parquet(inp).merge(pd.read_parquet(ans), on="variant_id").to_csv(path, index=False)
+    return path
+
+
+@pytest.fixture
+def family(hub, tmp_path):
+    """Two providers on two machines, each with its own dataset and split."""
+    store, url = hub
+    workers = {}
+    for name, seed in (("lab_a", 1), ("lab_b", 2)):
+        d = _split_task(tmp_path / name, final_evaluations=2, name=f"fit_{name}")
+        code, _ = store.add_enrollment(d)
+        node = _fresh_node(tmp_path / f"node_{name}")
+        cfg = _connect(node, url, code, _provider_csv(tmp_path / f"{name}.csv", seed))
+        workers[f"fit_{name}"] = Worker(cfg)
+    store.set_family("fitness", ["fit_lab_a", "fit_lab_b"])
+    agent = Client(url, store.add_agent("attempt-1", evaluations=3))
+    return store, url, agent, workers
+
+
+def _drain(workers):
+    for w in workers.values():
+        w.drain()
+
+
+def test_family_submission_scored_on_every_dataset(family, monkeypatch):
+    store, url, agent, workers = family
+    listing = agent.tasks()
+    assert listing["families"] == [{"name": "fitness", "tasks": ["fit_lab_a", "fit_lab_b"]}]
+    assert listing["budget"] == {"evaluations": 3, "used": 0}
+    puts = []
+    real = agent._put
+    monkeypatch.setattr(agent, "_put", lambda up, p: (puts.append(p.name), real(up, p)))
+    r = agent.submit_async("fitness", EXAMPLE_BUNDLE)
+    assert r["status"] == "pending" and len(puts) == 2       # files upload once for both datasets
+    assert agent.status(r["submission_id"])["status"] == "pending"
+    _drain(workers)
+    g = agent.status(r["submission_id"])
+    res = g["result"]
+    assert g["status"] == "done" and set(res["datasets"]) == {"fit_lab_a", "fit_lab_b"}
+    assert all(d["split"] == "validation" for d in res["datasets"].values())
+    scores = [d["metrics"]["spearman"] for d in res["datasets"].values()]
+    assert res["datasets_scored"] == 2 and res["combined"] == round(sum(scores) / 2, 4)
+    assert agent.tasks()["budget"]["used"] == 1               # one evaluation, not two
+
+
+def test_attempt_budget_is_shared_across_datasets_and_tasks(family):
+    store, url, agent, workers = family
+    agent.submit_async("fitness", EXAMPLE_BUNDLE)             # 1
+    agent.submit_async("fitness", EXAMPLE_BUNDLE)             # 2
+    agent.submit_async("fit_lab_a", EXAMPLE_BUNDLE)           # 3 (a single dataset counts too)
+    r = agent.submit_async("fitness", EXAMPLE_BUNDLE)
+    assert r["error"]["code"] == "budget_exhausted"
+    assert agent.tasks()["budget"] == {"evaluations": 3, "used": 3}
+
+
+def test_family_final_runs_every_test_set_hidden_from_agent(family):
+    store, url, agent, workers = family
+    gid = agent.submit_async("fitness", EXAMPLE_BUNDLE)["submission_id"]
+    _drain(workers)
+    finals = store.request_finals(gid)
+    assert len(finals) == 2
+    _drain(workers)
+    for fid in finals:
+        r = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
+        assert r["split"] == "test" and r["status"] == "ok"
+        assert agent.status(fid)["error"]["code"] == "not_found"
+    assert agent.status(gid)["result"]["datasets_scored"] == 2   # agent's view: validation only
+    assert agent.tasks()["budget"]["used"] == 1                  # finals don't use the budget
+
+
+def test_family_results_command(family, capsys):
+    store, url, agent, workers = family
+    gid = agent.submit_async("fitness", EXAMPLE_BUNDLE)["submission_id"]
+    _drain(workers)
+    store.request_finals(gid)
+    _drain(workers)
+    hub_mod.main(["--state", str(store.state), "results", "fitness"])
+    out = capsys.readouterr().out
+    assert gid in out and "combined=" in out and out.count("final ") == 2
+
+
+def test_unbudgeted_tokens_still_work(connected):
+    cfg, store, url, agent = connected
+    assert agent.tasks()["budget"] == {"evaluations": None, "used": 0}

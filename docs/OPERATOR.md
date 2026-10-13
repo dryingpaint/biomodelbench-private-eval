@@ -54,8 +54,12 @@ results). Snapshot the VM's disk on a schedule.
 Run from your laptop; they execute on the hub VM:
 
 ```bash
-deploy/gcp/hub agent-token claude-run-17                  # prints the agent's token once
+deploy/gcp/hub agent-token attempt-17 --evaluations 40   # one token per attempt, with its evaluation budget
 deploy/gcp/hub enroll examples/tasks/sequence_regression  # prints the provider email
+deploy/gcp/hub family set admet admet_ism admet_labx      # group datasets for one run
+deploy/gcp/hub final <submission_id>                      # held-out test runs (every dataset, for a family)
+deploy/gcp/hub results <task or family>                   # all scores, including finals
+deploy/gcp/hub revoke <code>                              # cancel an unused connect code
 deploy/gcp/hub status                                     # nodes, tasks, queue, codes
 ```
 
@@ -110,6 +114,33 @@ so the hub cannot change it remotely.
 | metric `per: [...]` | none | Every group adds a full metric to the leakage budget |
 
 | `split` | off | **Recommended for every task.** `{validation_fraction: 0.5, final_evaluations: 3}` |
+
+## One run, many datasets: families and attempt budgets
+
+Each provider dataset is its own task, on its own provider machine. To run
+one attempt across several datasets:
+
+1. **Give the datasets the same contract format** (same inputs and outputs),
+   so one model works on all of them. Each provider's task may cover only the
+   endpoints they measured. For ADMET, `make_task.py <task_id> --endpoints ...`
+   generates such a per-provider task.
+2. **Group them:** `bmb-hub family set admet admet_ism admet_labx`.
+3. **Give the attempt one token with one budget:**
+   `bmb-hub agent-token attempt-17 --evaluations 40`.
+
+An agent submits to `admet` exactly as it would to a task:
+- The hub sends that one submission to every dataset's provider. Model files
+  upload once.
+- It counts as **one** evaluation against the attempt's budget. Submissions to
+  a single task count too.
+- The result has each dataset's scores, plus `combined`: the mean of the
+  datasets' headline metric, equal weight per dataset.
+- `bmb-hub final <submission>` on a family submission runs every dataset's
+  held-out test half.
+
+Providers' own caps still apply on their machines. Because the benchmark runs
+several independent attempts, size each provider's `submissions_total` (and
+the leakage they approve) for **all** attempts, e.g. 3 attempts x 40.
 
 ## Held-out test set and final evaluations
 

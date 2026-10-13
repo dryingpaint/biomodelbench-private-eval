@@ -597,3 +597,148 @@ def test_result_in_flight_survives_hub_restart(connected, monkeypatch):
     sid2 = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
     w.drain()
     assert agent.status(sid2)["result"]["status"] == "ok"   # new work still flows
+
+
+# ------------------------------------------------- held-out test set (split)
+
+SPLIT_SCORER = """
+import numpy as np
+from scipy import stats
+
+def score(df):
+    y, p = df["fitness"].to_numpy(float), df["fitness_pred"].to_numpy(float)
+    rho = float(stats.spearmanr(y, p)[0]) if np.std(p) > 0 and np.std(y) > 0 else None
+    return {"spearman": rho, "n": int(len(df))}
+"""
+
+
+def _split_task(tmp_path, final_evaluations=2, name="split_task"):
+    d = scaffold.write_task(
+        name, tmp_path / "authored_split",
+        [("variant_id", "string", False), ("sequence", "string", False)],
+        [("variant_id", "string", False), ("fitness", "float", False)],
+        ["variant_id"], "regression", "fitness")
+    text = (d / "contract.yaml").read_text()
+    start = text.index("metrics:")
+    end = text.index("export:")
+    text = (text[:start] + "metrics:\n"
+            "  - {name: spearman, type: float, nullable: true, min: -1, max: 1}\n"
+            "  - {name: n, type: int, min: 0, max: 100000}\n"
+            "headline: spearman\n\n"
+            f"split: {{validation_fraction: 0.5, final_evaluations: {final_evaluations}}}\n\n"
+            + text[end:])
+    (d / "contract.yaml").write_text(text)
+    (d / "score.py").write_text(SPLIT_SCORER)
+    return d
+
+
+@pytest.fixture
+def split_connected(hub, node_dir, provider_files, tmp_path):
+    store, url = hub
+    data, _ = provider_files
+    code, _ = store.add_enrollment(_split_task(tmp_path))
+    cfg = _connect(node_dir, url, code, data)
+    return cfg, store, url, Client(url, store.add_agent("agent-split"))
+
+
+def test_split_is_random_disjoint_and_hidden(split_connected):
+    import pandas as pd
+    cfg, *_ = split_connected
+    t = cfg.tasks["split_task"]
+    val = set(pd.read_parquet(t.inputs)["variant_id"])
+    test = set(pd.read_parquet(t.test_inputs)["variant_id"])
+    assert val and test and not (val & test)                     # disjoint
+    assert len(val | test) == 500 and 150 < len(val) < 350       # all rows, roughly half
+    assert not (t.inputs_dir.parent / "inputs").exists()        # no combined folder to mount
+    assert (t.inputs_dir.parent / "split.json").stat().st_mode & 0o077 == 0
+
+
+def test_agent_only_ever_scored_on_validation(split_connected):
+    import pandas as pd
+    cfg, store, url, agent = split_connected
+    n_val = len(pd.read_parquet(cfg.tasks["split_task"].inputs))
+    sid = agent.submit_async("split_task", EXAMPLE_BUNDLE)["submission_id"]
+    Worker(cfg).drain()
+    r = agent.status(sid)["result"]
+    assert r["split"] == "validation" and r["metrics"]["n"] == n_val
+
+
+def test_final_runs_on_test_set_and_is_hidden_from_agent(split_connected):
+    import pandas as pd
+    cfg, store, url, agent = split_connected
+    n_test = len(pd.read_parquet(cfg.tasks["split_task"].test_inputs))
+    sid = agent.submit_async("split_task", EXAMPLE_BUNDLE)["submission_id"]
+    w = Worker(cfg)
+    w.drain()
+    fid = store.request_final(sid)
+    w.drain()
+    final = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
+    assert final["split"] == "test" and final["metrics"]["n"] == n_test
+    assert agent.status(fid)["error"]["code"] == "not_found"    # agents never see final scores
+    # Final runs don't use the agent's validation quota.
+    assert w.store.count_total("split_task") == 1
+
+
+def test_node_enforces_final_cap_and_refusals_dont_count(hub, node_dir, provider_files, tmp_path):
+    store, url = hub
+    data, _ = provider_files
+    code, _ = store.add_enrollment(_split_task(tmp_path, final_evaluations=1, name="capped"))
+    cfg = _connect(node_dir, url, code, data)
+    agent = Client(url, store.add_agent("agent-cap"))
+    sid = agent.submit_async("capped", EXAMPLE_BUNDLE)["submission_id"]
+    w = Worker(cfg)
+    w.drain()
+    first, second, third = (store.request_final(sid) for _ in range(3))
+    w.drain()
+    res = {f: json.loads(store.q("SELECT result FROM submissions WHERE id=?", (f,), one=True)[0])
+           for f in (first, second, third)}
+    assert res[first]["status"] == "ok"
+    assert res[second]["error"]["code"] == res[third]["error"]["code"] == "final_quota_exceeded"
+    assert w.store.count_final("capped") == 1
+
+
+def test_final_on_task_without_split_is_refused(connected):
+    cfg, store, url, agent = connected
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w = Worker(cfg)
+    w.drain()
+    fid = store.request_final(sid)
+    w.drain()
+    r = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
+    assert r["error"]["code"] == "no_test_split"
+
+
+def test_resplit_keeps_existing_assignment(tmp_path, provider_files):
+    from bmb_eval.prepare import apply_split, prepare
+    import pandas as pd
+    data, _ = provider_files
+    c = Contract.load(_split_task(tmp_path) / "contract.yaml")
+    dest = tmp_path / "pd"
+    prepare(c, data, dest)
+    v1, t1, *_ = apply_split(c, dest)
+    before = set(pd.read_parquet(t1 / "samples.parquet")["variant_id"])
+    prepare(c, data, dest)                                       # provider re-runs connect
+    v2, t2, *_ = apply_split(c, dest)
+    assert set(pd.read_parquet(t2 / "samples.parquet")["variant_id"]) == before
+
+
+def test_existing_databases_gain_split_column(tmp_path):
+    import sqlite3
+    from bmb_eval.store import Store
+    db = sqlite3.connect(tmp_path / "node.db")
+    db.execute("CREATE TABLE submissions (id TEXT PRIMARY KEY, task TEXT NOT NULL, submitter TEXT NOT NULL, "
+               "day TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL, release_at REAL NOT NULL, "
+               "finished REAL, result TEXT, posted INTEGER NOT NULL DEFAULT 0)")
+    db.execute("INSERT INTO submissions VALUES ('old', 't', 'a', '2026-01-01', 'done', 0, 0, 0, '{}', 1)")
+    db.commit()
+    db.close()
+    s = Store(tmp_path)
+    assert s.count_total("t") == 1                               # old rows count as validation
+    h = tmp_path / "hub"
+    h.mkdir()
+    hdb = sqlite3.connect(h / "hub.db")
+    hdb.execute("CREATE TABLE submissions (id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL, "
+                "created REAL NOT NULL, status TEXT NOT NULL, node_id TEXT, result TEXT, manifest TEXT NOT NULL)")
+    hdb.commit()
+    hdb.close()
+    assert "split" in {r[1] for r in hub_mod.HubStore(h).db.execute("PRAGMA table_info(submissions)")}

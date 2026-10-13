@@ -47,7 +47,7 @@ class Runner:
 
     def evaluate(self, task_id: str, bundle: bytes | Path, *, run_id: str | None = None,
                  submitter: str = "local", limits_override: dict | None = None,
-                 bundle_id: str | None = None) -> dict:
+                 bundle_id: str | None = None, split: str = "validation") -> dict:
         """bundle: a .tar.gz (operator/self-test use) or a directory already
         assembled from the verified file cache (the node, for real submissions)."""
         run_id = run_id or new_run_id()
@@ -61,12 +61,18 @@ class Runner:
         try:
             if t is None:
                 raise EvalError("task_unknown")
+            if split == "test":
+                # Final evaluation: the model sees and is scored on the held-out half.
+                if not t.test_inputs_dir:
+                    raise EvalError("no_test_split")
+                t = dataclasses.replace(t, inputs=t.test_inputs, inputs_dir=t.test_inputs_dir)
             c = t.contract
             if limits_override:
                 c = dataclasses.replace(c, limits=dataclasses.replace(c.limits, **limits_override))
             metrics = self._pipeline(t, c, bundle, run_id, run_dir, internal)
             payload = self._payload(run_id, t, sha, STATUS_OK, metrics=metrics)
-            payload = self._ladder(payload, t.contract, submitter)
+            if split != "test":
+                payload = self._ladder(payload, t.contract, submitter)
         except EvalError as e:
             internal["error_internal"] = e.internal
             payload = self._payload(run_id, t, sha, STATUS_ERROR, error=e.public())
@@ -83,10 +89,12 @@ class Runner:
             if not self.cfg.retain_bundles:
                 shutil.rmtree(run_dir / "bundle", ignore_errors=True)
 
+        if t is not None and t.contract.split:
+            payload["split"] = split
         internal["seconds"] = round(time.time() - t0, 2)
         internal["exported"] = payload
         (run_dir / "internal.json").write_text(json.dumps(internal, indent=2))
-        audit.record(self.cfg.state_dir, "run", run_id=run_id, task=task_id,
+        audit.record(self.cfg.state_dir, "run", run_id=run_id, task=task_id, split=split,
                      submitter=submitter, bundle_sha256=sha, status=payload["status"],
                      error_code=payload.get("error", {}).get("code"),
                      exported_sha256=bundle_mod.sha256(json.dumps(payload).encode()))

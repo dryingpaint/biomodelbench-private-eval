@@ -153,7 +153,10 @@ def data_problems(t) -> list[str]:
             out.append(f"Column '{col}' in your data file "
                        + REASON_TEXT.get(reason, reason).format(type=ftype) + ".")
     if len(frames) == 2 and not out:
-        ik = set(map(tuple, frames["inputs"][c.key].astype(str).to_numpy()))
+        inputs_all = frames["inputs"]
+        if t.test_inputs and t.test_inputs.exists():   # split task: both halves together
+            inputs_all = pd.concat([inputs_all, pd.read_parquet(t.test_inputs)], ignore_index=True)
+        ik = set(map(tuple, inputs_all[c.key].astype(str).to_numpy()))
         ak = set(map(tuple, frames["answers"][c.key].astype(str).to_numpy()))
         if ik != ak:
             out.append(f"The inputs and answers must list the same IDs: {len(ik - ak)} input "
@@ -168,7 +171,8 @@ def _user_path(p: str) -> Path:
 
 
 def _bind_task(cfg_path: Path, task: str, task_dir: Path, inputs: Path, answers: Path,
-               inputs_dir: Path | None = None, answers_dir: Path | None = None) -> None:
+               inputs_dir: Path | None = None, answers_dir: Path | None = None,
+               test_inputs_dir: Path | None = None) -> None:
     raw = yaml.safe_load(cfg_path.read_text()) or {}
     raw.setdefault("tasks", {})[task] = {
         "dir": str(task_dir.relative_to(cfg_path.parent)),
@@ -177,6 +181,8 @@ def _bind_task(cfg_path: Path, task: str, task_dir: Path, inputs: Path, answers:
         raw["tasks"][task]["inputs_dir"] = str(inputs_dir)
     if answers_dir:
         raw["tasks"][task]["answers_dir"] = str(answers_dir)
+    if test_inputs_dir:
+        raw["tasks"][task]["test_inputs_dir"] = str(test_inputs_dir)
     save_yaml(cfg_path, raw)
 
 
@@ -253,8 +259,9 @@ def _summary(c, n_rows: int) -> str:
     b = leakage.budget(c)
     lim = c.limits
     total = f", {lim.submissions_total} in total" if lim.submissions_total else ""
+    n_all = (lim.submissions_total or 0) + (c.split.final_evaluations if c.split else 0)
     worst = (f"at most ~{_kb(b.lifetime)} of information about your data, "
-             f"across all {lim.submissions_total} evaluations"
+             f"across all {n_all} evaluations"
              if b.lifetime else f"at most ~{b.per_submission:.0f} bits per evaluation")
     return "\n".join([
         f"  Task:                {c.title}",
@@ -265,6 +272,9 @@ def _summary(c, n_rows: int) -> str:
         f"  What leaves:         only scores ({', '.join(m.name for m in c.metrics)}), "
         f"{c.decimals} decimals",
         f"  Worst case:          a model built to extract data could learn {worst}",
+        *([f"  Held-out test set:   {c.split.validation_fraction:.0%} of rows scored during the "
+           f"benchmark; the rest only for final evaluations (at most {c.split.final_evaluations})"]
+          if c.split else []),
     ])
 
 
@@ -299,12 +309,19 @@ def cmd_connect(args) -> None:
     # 3. Their data (one table or a folder), split locally into what the model
     #    sees and the answers.
     from .contract import Contract
-    from .prepare import DataError, prepare
+    from .prepare import DataError, apply_split, prepare
     try:
-        inputs_dir, answers, n_rows = prepare(Contract.load(task_dir / "contract.yaml"),
-                                              _user_path(args.data), root / "private_data" / task)
+        contract = Contract.load(task_dir / "contract.yaml")
+        inputs_dir, answers, n_rows = prepare(contract, _user_path(args.data),
+                                              root / "private_data" / task)
+        test_dir, split_counts = None, None
+        if contract.split:
+            # Held-out test set, chosen here on the provider's machine with a secret seed.
+            inputs_dir, test_dir, n_val, n_test = apply_split(contract, answers.parent)
+            split_counts = (n_val, n_test)
         _bind_task(cfg_path, task, task_dir, inputs_dir / "samples.parquet", answers, inputs_dir,
-                   answers.parent / "answers_files" if (answers.parent / "answers_files").exists() else None)
+                   answers.parent / "answers_files" if (answers.parent / "answers_files").exists() else None,
+                   test_dir)
         cfg = Config.load(cfg_path)
         if problems := data_problems(cfg.tasks[task]):
             raise DataError(problems)
@@ -314,6 +331,9 @@ def cmd_connect(args) -> None:
             print(f"  • {p}")
         raise SystemExit("\nFix it and run the same command again.")
     print(f"✓ Your data looks good ({n_rows:,} rows)")
+    if split_counts:
+        print(f"✓ Split at random on this machine: {split_counts[0]:,} validation rows (scored during "
+              f"the benchmark), {split_counts[1]:,} test rows (held out for final evaluations)")
 
     if problems := hardware_problems(cfg.tasks[task].contract.limits, root):
         print("\nThis machine isn't quite ready for this task:")

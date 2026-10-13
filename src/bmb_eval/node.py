@@ -210,11 +210,18 @@ class Worker:
             return
         t = self.cfg.tasks.get(task)
         lim = t.contract.limits if t else None
+        split = job.get("split", "validation")
         refusal, files = None, []
-        if t is None:
+        if t is None or split not in ("validation", "test"):
             refusal = EvalError("task_unknown")
-        elif self.store.count_today(submitter, task) >= lim.submissions_per_day or (
-                lim.submissions_total and self.store.count_total(task) >= lim.submissions_total):
+        elif split == "test" and not (t.contract.split and t.test_inputs_dir):
+            refusal = EvalError("no_test_split")
+        elif split == "test" and self.store.count_final(task) >= t.contract.split.final_evaluations:
+            # Enforced here, not at the hub: even a compromised hub can't run the test set again.
+            refusal = EvalError("final_quota_exceeded")
+        elif split == "validation" and (
+                self.store.count_today(submitter, task) >= lim.submissions_per_day or (
+                lim.submissions_total and self.store.count_total(task) >= lim.submissions_total)):
             refusal = EvalError("quota_exceeded")
         else:
             try:
@@ -232,14 +239,15 @@ class Worker:
                 refusal = e
         if refusal:
             # Data-independent refusal: answer immediately, never run anything.
-            self.store.add(sid, task, submitter, 0)
+            # A refused test job isn't counted as a final evaluation.
+            self.store.add(sid, task, submitter, 0, "test_refused" if split == "test" else split)
             self.store.finish(sid, {"run_id": sid, "task": task, "status": "error",
                                     "error": refusal.public()})
             return
         (self.queue_dir / f"{sid}.json").write_text(json.dumps(
-            {"files": files, "bundle_id": job.get("bundle_id")}))
-        self.store.add(sid, task, submitter, lim.release_after_s)
-        audit.record(self.cfg.state_dir, "job_received", run_id=sid, task=task,
+            {"files": files, "bundle_id": job.get("bundle_id"), "split": split}))
+        self.store.add(sid, task, submitter, lim.release_after_s, split)
+        audit.record(self.cfg.state_dir, "job_received", run_id=sid, task=task, split=split,
                      submitter=submitter, bundle_id=job.get("bundle_id"),
                      bytes=sum(f["size"] for f in files), downloaded=fetched)
         self.store.start(sid)
@@ -253,7 +261,8 @@ class Worker:
                 raise EvalError("infra_error", internal="cached files missing")
             bundle = self.cache.assemble(job["files"], self.cfg.state_dir / "runs" / sid / "bundle")
             result = self.runner.evaluate(task, bundle, run_id=sid, submitter=submitter,
-                                          bundle_id=job.get("bundle_id"))
+                                          bundle_id=job.get("bundle_id"),
+                                          split=job.get("split", "validation"))
         except Exception as e:
             audit.record(self.cfg.state_dir, "worker_error", run_id=sid, error=type(e).__name__)
             result = {"run_id": sid, "status": "error", "error": EvalError("infra_error").public()}

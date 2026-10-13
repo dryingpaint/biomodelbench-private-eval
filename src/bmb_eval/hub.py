@@ -7,7 +7,7 @@ gated results nodes send back. Never sees provider data.
     agents   POST /v1/tasks/<task>/submissions   {manifest} -> {submission_id, uploads}
              PUT  <upload url>                    each file the hub doesn't have yet
              POST /v1/submissions/<id>/commit     queue it once every file is present
-             GET  /v1/submissions/<id>            {status: pending|done, result?}
+             GET  /v1/submissions/<id>            {status: pending|done, result?} (validation runs only)
              GET  /v1/tasks                       public contracts + node status
     nodes    POST /v1/node/hello                  report tasks/contracts, recover jobs
              GET  /v1/node/next                   claim a job: manifest + download urls
@@ -144,6 +144,10 @@ class HubStore:
         state.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(state / "hub.db", check_same_thread=False)
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(submissions)")}
+        if "split" not in cols:   # hubs created before held-out test sets
+            self.db.execute("ALTER TABLE submissions ADD COLUMN split TEXT NOT NULL DEFAULT 'validation'")
+            self.db.commit()
         self.lock = threading.Lock()
 
     def q(self, sql: str, args=(), one=False):
@@ -160,6 +164,19 @@ class HubStore:
     def node(self, secret: str) -> str | None:
         row = self.q("SELECT id FROM nodes WHERE secret_sha256=?", (_h(secret),), one=True)
         return row[0] if row else None
+
+    def request_final(self, sid: str) -> str:
+        """Queue a final (test set) evaluation of an existing submission's model.
+        Admin only. The provider's node decides whether it may run (its cap)."""
+        row = self.q("SELECT task, agent, manifest FROM submissions WHERE id=? AND split='validation' "
+                     "AND status <> 'uploading'", (sid,), one=True)
+        if not row:
+            raise KeyError(f"no committed submission {sid}")
+        n = self.q("SELECT COUNT(*) FROM submissions WHERE id LIKE ?", (sid + "-final%",), one=True)[0]
+        fid = f"{sid}-final{n + 1}"
+        self.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, manifest, split) "
+               "VALUES (?,?,?,?, 'queued', NULL, NULL, ?, 'test')", (fid, row[0], row[1], time.time(), row[2]))
+        return fid
 
     def add_agent(self, name: str) -> str:
         token = "bmba_" + secrets.token_urlsafe(32)
@@ -362,8 +379,9 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                              else "online" if acc else "paused"),
                 } for _, c, seen, acc in rows]})
             if m := re.fullmatch(r"/v1/submissions/([\w-]{1,64})", p):
-                row = store.q("SELECT id, task, status, result FROM submissions WHERE id=? AND agent=?",
-                              (m.group(1), agent), one=True)
+                # Final (test set) results are for BioModelBench only, never the agent.
+                row = store.q("SELECT id, task, status, result FROM submissions WHERE id=? AND agent=? "
+                              "AND split='validation'", (m.group(1), agent), one=True)
                 if not row:
                     return self._err(404, "not_found", "No such submission.")
                 out = {"submission_id": row[0], "task": row[1],
@@ -432,7 +450,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._err(413 if e.code == "bundle_too_large" else 400, e.code,
                                  e.public()["message"])
             sid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(4)
-            store.q("INSERT INTO submissions VALUES (?,?,?,?, 'uploading', NULL, NULL, ?)",
+            store.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, manifest) "
+                    "VALUES (?,?,?,?, 'uploading', NULL, NULL, ?)",
                     (sid, task, agent, time.time(), json.dumps(manifest)))
             uploads, seen = [], set()
             for f in files:
@@ -484,7 +503,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._err(404, "not_found", "No such endpoint.")
             with store.lock, store.db:
                 row = store.db.execute(
-                    "SELECT s.id, s.task, s.agent, s.manifest FROM submissions s JOIN node_tasks t "
+                    "SELECT s.id, s.task, s.agent, s.manifest, s.split FROM submissions s JOIN node_tasks t "
                     "ON t.task = s.task WHERE t.node_id=? AND s.status='queued' "
                     "ORDER BY s.created LIMIT 1", (node,)).fetchone()
                 if row:
@@ -496,6 +515,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             downloads = {f["sha256"]: blobs.download(row[2], f["sha256"], f["size"])
                          for f in manifest["files"]}
             self._send(200, {"submission_id": row[0], "task": row[1], "submitter": row[2],
+                             "split": row[4],
                              "manifest": manifest, "bundle_id": manifest_id(manifest),
                              "downloads": downloads})
 
@@ -615,6 +635,13 @@ def main(argv=None) -> None:
     p.add_argument("name")
 
     sub.add_parser("status", help="nodes, tasks and queue")
+
+    p = sub.add_parser("final", help="evaluate a submission's model on the held-out test set")
+    p.add_argument("submission_id")
+
+    p = sub.add_parser("results", help="scores for a task (validation and final)")
+    p.add_argument("task")
+    p.add_argument("--agent")
     args = ap.parse_args(argv)
     state = Path(args.state)
 
@@ -651,8 +678,21 @@ def main(argv=None) -> None:
             age = f"{int(now - seen)}s ago" if seen else "never"
             tasks = [r[0] for r in store.q("SELECT task FROM node_tasks WHERE node_id=?", (nid,))]
             print(f"node {nid} ({name}) last seen {age}, {'accepting' if acc else 'NOT accepting'}: {tasks}")
-        for task, status, n in store.q("SELECT task, status, COUNT(*) FROM submissions GROUP BY 1, 2"):
-            print(f"task {task}: {status} {n}")
+        for task, split, status, n in store.q(
+                "SELECT task, split, status, COUNT(*) FROM submissions GROUP BY 1, 2, 3"):
+            print(f"task {task}: {split} {status} {n}")
+    elif args.cmd == "final":
+        fid = store.request_final(args.submission_id)
+        print(f"queued final evaluation {fid}; see `bmb-hub results <task>` when it's done")
+    elif args.cmd == "results":
+        q = ("SELECT id, agent, split, status, result FROM submissions WHERE task=?"
+             + (" AND agent=?" if args.agent else "") + " ORDER BY created")
+        for sid, agent, split, status, res in store.q(q, (args.task, args.agent) if args.agent else (args.task,)):
+            r = json.loads(res) if res else {}
+            score = (r.get("metrics") or {}).get(r.get("headline")) if r.get("status") == "ok" else None
+            what = (f"{r.get('headline')}={score}" if r.get("status") == "ok"
+                    else (r.get("error") or {}).get("code", status))
+            print(f"{split:10s} {sid:40s} {agent:24s} {what}")
         for code, task, used in store.q("SELECT code, task, used_by FROM enrollments"):
             print(f"code {code} for {task}: {'used by ' + used if used else 'unused'}")
 

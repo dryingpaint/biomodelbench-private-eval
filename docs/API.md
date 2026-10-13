@@ -119,6 +119,11 @@ fixed codes in `src/bmb_eval/errors.py`:
 public contract (or `*`) and one of the fixed reasons, for example
 `wrong_type`, `non_finite`, `above_max` or `missing_keys`.
 
+For tasks with a held-out test set (`split` in the contract), results also
+carry `"split": "validation"`. Agents only ever receive validation results.
+Final (test set) runs are requested by BioModelBench with `bmb-hub final`,
+and their results are not served by this endpoint.
+
 If the task sets `export.ladder_step`, the result also has `"improved": true`
 or `false`. When it's `false`, `metrics` repeats your previous best.
 
@@ -127,7 +132,7 @@ or `false`. When it's `false`, `metrics` repeats your previous best.
 | Endpoint | Body or response |
 |---|---|
 | `POST /v1/node/hello` | `{"tasks": {"<task>": <public contract>}, "accepting": true, "held": ["<submission id>", …]}`, sent every minute. `held` lists jobs the node still holds; the hub re-queues any others assigned to it |
-| `GET /v1/node/next` | `204` if there's no work, else `{"submission_id", "task", "submitter", "manifest", "bundle_id", "downloads": {"<sha256>": {"url", "headers", "auth"}}}` |
+| `GET /v1/node/next` | `204` if there's no work, else `{"submission_id", "task", "submitter", "split", "manifest", "bundle_id", "downloads": {"<sha256>": {"url", "headers", "auth"}}}`. `split` is `"validation"` or `"test"`; the node refuses test jobs beyond the contract's `final_evaluations` |
 | `POST /v1/node/results/<id>` | The payload shown above as `result`, at most 64 KB |
 
 ## Enrollment (used by `bmb-eval connect`)

@@ -50,11 +50,18 @@ Two further points the proposal does not address:
 - **The export check has to sit outside the container that runs the agent's
   code.** If the gate runs in the same container, the code can bypass it. Here
   the gate runs in the controller process, which never runs submitted code.
-- **Adaptive overfitting.** Even an honest agent that evaluates hundreds of
-  times against one private test set will overfit to it, and the final number
-  will be optimistic. Use two tasks: a `dev` task with frequent feedback, and a
-  `final` task on separate held-out rows with `submissions_total: 1` (or a few)
-  and `ladder_step` set. Only the `final` number counts.
+- **Adaptive overfitting.** Even an honest agent that evaluates many times
+  against one private set will overfit to it, and its score will be
+  optimistic. The first Capable test showed this: the agent ran ablations
+  against the private set. Set `split` in the contract:
+  - The provider's node randomly splits the rows, with a secret seed, into
+    validation and test sets.
+  - Agents are only ever shown, and scored on, the validation rows.
+  - BioModelBench requests final evaluations on the test rows
+    (`bmb-hub final`). The node runs at most `final_evaluations` of them,
+    enforced on the provider's machine.
+  - Final scores are visible to BioModelBench only. Only the final score
+    counts.
 
 ## The worst-case leakage budget
 
@@ -154,7 +161,7 @@ what the provider agrees to: here, `bmb-eval check` plus quotas. Next upgrades,
 in order:
 
 1. Make gVisor mandatory.
-2. Split tasks into dev and final.
+2. Use `split` (a held-out test set) on every task.
 3. Add an ONNX-only tier.
 4. Make the hub's scorer and contract delivery verifiable (signed task packages).
 5. Sign results with the node's key so BioModelBench can verify their origin.

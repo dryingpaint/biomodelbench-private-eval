@@ -76,7 +76,8 @@ def budget(c: Contract) -> Budget:
         timing_bits=timing_bits,
         per_submission=per,
         per_day_per_submitter=per * lim.submissions_per_day,
-        lifetime=per * lim.submissions_total if lim.submissions_total else None,
+        lifetime=(per * (lim.submissions_total + (c.split.final_evaluations if c.split else 0))
+                  if lim.submissions_total else None),
         notes=notes,
     )
 
@@ -93,5 +94,8 @@ def describe(c: Contract) -> str:
         "  lifetime  " + (f"{b.lifetime:.0f} bits ({c.limits.submissions_total} submissions)"
                           if b.lifetime is not None else "unbounded (set limits.submissions_total)"),
     ]
+    if c.split:
+        lines.append(f"  split     {c.split.validation_fraction:.0%} validation (scored during the "
+                     f"benchmark), rest test (at most {c.split.final_evaluations} final evaluations)")
     lines += [f"  ! {n}" for n in b.notes]
     return "\n".join(lines)

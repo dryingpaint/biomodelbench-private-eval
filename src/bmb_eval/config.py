@@ -21,6 +21,11 @@ class TaskBinding:
     contract: Contract
     inputs_dir: Path | None = None  # folder the model sees, holding inputs + its files
     answers_dir: Path | None = None  # scorer-only files (data.private)
+    test_inputs_dir: Path | None = None  # held-out test half, when the contract has `split`
+
+    @property
+    def test_inputs(self) -> Path | None:
+        return self.test_inputs_dir / "samples.parquet" if self.test_inputs_dir else None
 
 
 @dataclass
@@ -76,7 +81,8 @@ class Config:
                 raise SystemExit(f"task {tid!r}: contract id is {contract.id!r}")
             cfg.tasks[tid] = TaskBinding(tid, d, rel(t["inputs"]), rel(t["answers"]), contract,
                                          rel(t["inputs_dir"]) if t.get("inputs_dir") else None,
-                                         rel(t["answers_dir"]) if t.get("answers_dir") else None)
+                                         rel(t["answers_dir"]) if t.get("answers_dir") else None,
+                                         rel(t["test_inputs_dir"]) if t.get("test_inputs_dir") else None)
         if cfg.backend not in ("docker", "podman", "local"):
             raise SystemExit("sandbox.backend must be docker, podman or local")
         if cfg.backend == "local" and not cfg.allow_unisolated:

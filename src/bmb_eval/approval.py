@@ -61,6 +61,7 @@ def fingerprint(cfg: Config) -> dict:
             "task_dir": _dir_hash(t.dir),  # scorer and anything it imports
             "inputs_dir": _tree_hash(t.inputs_dir) if t.inputs_dir else None,
             "answers_dir": _tree_hash(t.answers_dir) if t.answers_dir else None,
+            "test_inputs_dir": _tree_hash(t.test_inputs_dir) if t.test_inputs_dir else None,
             "inputs": _file_hash(t.inputs) if t.inputs.exists() else "missing",
             "answers": _file_hash(t.answers) if t.answers.exists() else "missing",
         }

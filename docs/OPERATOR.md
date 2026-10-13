@@ -109,5 +109,24 @@ so the hub cannot change it remotely.
 | `export.ladder_step` | off | Turn on for "final" tasks |
 | metric `per: [...]` | none | Every group adds a full metric to the leakage budget |
 
-Recommended: a `dev` task with frequent feedback, plus a `final` task on
-separate held-out rows with `submissions_total` of 1–5.
+| `split` | off | **Recommended for every task.** `{validation_fraction: 0.5, final_evaluations: 3}` |
+
+## Held-out test set and final evaluations
+
+With `split` in the contract:
+- **The split:** when the provider connects, their node randomly splits the
+  rows into validation and test, with a secret seed. Nobody, including us,
+  knows which row is where.
+- **During the benchmark:** agents only see, and are only scored on, the
+  validation rows.
+- **At the end:** request the final score for the submission each agent
+  nominates, then read the results:
+
+```bash
+$HUB_ADMIN final <submission_id>      # queues a test-set run of that model
+$HUB_ADMIN results <task>             # validation and final scores; final ones are visible only here
+```
+
+The provider's node allows at most `final_evaluations` test runs per task, and
+refuses the rest with `final_quota_exceeded`, so plan which submissions to
+finalize. Final results never reach agents.

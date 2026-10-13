@@ -34,6 +34,8 @@ ERRORS: dict[str, tuple[str, str]] = {
     "service_paused": ("The evaluation service is paused by its operator.", "policy"),
     "config_not_approved": ("Node configuration changed and awaits operator approval.", "policy"),
     "task_unknown": ("Unknown task id.", "policy"),
+    "no_test_split": ("This task has no held-out test set.", "policy"),
+    "final_quota_exceeded": ("Final (test set) evaluations for this task are used up.", "policy"),
 }
 
 # Reasons allowed in detail.reason for predictions_invalid.

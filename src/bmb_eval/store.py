@@ -37,25 +37,39 @@ class Store:
     def __init__(self, state_dir: Path):
         self.db = sqlite3.connect(state_dir / "node.db", check_same_thread=False)
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(submissions)")}
+        if "split" not in cols:   # nodes installed before held-out test sets
+            self.db.execute("ALTER TABLE submissions ADD COLUMN split TEXT NOT NULL DEFAULT 'validation'")
+            self.db.commit()
         self.lock = threading.Lock()
 
-    def add(self, sid: str, task: str, submitter: str, release_after_s: int) -> None:
+    def add(self, sid: str, task: str, submitter: str, release_after_s: int,
+            split: str = "validation") -> None:
         now = time.time()
         with self.lock, self.db:
             self.db.execute(
-                "INSERT OR IGNORE INTO submissions VALUES (?,?,?,?,?,?,?,?,?,0)",
-                (sid, task, submitter, _day(), "queued", now, now + release_after_s, None, None))
+                "INSERT OR IGNORE INTO submissions (id, task, submitter, day, status, created, "
+                "release_at, finished, result, posted, split) VALUES (?,?,?,?,?,?,?,?,?,0,?)",
+                (sid, task, submitter, _day(), "queued", now, now + release_after_s, None, None, split))
 
     def count_today(self, submitter: str, task: str) -> int:
         with self.lock:
             return self.db.execute(
-                "SELECT COUNT(*) FROM submissions WHERE submitter=? AND task=? AND day=?",
-                (submitter, task, _day())).fetchone()[0]
+                "SELECT COUNT(*) FROM submissions WHERE submitter=? AND task=? AND day=? "
+                "AND split='validation'", (submitter, task, _day())).fetchone()[0]
 
     def count_total(self, task: str) -> int:
         with self.lock:
             return self.db.execute(
-                "SELECT COUNT(*) FROM submissions WHERE task=?", (task,)).fetchone()[0]
+                "SELECT COUNT(*) FROM submissions WHERE task=? AND split='validation'",
+                (task,)).fetchone()[0]
+
+    def count_final(self, task: str) -> int:
+        """Final (test set) evaluations run or accepted for this task, ever."""
+        with self.lock:
+            return self.db.execute(
+                "SELECT COUNT(*) FROM submissions WHERE task=? AND split='test'",
+                (task,)).fetchone()[0]
 
     def next_queued(self) -> tuple[str, str, str] | None:
         with self.lock, self.db:

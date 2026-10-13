@@ -23,6 +23,12 @@ also gets as-is (e.g. an EHR events table, a control-cell .h5ad), and `private`
 lists files only the scorer gets (answers in any format, e.g. perturbed-cell
 populations). Answers may then be just the key column.
 
+`split` holds out a test set: the provider's rows are split once, randomly,
+on their machine, into a validation set (the only one scored during the
+benchmark) and a test set (scored only for final evaluations BioModelBench
+requests, at most `final_evaluations` times, enforced by the node):
+`split: {validation_fraction: 0.5, final_evaluations: 3}`.
+
 `per` on a metric expands it into one metric per group, e.g.
 `{name: mae, per: [hERG, AMES]}` -> `mae[hERG]`, `mae[AMES]`. Every group adds
 to the leakage budget, so prefer macro-averages plus a few named groups.
@@ -153,6 +159,13 @@ class DataLayout:
 
 
 @dataclass
+class Split:
+    """Validation/test split of the private rows (see module docstring)."""
+    validation_fraction: float
+    final_evaluations: int = 3
+
+
+@dataclass
 class Contract:
     id: str
     version: int
@@ -172,6 +185,7 @@ class Contract:
     batch_size: int = 1024
     limits: Limits = field(default_factory=Limits)
     data: DataLayout = field(default_factory=DataLayout)
+    split: Split | None = None
     path: Path | None = None
 
     # ------------------------------------------------------------------ load
@@ -215,6 +229,7 @@ class Contract:
             limits=Limits(**raw.get("limits", {})),
             data=DataLayout(samples=data.get("samples"), include=list(data.get("include") or []),
                             private=list(data.get("private") or [])),
+            split=Split(**raw["split"]) if raw.get("split") else None,
         )
         c._check(public)
         return c
@@ -239,6 +254,9 @@ class Contract:
             for i in f.items or []:
                 if i.in_input and i.in_input not in input_names:
                     raise ValueError(f"{f.name}.{i.name}: in_input {i.in_input!r} is not an input")
+        if self.split and not (0 < self.split.validation_fraction < 1
+                               and self.split.final_evaluations >= 1):
+            raise ValueError("split: validation_fraction must be in (0, 1) and final_evaluations >= 1")
         if self.headline not in {m.name for m in self.metrics}:
             raise ValueError(f"headline {self.headline!r} is not a declared metric")
         for m in self.metrics:
@@ -273,6 +291,8 @@ class Contract:
         }
         if self.data.include:
             out["data"] = {"include": self.data.include}
+        if self.split:
+            out["split"] = dict(self.split.__dict__)
         return out
 
     def sha256(self) -> str:

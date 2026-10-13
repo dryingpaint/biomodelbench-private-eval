@@ -182,6 +182,47 @@ def prepare(c: Contract, data: Path, dest: Path) -> tuple[Path, Path, int]:
     return final, dest / "answers.parquet", len(df)
 
 
+def apply_split(c: Contract, dest: Path) -> tuple[Path, Path, int, int]:
+    """Split dest/inputs/ into dest/inputs_validation/ and dest/inputs_test/.
+
+    Random, with a secret seed, on the provider's machine. The assignment is
+    saved in dest/split.json and reused on re-runs, so a row never moves
+    between validation and test once the split exists (new rows are assigned
+    at random). The combined inputs/ folder is removed so it can't be mounted
+    by mistake; the answers file stays whole (only the scorer reads it).
+    """
+    import secrets as _secrets
+    full = dest / "inputs"
+    samples = pd.read_parquet(full / "samples.parquet")
+    keys = samples[c.key].astype(str).agg("\x1f".join, axis=1)
+    split_file = dest / "split.json"
+    assignment = json.loads(split_file.read_text()) if split_file.exists() else {}
+    rng = np.random.default_rng(_secrets.randbits(64))
+    for k in keys:
+        if k not in assignment:
+            assignment[k] = "validation" if rng.random() < c.split.validation_fraction else "test"
+    split_file.write_text(json.dumps(assignment))
+    os.chmod(split_file, 0o600)
+
+    file_cols = [f.name for f in c.inputs if f.type == "file"]
+    out = {}
+    for name in ("validation", "test"):
+        d = dest / f"inputs_{name}"
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True)
+        part = samples[keys.map(assignment).eq(name).to_numpy()]
+        part.to_parquet(d / "samples.parquet", index=False)
+        for col in file_cols:                      # only this half's files
+            for rel in part[col].dropna():
+                _link(full / rel, d / rel)
+        for inc in c.data.include:                 # pass-through files go to both
+            if (full / inc["path"]).exists():
+                _link(full / inc["path"], d / inc["path"])
+        out[name] = (d, len(part))
+    shutil.rmtree(full)
+    return out["validation"][0], out["test"][0], out["validation"][1], out["test"][1]
+
+
 def describe_inputs(c: Contract) -> str:
     """One line for the approval summary: everything the model will see."""
     parts = [f.name for f in c.inputs]

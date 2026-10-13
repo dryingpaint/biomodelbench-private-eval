@@ -319,11 +319,13 @@ def test_provider_connects_and_agent_gets_scores(connected):
     assert held == {f["sha256"] for f in manifest_for(EXAMPLE_BUNDLE)["files"]}
 
 
-def test_connect_code_is_single_use(hub, connected, provider_files):
+def test_code_reusable_by_its_own_machine_only(hub, connected, provider_files, tmp_path):
     cfg, store, url, _ = connected
     code = store.q("SELECT code FROM enrollments", one=True)[0]
-    with pytest.raises(SystemExit, match="unknown or already used"):
-        _connect(cfg.path.parent, url, code, provider_files[0])
+    _connect(cfg.path.parent, url, code, provider_files[0])      # same machine: fine (re-run)
+    other = _fresh_node(tmp_path / "someone_else")
+    with pytest.raises(SystemExit, match="used by another machine"):
+        _connect(other, url, code, provider_files[0])
 
 
 def test_connect_explains_bad_file_and_keeps_code(hub, node_dir, provider_files, tmp_path, capsys):
@@ -872,3 +874,56 @@ def test_family_results_command(family, capsys):
 def test_unbudgeted_tokens_still_work(connected):
     cfg, store, url, agent = connected
     assert agent.tasks()["budget"] == {"evaluations": None, "used": 0}
+
+
+
+# ------------------------------------------- one code per task, updates in place
+
+def test_enrolling_again_keeps_the_code(tmp_path):
+    store = hub_mod.HubStore(tmp_path / "h")
+    d = scaffold.write_task("t1", tmp_path / "t", [("id", "string", False), ("x", "float", False)],
+                            [("id", "string", False), ("y", "float", False)], ["id"], "regression", "y")
+    code1, _ = store.add_enrollment(d)
+    code2, _ = store.add_enrollment(d)
+    assert code1 == code2 and store.enrollment(code1)[3] == 2
+
+
+def test_task_update_reaches_provider_who_approves_it(connected, provider_files, capsys):
+    cfg, store, url, agent = connected
+    _, task_dir = provider_files
+    w = Worker(cfg)
+    w.step()                                          # hello: publishes version 1
+    assert "update" not in agent.contract("binding")["description"]
+
+    # BioModelBench edits the task and enrolls again: same code, version 2.
+    text = (task_dir / "contract.yaml").read_text().replace('description: ""', 'description: "update 2"')
+    (task_dir / "contract.yaml").write_text(text)
+    code = store.code_for("binding")
+    assert store.add_enrollment(task_dir)[0] == code
+
+    # The provider's node notices and tells them, but keeps the approved version.
+    w._last_hello = 0
+    w.step()
+    from bmb_eval.node import pending_updates
+    assert pending_updates(cfg) == {"binding": 2}
+    assert "update 2" not in agent.contract("binding")["description"]
+    cli.main(["--config", str(cfg.path), "status"])
+    assert "run `bmb-eval update`" in capsys.readouterr().out
+
+    # The provider reviews and approves it with one command: no code to look up.
+    cli.main(["--config", str(cfg.path), "update", "--yes", "--no-service"])
+    cfg2 = Config.load(cfg.path)
+    assert cfg2.raw["tasks"]["binding"]["package_version"] == 2 and pending_updates(cfg2) == {}
+    assert not approval.diff(cfg2)
+    w2 = Worker(cfg2)
+    w2.step()
+    assert agent.contract("binding")["description"] == "update 2"
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w2.drain()
+    assert agent.status(sid)["result"]["status"] == "ok"
+
+
+def test_update_with_nothing_pending(connected, capsys):
+    cfg, *_ = connected
+    cli.main(["--config", str(cfg.path), "update", "--yes", "--no-service"])
+    assert "up to date" in capsys.readouterr().out

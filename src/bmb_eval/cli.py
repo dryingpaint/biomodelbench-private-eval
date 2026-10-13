@@ -285,9 +285,12 @@ def cmd_connect(args) -> None:
     cfg_path = Path(args.config).resolve()
     root = cfg_path.parent
 
-    # 1. Fetch the task package (does not use up the code).
+    # 1. Fetch the task package. A node that already used this code (re-runs,
+    #    updates) identifies itself, so the code keeps working for it.
+    existing = (yaml.safe_load(cfg_path.read_text()) or {}) if cfg_path.exists() else {}
+    secret = (existing.get("hub") or {}).get("secret")
     try:
-        pkg = HubAPI(hub_url).enrollment(code)
+        pkg = HubAPI(hub_url, secret).enrollment(code)
     except HubError as e:
         raise SystemExit(f"Couldn't use that connect link: {e}")
     task = pkg["task"]
@@ -371,8 +374,16 @@ def cmd_connect(args) -> None:
     if "secret" in creds:
         hub["secret"] = creds["secret"]
     raw["hub"] = hub
+    # Remember how this task was connected, so `bmb-eval update` can re-run it.
+    raw["tasks"][task].update(code=code, data=str(_user_path(args.data)),
+                              package_version=int(pkg.get("version", 1)))
     save_yaml(cfg_path, raw)
-    audit.record(cfg.state_dir, "connected", hub=hub_url, task=task, node_id=creds["node_id"])
+    audit.record(cfg.state_dir, "connected", hub=hub_url, task=task, node_id=creds["node_id"],
+                 version=int(pkg.get("version", 1)))
+    from .node import pending_updates, updates_path
+    pending = pending_updates(Config.load(cfg_path))
+    if pending.pop(task, None) is not None:
+        updates_path(Config.load(cfg_path)).write_text(json.dumps(pending))
 
     started = not args.no_service and _install_service(Config.load(cfg_path))
     print(f"\n✓ Connected. Task '{task}' is live.")
@@ -395,6 +406,26 @@ def _ask(prompt: str) -> str:
             return inp.readline().strip().lower()
     except (OSError, EOFError):
         raise SystemExit("Run this in a terminal so you can approve it.")
+
+
+def cmd_update(args) -> None:
+    """Review and approve task updates from BioModelBench (no new code needed):
+    re-runs the connect check for each updated task, with its saved code and data."""
+    from .node import pending_updates
+    cfg = _cfg(args)
+    tasks = [args.task] if args.task else sorted(pending_updates(cfg))
+    if not tasks:
+        print("No updates from BioModelBench. Everything is up to date.")
+        return
+    for task in tasks:
+        t = (cfg.raw.get("tasks") or {}).get(task) or {}
+        if not t.get("code") or not t.get("data"):
+            raise SystemExit(f"Task {task} was connected before updates were supported; "
+                             "run the original connect command from BioModelBench's email once.")
+        print(f"Reviewing BioModelBench's update to task '{task}'...\n")
+        cmd_connect(argparse.Namespace(config=args.config, code=t["code"], data=t["data"],
+                                       hub=cfg.hub.get("url"), yes=args.yes,
+                                       no_service=args.no_service))
 
 
 def _install_service(cfg) -> bool:
@@ -452,6 +483,10 @@ def cmd_status(args) -> None:
                              capture_output=True, text=True).stdout.strip() if shutil.which("systemctl") else "?"
     print(f"connected   {cfg.hub.get('url', 'NO (run the connect command)')}")
     print(f"service     {running}")
+    from .node import pending_updates
+    for task, version in pending_updates(cfg).items():
+        print(f"update      task {task} has a new version ({version}) from BioModelBench: "
+              "run `bmb-eval update` to review it")
     print(f"accepting   {'NO: stopped (bmb-eval resume)' if paused_path(cfg).exists() else 'NO: settings changed (bmb-eval approve)' if drift else 'yes'}")
     print(f"sandbox     {cfg.backend}{' + gVisor' if cfg.runtime else ''}")
     print(f"audit log   {n} entries, {msg}")
@@ -644,6 +679,11 @@ def main(argv=None) -> None:
                    ).set_defaults(fn=cmd_stop)
     sub.add_parser("resume", help="undo stop").set_defaults(fn=cmd_resume)
     sub.add_parser("approve", help="accept changed settings").set_defaults(fn=cmd_approve)
+    p = sub.add_parser("update", help="review and approve task updates from BioModelBench")
+    p.add_argument("task", nargs="?", help="only this task (default: every task with an update)")
+    p.add_argument("--yes", action="store_true", help="approve without asking")
+    p.add_argument("--no-service", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_update)
 
     # Setup and troubleshooting
     p = sub.add_parser("init", help="(setup) write config.yaml")

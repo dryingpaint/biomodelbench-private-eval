@@ -81,8 +81,9 @@ class HubAPI:
         return self._req("POST", f"/v1/enroll/{code}", {"name": name})
 
     # work
-    def hello(self, tasks: dict, accepting: bool, held: list[str]) -> None:
-        self._req("POST", "/v1/node/hello", {"tasks": tasks, "accepting": accepting, "held": held})
+    def hello(self, tasks: dict, accepting: bool, held: list[str]) -> dict:
+        return self._req("POST", "/v1/node/hello",
+                         {"tasks": tasks, "accepting": accepting, "held": held}) or {}
 
     def next(self) -> dict | None:
         return self._req("GET", "/v1/node/next")
@@ -105,6 +106,18 @@ class HubAPI:
 
 def paused_path(cfg: Config):
     return cfg.state_dir / "PAUSED"
+
+
+def updates_path(cfg: Config):
+    return cfg.state_dir / "updates.json"
+
+
+def pending_updates(cfg: Config) -> dict[str, int]:
+    """Task updates BioModelBench has published that the provider hasn't approved."""
+    try:
+        return json.loads(updates_path(cfg).read_text())
+    except (OSError, ValueError):
+        return {}
 
 
 class Worker:
@@ -149,8 +162,9 @@ class Worker:
             # Held = anything not yet delivered, including finished results the
             # hub hasn't received; otherwise the hub would re-queue them.
             held = sorted({p.stem for p in self.queue_dir.glob("*.json")} | set(self.store.unposted()))
-            self.api.hello({t: b.contract.public() for t, b in self.cfg.tasks.items()},
-                           accepting, held)
+            reply = self.api.hello({t: b.contract.public() for t, b in self.cfg.tasks.items()},
+                                   accepting, held)
+            self._note_updates(reply.get("versions") or {})
             self._last_hello = time.time()
         for sid, payload in self.store.released_unposted():
             try:
@@ -175,6 +189,19 @@ class Worker:
             self._take(job)
             return True
         return did
+
+    def _note_updates(self, versions: dict) -> None:
+        """BioModelBench changed a task: tell the provider (once per version).
+        Nothing changes here until they review and approve it with `bmb-eval update`."""
+        pending = pending_updates(self.cfg)
+        for task, version in versions.items():
+            have = int((self.cfg.raw.get("tasks", {}).get(task) or {}).get("package_version", 1))
+            if version > have and pending.get(task) != version:
+                pending[task] = version
+                audit.record(self.cfg.state_dir, "task_update_available", task=task, version=version)
+                alerts.send(self.cfg, "config", f"BioModelBench updated task {task} (version {version}); "
+                            "run `bmb-eval update` to review and approve it", task=task)
+        updates_path(self.cfg).write_text(json.dumps(pending))
 
     def run_forever(self) -> None:
         n = self.store.requeue_running()

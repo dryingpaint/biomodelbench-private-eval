@@ -146,7 +146,8 @@ class HubStore:
         self.db = sqlite3.connect(state / "hub.db", check_same_thread=False)
         self.db.executescript(SCHEMA)
         # Columns added after the first release; older hub.db files gain them here.
-        for table, col, decl in [("submissions", "split", "TEXT NOT NULL DEFAULT 'validation'"),
+        for table, col, decl in [("enrollments", "version", "INTEGER NOT NULL DEFAULT 1"),
+                                 ("submissions", "split", "TEXT NOT NULL DEFAULT 'validation'"),
                                  ("submissions", "group_id", "TEXT"),
                                  ("agents", "eval_budget", "INTEGER")]:
             if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
@@ -234,26 +235,50 @@ class HubStore:
 
     # ----------------------------------------------------------- enrollment
 
+    def code_for(self, task: str) -> str | None:
+        """The task's connect code (one per task, for good), unless revoked."""
+        row = self.q("SELECT code FROM enrollments WHERE task=? AND (used_by IS NULL OR used_by <> 'revoked') "
+                     "ORDER BY created DESC LIMIT 1", (task,), one=True)
+        return row[0] if row else None
+
     def add_enrollment(self, task_dir: Path) -> tuple[str, Contract]:
         """Package a task: contract, scorer, and any small text files it uses
-        (e.g. a gene-panel labels file). Example bundles are not shipped."""
+        (e.g. a gene-panel labels file). Example bundles are not shipped.
+
+        A task keeps one code: enrolling an existing task id again updates its
+        package (version + 1) behind the same code. A connected provider's node
+        then reports an update, which the provider reviews and approves with
+        `bmb-eval update`; until then it keeps serving the approved version."""
         c = Contract.load(task_dir / "contract.yaml")
         files = {p.name: p.read_text() for p in sorted(task_dir.iterdir())
                  if p.is_file() and p.suffix in (".yaml", ".py", ".txt", ".json", ".csv", ".tsv")}
-        code = new_code()
-        self.q("INSERT INTO enrollments VALUES (?,?,?,?,NULL)",
-               (code, c.id, json.dumps(files), time.time()))
+        code = self.code_for(c.id)
+        if code:
+            self.q("UPDATE enrollments SET files=?, version=version+1 WHERE code=?",
+                   (json.dumps(files), code))
+        else:
+            code = new_code()
+            self.q("INSERT INTO enrollments (code, task, files, created, used_by, version) "
+                   "VALUES (?,?,?,?,NULL,1)", (code, c.id, json.dumps(files), time.time()))
         return code, c
 
-    def enrollment(self, code: str) -> tuple[str, dict, str | None] | None:
-        row = self.q("SELECT task, files, used_by FROM enrollments WHERE code=?", (code,), one=True)
-        return (row[0], json.loads(row[1]), row[2]) if row else None
+    def enrollment(self, code: str) -> tuple[str, dict, str | None, int] | None:
+        row = self.q("SELECT task, files, used_by, version FROM enrollments WHERE code=?", (code,), one=True)
+        return (row[0], json.loads(row[1]), row[2], row[3]) if row else None
+
+    def task_versions(self, node_id: str) -> dict[str, int]:
+        """Current package version of each task this node serves."""
+        return {t: v for t, v in self.q(
+            "SELECT e.task, MAX(e.version) FROM enrollments e JOIN node_tasks n ON n.task = e.task "
+            "WHERE n.node_id=? AND e.used_by=? GROUP BY e.task", (node_id, node_id))}
 
     def activate(self, code: str, node_id: str | None, name: str) -> dict:
         """Bind the code's task to a node, creating the node if needed."""
         e = self.enrollment(code)
-        if e is None or e[2] is not None:
-            raise KeyError("code unknown or already used")
+        # Reusable by the node it's bound to (re-runs, updates); any other
+        # machine is refused once it's been used.
+        if e is None or e[2] == "revoked" or (e[2] is not None and e[2] != node_id):
+            raise KeyError("code unknown or already used by another machine")
         task = e[0]
         owner = self.q("SELECT node_id FROM node_tasks WHERE task=?", (task,), one=True)
         out = {"task": task}
@@ -408,9 +433,11 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                                   ctype="text/plain")
             if m := re.fullmatch(r"/v1/enroll/([A-Z0-9-]{14})", p):
                 e = store.enrollment(m.group(1))
-                if e is None or e[2] is not None:
-                    return self._err(404, "code_invalid", "This connect code is unknown or already used.")
-                return self._send(200, {"task": e[0], "files": e[1]})
+                me = store.node(self._bearer()) if self._bearer() else None
+                if e is None or e[2] == "revoked" or (e[2] is not None and e[2] != me):
+                    return self._err(404, "code_invalid",
+                                     "This connect code is unknown or used by another machine.")
+                return self._send(200, {"task": e[0], "files": e[1], "version": e[3]})
             if m := re.fullmatch(r"/v1/blobs/([0-9a-f]{64})", p):
                 return self._blob_get(m.group(1))
             if p.startswith("/v1/node/"):
@@ -615,7 +642,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                                       (node,)):
                     if sid not in held:
                         store.q("UPDATE submissions SET status='queued', node_id=NULL WHERE id=?", (sid,))
-                return self._send(200, {"ok": True})
+                return self._send(200, {"ok": True, "versions": store.task_versions(node)})
             if m := re.fullmatch(r"/v1/node/results/([\w-]{1,128})", p):
                 sid = m.group(1)
                 # Accept from the node that serves the task, even if the job was
@@ -751,8 +778,19 @@ def main(argv=None) -> None:
         except KeyboardInterrupt:
             pass
     elif args.cmd == "enroll":
+        existing = store.code_for(Contract.load(Path(args.task_dir) / "contract.yaml").id)
+        used = existing and store.enrollment(existing)[2]
         code, c = store.add_enrollment(Path(args.task_dir))
-        print(provider_message(args.public_url.rstrip("/"), code, c))
+        version = store.enrollment(code)[3]
+        if not existing or not used:
+            if existing:
+                print(f"(updated task {c.id} to version {version}; same code)\n")
+            print(provider_message(args.public_url.rstrip("/"), code, c))
+        else:
+            print(f"Updated task {c.id} to version {version}. The code stays {code}.\n"
+                  f"The provider's machine will show an update; they review and approve it with:\n"
+                  f"    ~/bmb-eval/bmb-eval update\n"
+                  f"Until then it keeps evaluating with the version they approved.")
     elif args.cmd == "revoke":
         with store.lock, store.db:
             n = store.db.execute("UPDATE enrollments SET used_by='revoked' WHERE code=? AND used_by IS NULL",

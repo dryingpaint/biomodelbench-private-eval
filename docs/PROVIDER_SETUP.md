@@ -50,6 +50,7 @@ GB"*). Fix it and run the same command again.
 | Check it's running | `~/bmb-eval/bmb-eval status` |
 | **Stop everything immediately** | `~/bmb-eval/bmb-eval stop` |
 | Start again | `~/bmb-eval/bmb-eval resume` |
+| Review a task change from BioModelBench | `~/bmb-eval/bmb-eval update` (`status` tells you when there is one) |
 
 ## Technical details
 

@@ -93,12 +93,20 @@ deploy/gcp/hub status                                     # nodes, tasks, queue,
 3. **Check it with fake data:** save the public contract (`Contract.load(...).public()`
    as JSON), then run `bmb-eval dryrun contract.json <template>/bundle`.
 4. **Enroll:** `deploy/gcp/hub enroll <task folder>` prints the email. Send it.
-   A code works once, and is only used up when the provider approves.
+   **Each task has one code for good.** It works only for the first machine that
+   connects with it, and that machine can reuse it for re-runs and updates.
 5. **Watch it come online:** `deploy/gcp/hub status`.
 
-Changing a live task's contract or scorer means sending a new code for a new
-task version. The node holds its own copy under the provider's approval lock,
-so the hub cannot change it remotely.
+**Changing a task** never needs a new code. Edit the files and run `enroll`
+again:
+- **Before the provider connects:** the same code now delivers the new version.
+- **After they connect:** their machine shows "update available" and raises an
+  alert if they've set one up. They review and approve it with
+  `~/bmb-eval/bmb-eval update`, and until then keep evaluating with the
+  version they approved.
+
+The hub can't change a provider's task without that approval. To retire a
+code nobody has used, run `deploy/gcp/hub revoke <code>`.
 
 ## Settings worth deciding per task
 

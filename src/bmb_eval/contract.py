@@ -31,6 +31,9 @@ requests, at most `final_evaluations` times, enforced by the node):
 column>` (e.g. smiles) to keep all rows of a group in the same half, so one
 molecule's other endpoints can't leak its test labels.
 
+`final_only: true` on a metric reports it only in final (held-out test)
+evaluations, never in benchmark feedback (needs `split`).
+
 `per` on a metric expands it into one metric per group, e.g.
 `{name: mae, per: [hERG, AMES]}` -> `mae[hERG]`, `mae[AMES]`. Every group adds
 to the leakage budget, so prefer macro-averages plus a few named groups.
@@ -124,6 +127,10 @@ class Metric:
     max: float | None = None
     goal: str = "max"    # max | min; used by the ladder
     description: str = ""
+    # Reported only by final (held-out test) evaluations, never in benchmark
+    # feedback: e.g. absolute errors, which would let agents fit the provider's
+    # assay offset. Needs `split`. Enforced by the node's output gate.
+    final_only: bool = False
 
 
 @dataclass
@@ -264,6 +271,10 @@ class Contract:
             raise ValueError(f"split.group_by {self.split.group_by!r} is not an input column")
         if self.headline not in {m.name for m in self.metrics}:
             raise ValueError(f"headline {self.headline!r} is not a declared metric")
+        if self.metric(self.headline).final_only:
+            raise ValueError("the headline metric can't be final_only")
+        if any(m.final_only for m in self.metrics) and not self.split:
+            raise ValueError("final_only metrics need a held-out test set (split)")
         for m in self.metrics:
             if m.type not in {"float", "int"}:
                 raise ValueError(f"metric {m.name}: type must be float or int")
@@ -539,12 +550,13 @@ def from_canonical(contract: Contract, data: bytes, n_rows: int) -> pd.DataFrame
 # Output gate: the last check before anything leaves the node
 # ---------------------------------------------------------------------------
 
-def gate_metrics(contract: Contract, raw: bytes) -> dict[str, Any]:
+def gate_metrics(contract: Contract, raw: bytes, split: str = "validation") -> dict[str, Any]:
     """Parse scorer output and return the exportable metrics dict.
 
     Exactly the declared metric names, numeric or declared-nullable,
     finite, within bounds, rounded to the contract precision. Anything
     else is an output_contract_violation and nothing is exported.
+    final_only metrics leave only with final (split="test") evaluations.
     """
     def violation(why: str) -> EvalError:
         return EvalError("output_contract_violation", internal=why)
@@ -577,6 +589,8 @@ def gate_metrics(contract: Contract, raw: bytes) -> dict[str, Any]:
         if m.type == "int" and float(v) != int(v):
             raise violation(f"{name} not an integer")
         out[name] = int(v) if m.type == "int" else round(float(v), contract.decimals)
+    if split != "test":
+        out = {k: v for k, v in out.items() if not declared[k].final_only}
     if len(json.dumps(out)) > contract.max_export_bytes:
         raise violation("export exceeds max_bytes")
     return out

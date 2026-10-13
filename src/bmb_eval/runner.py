@@ -69,7 +69,7 @@ class Runner:
             c = t.contract
             if limits_override:
                 c = dataclasses.replace(c, limits=dataclasses.replace(c.limits, **limits_override))
-            metrics = self._pipeline(t, c, bundle, run_id, run_dir, internal)
+            metrics = self._pipeline(t, c, bundle, run_id, run_dir, internal, split)
             payload = self._payload(run_id, t, sha, STATUS_OK, metrics=metrics)
             if split != "test":
                 payload = self._ladder(payload, t.contract, submitter)
@@ -103,7 +103,7 @@ class Runner:
     # ---------------------------------------------------------------- pipeline
 
     def _pipeline(self, t: TaskBinding, c: Contract, bundle: bytes | Path, run_id: str,
-                  run_dir: Path, internal: dict) -> dict:
+                  run_dir: Path, internal: dict, split: str = "validation") -> dict:
         lim = c.limits
         contract_file = run_dir / "contract.json"
         contract_file.write_text(json.dumps(c.public()))
@@ -166,7 +166,7 @@ class Runner:
                             internal=f"exit {r.exit_code} timeout {r.timed_out}")
 
         # 5. gate
-        return gate_metrics(c, r.stdout)
+        return gate_metrics(c, r.stdout, split)
 
     def _stage(self, run_dir: Path, internal: dict, entry: str, run_id: str, **kw):
         r = self.sandbox.run(name=f"bmb-{run_id}-{entry}", entry=entry, **kw)

@@ -952,3 +952,52 @@ def test_second_task_connects_with_bare_code_on_same_machine(hub, connected, pro
     # As in a provider email: just the code, no hub address.
     cli.main(["--config", str(cfg.path), "connect", code, "--data", str(data), "--yes", "--no-service"])
     assert "second" in Config.load(cfg.path).tasks
+
+
+# ------------------------------------------------------- final-only metrics
+
+def _final_only_task(tmp_path, name="fo_task"):
+    d = _split_task(tmp_path, name=name)
+    text = (d / "contract.yaml").read_text().replace(
+        "  - {name: n, type: int, min: 0, max: 100000}\n",
+        "  - {name: n, type: int, min: 0, max: 100000}\n"
+        "  - {name: mae, type: float, min: 0, max: 10, final_only: true}\n")
+    (d / "contract.yaml").write_text(text)
+    (d / "score.py").write_text(SPLIT_SCORER.replace(
+        '"n": int(len(df))}', '"n": int(len(df)), "mae": min(float(np.mean(np.abs(y - p))), 10.0)}'))
+    return d
+
+
+def test_final_only_metrics_leave_only_in_final_evaluations(hub, node_dir, provider_files, tmp_path):
+    store, url = hub
+    data, _ = provider_files
+    code, _ = store.add_enrollment(_final_only_task(tmp_path))
+    cfg = _connect(node_dir, url, code, data)
+    agent = Client(url, store.add_agent("agent-fo"))
+    w = Worker(cfg)
+    w.step()                                       # check-in publishes the contract
+    assert any(m.get("final_only") for m in agent.contract("fo_task")["metrics"])   # agents know
+    sid = agent.submit_async("fo_task", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain()
+    assert set(agent.status(sid)["result"]["metrics"]) == {"spearman", "n"}      # no mae in feedback
+    fid = store.request_final(sid)
+    w.drain()
+    final = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
+    assert set(final["metrics"]) == {"spearman", "n", "mae"}
+
+
+def test_final_only_needs_split_and_cant_be_headline(tmp_path):
+    d = _final_only_task(tmp_path)
+    text = (d / "contract.yaml").read_text()
+    (d / "contract.yaml").write_text(text.replace("headline: spearman", "headline: mae"))
+    with pytest.raises(ValueError, match="headline"):
+        Contract.load(d / "contract.yaml")
+    (d / "contract.yaml").write_text(text[:text.index("split:")] + text[text.index("export:"):])
+    with pytest.raises(ValueError, match="need a held-out test set"):
+        Contract.load(d / "contract.yaml")
+
+
+def test_final_only_metrics_cost_leakage_only_in_finals(tmp_path):
+    with_fo = leakage.budget(Contract.load(_final_only_task(tmp_path / "a") / "contract.yaml"))
+    plain = leakage.budget(Contract.load(_split_task(tmp_path / "b") / "contract.yaml"))
+    assert with_fo.per_submission == plain.per_submission and with_fo.per_final > plain.per_final

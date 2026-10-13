@@ -121,6 +121,7 @@ code nobody has used, run `deploy/gcp/hub revoke <code>`.
 | `export.ladder_step` | off | Turn on for "final" tasks |
 | metric `per: [...]` | none | Every group adds a full metric to the leakage budget |
 
+| metric `final_only: true` | off | Reported only in final evaluations. Use it for absolute metrics (MAE, RMSE, calibration): agents' public training data comes from other labs' protocols, so absolute errors mostly measure the offset, and repeated feedback lets agents fit it. Needs `split` |
 | `split` | off | **Recommended for every task.** `{validation_fraction: 0.5, final_evaluations: 3}` |
 
 ## One run, many datasets: families and attempt budgets

@@ -938,3 +938,17 @@ def test_optional_numeric_output_may_be_left_empty():
     assert _check_column(f, pd.Series([0.5, None], dtype=object)) is None
     assert _check_column(f, pd.Series(["x", None], dtype=object)) == "wrong_type"
     assert _check_column(f, pd.Series([-1.0, None], dtype=object)) == "below_min"
+
+
+
+def test_second_task_connects_with_bare_code_on_same_machine(hub, connected, provider_files, tmp_path):
+    cfg, store, url, _ = connected
+    data, _ = provider_files
+    d = scaffold.write_task("second", tmp_path / "authored_second",
+                            [("variant_id", "string", False), ("sequence", "string", False)],
+                            [("variant_id", "string", False), ("fitness", "float", False)],
+                            ["variant_id"], "regression", "fitness")
+    code, _ = store.add_enrollment(d)
+    # As in a provider email: just the code, no hub address.
+    cli.main(["--config", str(cfg.path), "connect", code, "--data", str(data), "--yes", "--no-service"])
+    assert "second" in Config.load(cfg.path).tasks

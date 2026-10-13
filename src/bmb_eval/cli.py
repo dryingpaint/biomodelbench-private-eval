@@ -281,9 +281,12 @@ def _summary(c, n_rows: int) -> str:
 def cmd_connect(args) -> None:
     from .config import Config
     from .node import HubAPI, HubError, parse_connect
-    hub_url, code = parse_connect(args.code, args.hub)
     cfg_path = Path(args.config).resolve()
     root = cfg_path.parent
+    # A bare code works on a machine that's already connected: use its hub.
+    saved_hub = ((yaml.safe_load(cfg_path.read_text()) or {}).get("hub") or {}).get("url") \
+        if cfg_path.exists() else None
+    hub_url, code = parse_connect(args.code, args.hub or saved_hub)
 
     # 1. Fetch the task package. A node that already used this code (re-runs,
     #    updates) identifies itself, so the code keeps working for it.

@@ -15,6 +15,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+import yaml
 
 from bmb_eval import approval, audit, leakage, scaffold
 from conftest import sequence_data
@@ -614,7 +615,7 @@ def score(df):
 """
 
 
-def _split_task(tmp_path, final_evaluations=2, name="split_task"):
+def _split_task(tmp_path, final_evaluations=2, name="split_task", limits="", final_limits=""):
     d = scaffold.write_task(
         name, tmp_path / "authored_split",
         [("variant_id", "string", False), ("sequence", "string", False)],
@@ -628,7 +629,10 @@ def _split_task(tmp_path, final_evaluations=2, name="split_task"):
             "  - {name: n, type: int, min: 0, max: 100000}\n"
             "headline: spearman\n\n"
             f"split: {{validation_fraction: 0.5, final_evaluations: {final_evaluations}}}\n\n"
+            + (f"final_limits: {{{final_limits}}}\n\n" if final_limits else "")
             + text[end:])
+    if limits:
+        text = text.replace("limits:\n", f"limits:\n  {limits}\n", 1)
     (d / "contract.yaml").write_text(text)
     (d / "score.py").write_text(SPLIT_SCORER)
     return d
@@ -1001,3 +1005,76 @@ def test_final_only_metrics_cost_leakage_only_in_finals(tmp_path):
     with_fo = leakage.budget(Contract.load(_final_only_task(tmp_path / "a") / "contract.yaml"))
     plain = leakage.budget(Contract.load(_split_task(tmp_path / "b") / "contract.yaml"))
     assert with_fo.per_submission == plain.per_submission and with_fo.per_final > plain.per_final
+
+
+def test_final_limits_apply_only_to_final_runs(tmp_path):
+    c = Contract.load(_split_task(tmp_path, final_limits="gpus: 2, gpu_memory_gb: 80, max_bundle_gb: 150")
+                      / "contract.yaml")
+    assert c.limits_for("validation").gpus == 0
+    final = c.limits_for("test")
+    assert (final.gpus, final.gpu_memory_gb, final.max_bundle_gb) == (2, 80, 150)
+    assert final.cpus == c.limits.cpus                      # unset fields inherit
+    assert c.public()["final_limits"]["gpus"] == 2          # agents see the final hardware
+    assert Contract.from_dict(c.public(), public=True).limits_for("test").gpus == 2
+
+
+@pytest.mark.parametrize("final_limits, why", [
+    ({"submissions_total": 5}, "quotas"),
+    ({"gpu": 2}, "unexpected keyword"),
+])
+def test_final_limits_rejected(tmp_path, final_limits, why):
+    raw = yaml.safe_load((_split_task(tmp_path) / "contract.yaml").read_text())
+    raw["final_limits"] = final_limits
+    with pytest.raises((ValueError, TypeError), match=why):
+        Contract.from_dict(raw)
+    raw.pop("split")
+    raw["final_limits"] = {"gpus": 1}
+    with pytest.raises(ValueError, match="split"):
+        Contract.from_dict(raw)
+
+
+def test_final_candidate_skips_validation_and_runs_under_final_limits(hub, node_dir, provider_files,
+                                                                      tmp_path, monkeypatch):
+    # Validation can't take any bundle (0 GB); finals can. Like a 70B model on a CPU-only
+    # validation tier: register it, then run it only as a final.
+    store, url = hub
+    data, _ = provider_files
+    code, _ = store.add_enrollment(_split_task(tmp_path, name="big", limits="max_bundle_gb: 0",
+                                               final_limits="max_bundle_gb: 1"))
+    monkeypatch.setattr(cli, "_selftest", lambda *a, **k: 0)   # its probes can't fit in 0 GB either
+    cfg = _connect(node_dir, url, code, data)
+    agent = Client(url, store.add_agent("agent-big", evaluations=1))
+    r = agent.register_final("big", EXAMPLE_BUNDLE)
+    assert r["status"] == "registered"
+    w = Worker(cfg)
+    w.drain()
+    assert agent.status(r["submission_id"])["status"] == "registered"   # never run on validation
+    assert agent.tasks()["budget"] == {"evaluations": 1, "used": 0}
+    assert w.store.count_total("big") == 0
+    fid = store.request_final(r["submission_id"])
+    w.drain()
+    final = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
+    assert final["status"] == "ok" and final["split"] == "test"
+    # The same model as a normal submission is refused by validation's size limit.
+    sid = agent.submit_async("big", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain()
+    assert agent.status(sid)["result"]["error"]["code"] == "bundle_too_large"
+
+
+def test_final_refused_until_the_gpus_are_there(hub, node_dir, provider_files, tmp_path, monkeypatch):
+    from bmb_eval import node as node_mod
+    store, url = hub
+    data, _ = provider_files
+    code, _ = store.add_enrollment(_split_task(tmp_path, name="gpu_final", final_limits="gpus: 2"))
+    cfg = _connect(node_dir, url, code, data)     # connects fine without GPUs (validation is CPU)
+    agent = Client(url, store.add_agent("agent-gpu"))
+    sid = agent.submit_async("gpu_final", EXAMPLE_BUNDLE)["submission_id"]
+    w = Worker(cfg)
+    w.drain()
+    assert agent.status(sid)["result"]["status"] == "ok"
+    monkeypatch.setattr(node_mod, "gpus_here", lambda: [80])
+    fid = store.request_final(sid)
+    w.drain()
+    r = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
+    assert r["error"]["code"] == "final_hardware_missing"
+    assert w.store.count_final("gpu_final") == 0      # doesn't use up a final evaluation

@@ -34,6 +34,11 @@ molecule's other endpoints can't leak its test labels.
 `final_only: true` on a metric reports it only in final (held-out test)
 evaluations, never in benchmark feedback (needs `split`).
 
+`final_limits` overrides `limits` for final evaluations only, e.g.
+`{gpus: 2, gpu_memory_gb: 80, max_bundle_gb: 150}`: validation runs stay
+small (CPU), the final runs get the hardware for the largest models. Models
+too big for validation are registered for finals without a validation run.
+
 `per` on a metric expands it into one metric per group, e.g.
 `{name: mae, per: [hERG, AMES]}` -> `mae[hERG]`, `mae[AMES]`. Every group adds
 to the leakage budget, so prefer macro-averages plus a few named groups.
@@ -43,6 +48,7 @@ score sandboxes, so it depends only on numpy/pandas/pyyaml.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
 import json
@@ -194,6 +200,9 @@ class Contract:
     ladder_step: float | None = None
     batch_size: int = 1024
     limits: Limits = field(default_factory=Limits)
+    # Overrides of `limits` for final (test set) evaluations, e.g. GPUs for the
+    # largest models; validation runs keep the plain limits. Quotas don't apply.
+    final_limits: dict = field(default_factory=dict)
     data: DataLayout = field(default_factory=DataLayout)
     split: Split | None = None
     path: Path | None = None
@@ -237,6 +246,7 @@ class Contract:
             ladder_step=export.get("ladder_step"),
             batch_size=int(raw.get("prediction", {}).get("batch_size", 1024)),
             limits=Limits(**raw.get("limits", {})),
+            final_limits=dict(raw.get("final_limits") or {}),
             data=DataLayout(samples=data.get("samples"), include=list(data.get("include") or []),
                             private=list(data.get("private") or [])),
             split=Split(**raw["split"]) if raw.get("split") else None,
@@ -269,6 +279,13 @@ class Contract:
             raise ValueError("split: validation_fraction must be in (0, 1) and final_evaluations >= 1")
         if self.split and self.split.group_by and self.split.group_by not in input_names:
             raise ValueError(f"split.group_by {self.split.group_by!r} is not an input column")
+        if self.final_limits:
+            if not self.split:
+                raise ValueError("final_limits need a held-out test set (split)")
+            quotas = {"submissions_per_day", "submissions_total", "release_after_s"}
+            if bad := set(self.final_limits) & quotas:
+                raise ValueError(f"final_limits can't set {sorted(bad)}: quotas apply to validation")
+            Limits(**self.final_limits)   # unknown keys raise here
         if self.headline not in {m.name for m in self.metrics}:
             raise ValueError(f"headline {self.headline!r} is not a declared metric")
         if self.metric(self.headline).final_only:
@@ -305,11 +322,19 @@ class Contract:
             "prediction": {"batch_size": self.batch_size},
             "limits": dict(self.limits.__dict__),
         }
+        if self.final_limits:
+            out["final_limits"] = dict(self.final_limits)
         if self.data.include:
             out["data"] = {"include": self.data.include}
         if self.split:
             out["split"] = dict(self.split.__dict__)
         return out
+
+    def limits_for(self, split: str) -> Limits:
+        """Resource limits for a validation or a final (split="test") evaluation."""
+        if split == "test" and self.final_limits:
+            return dataclasses.replace(self.limits, **self.final_limits)
+        return self.limits
 
     def sha256(self) -> str:
         assert self.path is not None

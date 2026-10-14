@@ -139,6 +139,11 @@ class GCSBlobs:
 
 # -------------------------------------------------------------------- state
 
+def _public_status(status: str) -> str:
+    """done, registered (a final candidate: kept, not run on validation), or pending."""
+    return status if status in ("done", "registered") else "pending"
+
+
 class HubStore:
     def __init__(self, state: Path):
         self.state = state
@@ -174,7 +179,7 @@ class HubStore:
         """Queue a final (test set) evaluation of an existing submission's model.
         Admin only. The provider's node decides whether it may run (its cap)."""
         row = self.q("SELECT task, agent, manifest FROM submissions WHERE id=? AND split='validation' "
-                     "AND status <> 'uploading'", (sid,), one=True)
+                     "AND status NOT IN ('uploading', 'uploading_final')", (sid,), one=True)
         if not row:
             raise KeyError(f"no committed submission {sid}")
         n = self.q("SELECT COUNT(*) FROM submissions WHERE id LIKE ?", (sid + "-final%",), one=True)[0]
@@ -202,7 +207,7 @@ class HubStore:
         """(evaluation budget, evaluations used) for an attempt."""
         cap = self.q("SELECT eval_budget FROM agents WHERE name=?", (agent,), one=True)[0]
         used = self.q("SELECT COUNT(DISTINCT COALESCE(group_id, id)) FROM submissions WHERE agent=? "
-                      "AND split='validation' AND status <> 'uploading'", (agent,), one=True)[0]
+                      "AND split='validation' AND status IN ('queued', 'assigned', 'done')", (agent,), one=True)[0]
         return cap, used
 
     # ----------------------------------------------------------- families
@@ -221,8 +226,9 @@ class HubStore:
         rows = self.q(q, (gid, agent) if agent else (gid,))
         if not rows:
             return None
+        status = {_public_status(r[1]) for r in rows}
         out = {"submission_id": gid, "tasks": [r[0] for r in rows],
-               "status": "done" if all(r[1] == "done" for r in rows) else "pending"}
+               "status": status.pop() if len(status) == 1 else "pending"}
         if out["status"] == "done":
             datasets = {t: json.loads(r) for t, _, r in rows}
             ok = [d for d in datasets.values() if d.get("status") == "ok"]
@@ -465,8 +471,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                               "AND split='validation'", (m.group(1), agent), one=True)
                 if not row:
                     return self._err(404, "not_found", "No such submission.")
-                out = {"submission_id": row[0], "task": row[1],
-                       "status": "done" if row[2] == "done" else "pending"}
+                out = {"submission_id": row[0], "task": row[1], "status": _public_status(row[2])}
                 if row[2] == "done":
                     out["result"] = json.loads(row[3])
                 return self._send(200, out)
@@ -534,23 +539,26 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             tasks = [t for t in fam if t in enrolled] if fam else ([name] if name in enrolled else [])
             if not tasks:
                 return self._err(404, "task_unknown", "Unknown task id.")
-            if not self._budget_left(agent):
-                return
             try:
-                manifest = self._json_body()["manifest"]
+                body = self._json_body()
+                manifest, final = body["manifest"], bool(body.get("final_candidate"))
                 files = check_manifest(manifest, max_bundle)
             except (ValueError, KeyError, TypeError):
                 return self._err(400, "bundle_invalid", "Body must be {\"manifest\": ...}.")
             except EvalError as e:
                 return self._err(413 if e.code == "bundle_too_large" else 400, e.code,
                                  e.public()["message"])
+            # A final candidate isn't run on validation, so it doesn't spend the budget.
+            if not final and not self._budget_left(agent):
+                return
             sid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(4)
             for task in tasks:
                 # A family submission is one row per dataset, sharing a group id.
                 rid, gid = (f"{sid}-{task}", sid) if fam else (sid, None)
                 store.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, "
-                        "manifest, group_id) VALUES (?,?,?,?, 'uploading', NULL, NULL, ?, ?)",
-                        (rid, task, agent, time.time(), json.dumps(manifest), gid))
+                        "manifest, group_id) VALUES (?,?,?,?, ?, NULL, NULL, ?, ?)",
+                        (rid, task, agent, time.time(), "uploading_final" if final else "uploading",
+                         json.dumps(manifest), gid))
             uploads, seen = [], set()
             for f in files:
                 if f["sha256"] in seen or blobs.has(agent, f["sha256"], f["size"]):
@@ -565,18 +573,19 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                           "LIMIT 1", (sid, sid, agent), one=True)
             if not row:
                 return self._err(404, "not_found", "No such submission.")
-            if row[0] != "uploading":
-                return self._send(200, {"submission_id": sid, "status": "pending"})
-            if not self._budget_left(agent):
+            if row[0] not in ("uploading", "uploading_final"):
+                return self._send(200, {"submission_id": sid, "status": _public_status(row[0])})
+            final = row[0] == "uploading_final"
+            if not final and not self._budget_left(agent):
                 return
             missing = sorted({f["sha256"] for f in json.loads(row[1])["files"]
                               if not blobs.has(agent, f["sha256"], f["size"])})
             if missing:
                 return self._err(409, "files_missing", "Some files were not uploaded.",
                                  missing=missing)
-            store.q("UPDATE submissions SET status='queued' WHERE (id=? OR group_id=?) AND agent=? "
-                    "AND status='uploading'", (sid, sid, agent))
-            self._send(202, {"submission_id": sid, "status": "pending"})
+            store.q("UPDATE submissions SET status=? WHERE (id=? OR group_id=?) AND agent=? "
+                    "AND status=?", ("registered" if final else "queued", sid, sid, agent, row[0]))
+            self._send(202, {"submission_id": sid, "status": "registered" if final else "pending"})
 
         def _blob_get(self, sha: str) -> None:
             if not isinstance(blobs, DiskBlobs) or store.node(self._bearer()) is None:
@@ -676,10 +685,12 @@ def provider_message(public_url: str, code: str, c: Contract) -> str:
     for GPU tasks, the machine line: their data's format was agreed during
     intake, and `connect` itself shows them exactly what the model will and
     won't see before they approve."""
-    lim = c.limits
-    machine = ("a Linux machine that stays on, with an NVIDIA GPU "
-               f"({lim.gpu_memory_gb or 24} GB or more of GPU memory), 64 GB RAM and "
-               f"{max(300, lim.max_bundle_gb * 4)} GB free disk"
+    lim = c.limits_for("test")   # the most any run of this task needs
+    gpus = f"two {lim.gpu_memory_gb or 24} GB NVIDIA GPUs" if lim.gpus == 2 else (
+        f"{lim.gpus} NVIDIA GPUs ({lim.gpu_memory_gb or 24} GB each)" if lim.gpus > 1 else
+        f"an NVIDIA GPU ({lim.gpu_memory_gb or 24} GB or more of GPU memory)")
+    machine = (f"a Linux machine that stays on, with {gpus}, "
+               f"{max(64, 128 * lim.gpus)} GB RAM and {max(300, lim.max_bundle_gb * 3)} GB free disk"
                if lim.gpus else
                "a Linux machine that stays on (4 CPUs, 16 GB RAM, 150 GB free disk)")
     return f"""\
@@ -718,7 +729,7 @@ def main(argv=None) -> None:
     p.add_argument("--port", type=int, default=8790)
     p.add_argument("--public-url", required=True, help="https URL providers and agents use")
     p.add_argument("--bucket", help="Cloud Storage bucket for model files (default: hub disk)")
-    p.add_argument("--max-bundle-gb", type=int, default=128)
+    p.add_argument("--max-bundle-gb", type=int, default=160)
 
     p = sub.add_parser("new-task", help="write a contract + scorer from a column list")
     p.add_argument("task")

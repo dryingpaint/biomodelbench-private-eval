@@ -80,7 +80,7 @@ def container_cmd(engine: str, image: str, runtime: str | None, *, name: str, en
         "--security-opt", "no-new-privileges",
         "--pids-limit", str(limits.pids),
         "--memory", limits.memory, "--memory-swap", limits.memory,
-        "--cpus", str(limits.cpus),
+        "--cpus", str(min(limits.cpus, os.cpu_count() or 1)),
         "--ulimit", "core=0", "--ulimit", "nofile=4096:4096",
         "--user", uid,
         "--ipc", "private", "--shm-size", f"{limits.shm_mb}m",
@@ -101,6 +101,15 @@ def container_cmd(engine: str, image: str, runtime: str | None, *, name: str, en
         cmd += ["-e", f"{k}={v}"]
     cmd += [image, "python", "-m", f"bmb_eval.sandbox_entry.{entry}"]
     return cmd
+
+
+def gpus_here() -> list[int]:
+    """Memory (GB) of each NVIDIA GPU on this machine; [] if none."""
+    if not shutil.which("nvidia-smi"):
+        return []
+    r = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                       capture_output=True, text=True)
+    return [int(x) // 1024 for x in r.stdout.split()] if r.returncode == 0 else []
 
 
 class ContainerSandbox:

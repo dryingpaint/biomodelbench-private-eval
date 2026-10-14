@@ -59,18 +59,19 @@ def budget(c: Contract) -> Budget:
     error_bits = math.log2(error_outcomes)
 
     lim = c.limits
-    run_ceiling = lim.predict_timeout_s + lim.validate_timeout_s + lim.score_timeout_s
-    if lim.release_after_s >= run_ceiling:
-        timing_bits = 0.0
-    else:
-        # One-second resolution over the window in which finishing time is visible.
-        timing_bits = math.log2(run_ceiling - lim.release_after_s + 1)
-        notes.append(f"result time is observable (release_after_s={lim.release_after_s} < "
-                     f"{run_ceiling}s run ceiling): ~{timing_bits:.1f} bits/submission")
 
-    def bits(lv):
-        return (math.log2(lv + error_outcomes) if not math.isinf(lv) else math.inf) + timing_bits
-    per, per_final = bits(levels), bits(final_levels)
+    def timing(lm):
+        # One-second resolution over the window in which finishing time is visible.
+        ceiling = lm.predict_timeout_s + lm.validate_timeout_s + lm.score_timeout_s
+        return 0.0 if lm.release_after_s >= ceiling else math.log2(ceiling - lm.release_after_s + 1)
+    timing_bits, final_timing_bits = timing(lim), timing(c.limits_for("test"))
+    if timing_bits:
+        notes.append(f"result time is observable (release_after_s={lim.release_after_s} < "
+                     f"run ceiling): ~{timing_bits:.1f} bits/submission")
+
+    def bits(lv, tb):
+        return (math.log2(lv + error_outcomes) if not math.isinf(lv) else math.inf) + tb
+    per, per_final = bits(levels, timing_bits), bits(final_levels, final_timing_bits)
     if c.ladder_step is not None:
         notes.append("ladder on: most submissions return only 'not improved'; "
                      "bound above still applies to the improving ones")

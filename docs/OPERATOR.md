@@ -117,6 +117,7 @@ code nobody has used, run `deploy/gcp/hub revoke <code>`.
 | `limits.release_after_s` | 0 | Setting it at or above the total timeout removes the timing channel, but slows feedback |
 | `limits.gpus`, `gpu_memory_gb` | 0 | Large models need a GPU at the provider; connect checks the GPU is big enough |
 | `limits.max_bundle_gb` | 64 | Provider needs about 2× this much free disk |
+| `final_limits` | none | Overrides of `limits` for final evaluations only, e.g. `{gpus: 2, gpu_memory_gb: 80, max_bundle_gb: 150}`. Validation stays on CPU; connect only warns if the GPUs are missing, and the node refuses finals (`final_hardware_missing`, not counted) until they're there. Needs `split`. The hub's `--max-bundle-gb` (default 160) must be at least the largest `max_bundle_gb` |
 | `export.decimals` | 3 | Each decimal ≈ 3.3 bits per metric per evaluation |
 | `export.ladder_step` | off | Turn on for "final" tasks |
 | metric `per: [...]` | none | Every group adds a full metric to the leakage budget |
@@ -170,3 +171,7 @@ $HUB_ADMIN results <task>             # validation and final scores; final ones 
 The provider's node allows at most `final_evaluations` test runs per task, and
 refuses the rest with `final_quota_exceeded`, so plan which submissions to
 finalize. Final results never reach agents.
+
+A model too big for validation (see `final_limits`) is registered by the agent
+with `Client.register_final` instead of submitted; `final` accepts its
+submission id like any other.

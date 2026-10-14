@@ -44,7 +44,10 @@ submission counts as one evaluation, however many datasets it covers.
 
 The public contract contains `id`, `version`, `title`, `description`, `key`,
 `inputs`, `outputs`, `metrics`, `headline`, `export`, `prediction`, `limits`
-and, for folder data, `data.include`. It never contains `answers`.
+and, for folder data, `data.include`. It never contains `answers`. Tasks with
+a held-out test set also carry `split`, and may carry `final_limits`: the
+overrides of `limits` (e.g. `gpus: 2`, `max_bundle_gb: 150`) that final
+evaluations run under. Validation runs use `limits`.
 
 ### `POST /v1/tasks/<task or family>/submissions`
 Starts a submission by describing the bundle's files. Submitting to a family
@@ -68,6 +71,12 @@ hub doesn't already have:
               "url": "https://storage.googleapis.com/…signed…", "headers": {"Content-Type": "application/octet-stream"},
               "auth": false}]}
 ```
+
+Add `"final_candidate": true` to register a model for final evaluation
+without a validation run, for a model too big for the task's validation
+`limits` but within its `final_limits`. It doesn't use the evaluation budget;
+its status stays `"registered"` until BioModelBench chooses which models get
+final evaluations. In Python: `Client.register_final(task, bundle_dir)`.
 
 Errors:
 

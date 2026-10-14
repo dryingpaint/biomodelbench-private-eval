@@ -60,12 +60,15 @@ class Client:
                 return t["contract"]
         raise KeyError(task)
 
-    def submit_async(self, task: str, bundle: str | Path, retries: int = 3) -> dict:
+    def submit_async(self, task: str, bundle: str | Path, retries: int = 3,
+                     final_candidate: bool = False) -> dict:
         """Upload a bundle directory and queue it. Returns {submission_id, status}
-        or the hub's {"error": ...}."""
+        or the hub's {"error": ...}. final_candidate=True registers it for final
+        evaluation without a validation run (e.g. too big for validation limits)."""
         bundle = Path(bundle)
         manifest = manifest_for(bundle)
-        r = self._req("POST", f"/v1/tasks/{task}/submissions", {"manifest": manifest})
+        r = self._req("POST", f"/v1/tasks/{task}/submissions",
+                      {"manifest": manifest, "final_candidate": final_candidate})
         if "submission_id" not in r:
             return r
         paths = {f["sha256"]: bundle / f["path"] for f in manifest["files"]}
@@ -88,6 +91,12 @@ class Client:
             req = urllib.request.Request(up["url"], data=f, method=up.get("method", "PUT"),
                                          headers=headers)
             urllib.request.urlopen(req, timeout=max(self.timeout, 3600)).read()
+
+    def register_final(self, task: str, bundle: str | Path) -> dict:
+        """Register a model as a final-evaluation candidate: uploaded and kept,
+        never run on validation, no evaluation budget spent. Returns
+        {submission_id, status: "registered"}."""
+        return self.submit_async(task, bundle, final_candidate=True)
 
     def status(self, submission_id: str) -> dict:
         return self._req("GET", f"/v1/submissions/{submission_id}")

@@ -21,7 +21,7 @@ import yaml
 
 from . import approval, audit, leakage, scaffold
 from .config import save_yaml
-from .sandbox import ENGINES, detect_engine, make as make_sandbox
+from .sandbox import ENGINES, detect_engine, gpus_here, make as make_sandbox
 
 IMAGE = "bmb-eval-sandbox:latest"
 
@@ -197,13 +197,17 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
     local = cfg.backend == "local"
     failed = 0
     for a in ATTACKS:
-        if a.gpu_only and not t.contract.limits.gpus:
-            continue
+        limits = a.limits
+        if a.gpu_only:
+            gpus = t.contract.limits_for("test").gpus
+            if not (gpus and gpus_here()):
+                continue
+            limits = {**limits, "gpus": gpus}
         if a.container_only and local:
             if verbose:
                 print(f"  SKIP  {a.name:14s} {a.what} (local backend has no isolation)")
             continue
-        p = runner.evaluate(task, bundle_bytes(a), submitter="selftest", limits_override=a.limits)
+        p = runner.evaluate(task, bundle_bytes(a), submitter="selftest", limits_override=limits)
         got = "ok" if p["status"] == "ok" else p["error"]["code"]
         leaked = first_row in json.dumps(p)
         ok = got == a.expect and not leaked
@@ -221,16 +225,14 @@ def _kb(bits: float) -> str:
     return f"{b:,.0f} bytes" if b < 1000 else f"{b / 1000:.1f} KB"
 
 
-def gpus_here() -> list[int]:
-    """Memory (GB) of each NVIDIA GPU on this machine; [] if none."""
-    if not shutil.which("nvidia-smi"):
-        return []
-    r = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-                       capture_output=True, text=True)
-    return [int(x) // 1024 for x in r.stdout.split()] if r.returncode == 0 else []
-
-
 def hardware_problems(lim, root: Path) -> list[str]:
+    out = gpu_problems(lim)
+    if (shutil.disk_usage(root).free >> 30) < 20:
+        out.append("Less than 20 GB of disk is free; models need room to download.")
+    return out
+
+
+def gpu_problems(lim) -> list[str]:
     out = []
     if lim.gpus:
         mem = gpus_here()
@@ -240,8 +242,6 @@ def hardware_problems(lim, root: Path) -> list[str]:
         elif lim.gpu_memory_gb and min(sorted(mem)[-lim.gpus:]) < lim.gpu_memory_gb:
             out.append(f"This task needs {lim.gpu_memory_gb} GB of GPU memory; the GPU here has "
                        f"{max(mem)} GB.")
-    if (shutil.disk_usage(root).free >> 30) < 20:
-        out.append("Less than 20 GB of disk is free; models need room to download.")
     return out
 
 
@@ -347,7 +347,11 @@ def cmd_connect(args) -> None:
             print(f"  • {p}")
         raise SystemExit("\nPlease send this message to BioModelBench; we'll help sort it out.")
 
-    if note := disk_note(cfg.tasks[task].contract.limits, root):
+    final_lim = cfg.tasks[task].contract.limits_for("test")
+    for p in gpu_problems(final_lim):
+        # Not a blocker: validation runs on CPU; GPUs are needed by the final evaluations.
+        print(f"  Note: {p} Final evaluations need it; everything else runs now.")
+    if note := disk_note(final_lim, root):
         print(f"  {note}")
 
     # 4. Prove the sandbox holds on this machine, with this data.
@@ -640,7 +644,7 @@ def cmd_dryrun(args) -> None:
         inputs = inputs_dir / "samples.parquet"
         cm = Mount("BMB_CONTRACT_FILE", contract_file, "")
         env = {}
-        lim = c.limits
+        lim = c.limits_for("test" if args.final else "validation")
         sb = LocalSandbox()
         r = sb.run(name="dryrun-predict", entry="predict", env=env, limits=lim,
                    mounts=[Mount("BMB_BUNDLE", bundle, ""), Mount("BMB_INPUTS_DIR", inputs_dir, ""), cm],
@@ -732,6 +736,8 @@ def main(argv=None) -> None:
     p.add_argument("contract")
     p.add_argument("bundle")
     p.add_argument("-n", type=int, default=200)
+    p.add_argument("--final", action="store_true",
+                   help="use the final-evaluation limits (e.g. GPUs) instead of validation's")
     p.set_defaults(fn=cmd_dryrun)
 
     args = ap.parse_args(argv)

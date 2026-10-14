@@ -36,6 +36,7 @@ ERRORS: dict[str, tuple[str, str]] = {
     "task_unknown": ("Unknown task id.", "policy"),
     "no_test_split": ("This task has no held-out test set.", "policy"),
     "final_quota_exceeded": ("Final (test set) evaluations for this task are used up.", "policy"),
+    "final_hardware_missing": ("The provider's machine lacks the GPUs final evaluations need.", "policy"),
 }
 
 # Reasons allowed in detail.reason for predictions_invalid.

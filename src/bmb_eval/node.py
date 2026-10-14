@@ -17,6 +17,7 @@ from .blobs import BlobCache, check_manifest
 from .config import Config
 from .errors import EvalError
 from .runner import Runner
+from .sandbox import gpus_here
 from .store import Store
 
 POLL_S = 5
@@ -236,8 +237,8 @@ class Worker:
         if self.store.has(sid):
             return
         t = self.cfg.tasks.get(task)
-        lim = t.contract.limits if t else None
         split = job.get("split", "validation")
+        lim = t.contract.limits_for(split) if t else None
         refusal, files = None, []
         if t is None or split not in ("validation", "test"):
             refusal = EvalError("task_unknown")
@@ -246,6 +247,9 @@ class Worker:
         elif split == "test" and self.store.count_final(task) >= t.contract.split.final_evaluations:
             # Enforced here, not at the hub: even a compromised hub can't run the test set again.
             refusal = EvalError("final_quota_exceeded")
+        elif split == "test" and lim.gpus and len(gpus_here()) < lim.gpus:
+            # Refused before it counts, so the final can run once GPUs are added.
+            refusal = EvalError("final_hardware_missing")
         elif split == "validation" and (
                 self.store.count_today(submitter, task) >= lim.submissions_per_day or (
                 lim.submissions_total and self.store.count_total(task) >= lim.submissions_total)):

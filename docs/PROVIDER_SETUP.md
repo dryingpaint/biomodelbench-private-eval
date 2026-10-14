@@ -5,9 +5,11 @@ them on your data and sends back only the scores. Your data never leaves.
 
 ## What you need
 
-- **A Linux machine that stays on.** The server your data is already on is
-  ideal. If you don't have a suitable machine, talk to us and we'll help you
-  set one up.
+- **A Linux machine that stays on**, with two 80 GB NVIDIA GPUs (A100 or
+  H100), 24 CPUs, 256 GB RAM and 500 GB free disk. Most of the time it runs
+  small models on CPUs; the GPUs are for the final evaluations, which run the
+  largest models. If you don't have a suitable machine, talk to us and we'll
+  help you set one up.
 - **The data you described to us**, as one file or one folder, in whatever
   format it's already in.
 

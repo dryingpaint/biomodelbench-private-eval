@@ -110,6 +110,9 @@ def launch(node_id: str, pointers: dict, conf: dict, project: str | None = None)
             return {"zone": zone, "model": model, "name": name}
         msg = json.dumps(err)[:300]
         errors.append(f"{zone}/{model}: {msg}")
+        # A failed create can leave a stopped instance that still holds GPU quota:
+        # remove it before trying the next place.
+        _wait(_call("DELETE", f"{API}/projects/{project}/zones/{zone}/instances/{name}"))
         if not any(k in msg for k in ("QUOTA", "Quota", "STOCKOUT", "stockout", "unavailable",
                                       "does not have enough resources", "ZONE_RESOURCE_POOL_EXHAUSTED")):
             break                                         # not a capacity problem: don't spray zones

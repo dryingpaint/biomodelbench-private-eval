@@ -209,6 +209,9 @@ class BwrapSandbox:
         e = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "TMPDIR": "/tmp",
              "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": "/opt/bmb",
              "PIP_NO_INDEX": "1", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+             # No cgroups here: size math-library thread pools (and their buffers) to the limit.
+             **{v: str(max(1, int(limits.cpus))) for v in
+                ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")},
              **({"LD_LIBRARY_PATH": "/usr/local/nvidia/lib64"} if gpus else {}),
              **{m.env: m.container for m in mounts}, **env}
         cmd += ["--remount-ro", "/"]       # the sandbox's own root: only /tmp and /dev/shm are writable
@@ -230,11 +233,13 @@ class BwrapSandbox:
             resource.setrlimit(resource.RLIMIT_NPROC, (limits.pids, limits.pids))
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
-            if not gpus:              # CUDA reserves huge address ranges; cap memory on CPU only
-                mem = _bytes(limits.memory)
-                resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+            if not gpus:              # CUDA maps huge regions; cap memory on CPU stages only
+                mem = _bytes(limits.memory)   # data, not address space: libraries reserve plenty
+                resource.setrlimit(resource.RLIMIT_DATA, (mem, mem))
 
-        granted = _grant([m.host for m in mounts])
+        # GPU stages: the device files too (root-only inside the container otherwise).
+        granted = _grant([m.host for m in mounts]
+                         + (sorted(Path("/dev").glob("nvidia*")) if gpus else []))
         try:
             return _run(self.cmd(entry=entry, mounts=mounts, env=env, limits=limits, gpus=gpus),
                         timeout_s, stdout_cap, stdin, env={}, on_kill=self.kill_all,

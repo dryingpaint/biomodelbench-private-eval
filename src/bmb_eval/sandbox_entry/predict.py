@@ -151,4 +151,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except MemoryError:            # e.g. importing torch under a tight memory limit
+        sys.exit(EXIT_MEMORY)

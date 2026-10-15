@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends bubblewrap proc
 # What submitted models can import (same as the provider-run sandbox), plus
 # what the node needs to reach the provider's key and bucket.
 COPY sandbox/requirements.txt /tmp/requirements.txt
+# Confidential Space's GPU driver is 535 (CUDA 12.2): use PyTorch's CUDA 12.1 build.
+RUN pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
       cryptography google-auth google-cloud-kms google-cloud-storage requests \
  && rm /tmp/requirements.txt

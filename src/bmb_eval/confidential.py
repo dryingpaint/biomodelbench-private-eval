@@ -455,6 +455,34 @@ def synthetic_tasks(root: Path) -> dict:
     return {"sealed_selftest": (task_dir, data_dir, node)}
 
 
+def _gpu_diag() -> None:
+    """Why CUDA isn't usable inside the sandbox (synthetic self-test only)."""
+    from .contract import Limits
+    from .sandbox import SANDBOX_UID, BwrapSandbox
+    code = ("import os, ctypes, glob\n"
+            "print('uid', os.getuid(), 'ld', os.environ.get('LD_LIBRARY_PATH'))\n"
+            "print('libcuda', glob.glob('/usr/local/nvidia/lib64/libcuda.so*')[:3])\n"
+            "print('proc', os.path.exists('/proc/driver/nvidia/version'))\n"
+            "try:\n c = ctypes.CDLL('libcuda.so.1'); n = ctypes.c_int()\n"
+            " print('cuInit', c.cuInit(0), 'cuDeviceGetCount', c.cuDeviceGetCount(ctypes.byref(n)), n.value)\n"
+            "except Exception as e: print('libcuda error', e)\n"
+            "import torch\n"
+            "try: torch.cuda.init(); print('torch ok', torch.cuda.device_count())\n"
+            "except Exception as e: print('torch error', e)\n")
+    for label, as_sandbox in (("sandbox", True), ("node", False)):
+        cmd = (BwrapSandbox().cmd(entry="predict", mounts=[], env={}, limits=Limits(), gpus=1)[:-3]
+               + ["python3", "-c", code]) if as_sandbox else ["python3", "-c", code]
+
+        def drop():
+            os.setgroups([])
+            os.setgid(SANDBOX_UID)
+            os.setuid(SANDBOX_UID)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                           preexec_fn=drop if as_sandbox else None)
+        print(f"BMB-DIAG gpu[{label}] rc={r.returncode}: "
+              + (r.stdout + r.stderr)[-1500:].replace("\n", " | "), flush=True)
+
+
 def cmd_confidential_node(args) -> None:
     from . import approval
     from .cli import _selftest
@@ -490,6 +518,15 @@ def cmd_confidential_node(args) -> None:
     for task in sorted(cfg.tasks):
         failed = _selftest(cfg, task, verbose=True)   # prints attack names and PASS/FAIL only
         say(step="selftest", task=task, failed=failed)
+        if failed and selftest_only:
+            # Synthetic data only: safe to show why (never done with a provider's data).
+            devs = subprocess.run("ls -l /dev/nvidia* /dev/nvidia-caps 2>&1 | head", shell=True,
+                                  capture_output=True, text=True).stdout
+            print("BMB-DIAG devices: " + devs.replace("\n", " | "), flush=True)
+            _gpu_diag()
+            for log in sorted((root / "state" / "runs").glob("*/predict.log")):
+                tail = [ln for ln in log.read_text().splitlines() if ln.strip()][-6:]
+                print(f"BMB-DIAG {log.parent.name}: " + " | ".join(tail)[-1500:], flush=True)
         if failed:
             say(step="refused", reason="security self-test failed; not taking work")
             sys.exit(3)

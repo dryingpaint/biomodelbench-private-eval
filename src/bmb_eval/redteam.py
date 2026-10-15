@@ -76,7 +76,8 @@ ATTACKS = [
         # What the sandbox is allowed to have mounted; anything else is an escape.
         ALLOWED = ("/bundle", "/data/inputs", "/contract.json", "/tmp", "/dev", "/proc", "/sys",
                    "/etc/hosts", "/etc/hostname", "/etc/resolv.conf", "/run/.containerenv",
-                   "/etc/passwd", "/etc/group", "/run/secrets")
+                   "/etc/passwd", "/etc/group", "/run/secrets",
+                   "/usr/local/nvidia")   # the GPU driver (read-only), on GPU machines
 
         def load_model():
             hits = [k for k in os.environ if "ANSWER" in k.upper() or "TOKEN" in k.upper()]

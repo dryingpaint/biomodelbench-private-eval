@@ -36,7 +36,28 @@ provider project                         biomodelbench
 | Sandboxes inside the container: gVisor (systrap, ptrace), bubblewrap, user+net namespaces | All run with no network |
 | GPU inside the gVisor sandbox (`runsc --nvproxy do`) | **Fails**: can't reach the driver |
 
-**Not done yet:**
+
+## End to end (2026-10-15): the real sealed node, H100
+
+Image `sealed-node@sha256:1e5976d2…` (`src/bmb_eval/confidential.py`,
+`deploy/confidential/Dockerfile`), simulated provider project `bmb-provider-sim-1014`.
+
+| Step | Result |
+|---|---|
+| Synthetic self-test on sealed H100 (no provider) | 13/13 attacks contained, including GPU access from inside the sandbox |
+| Provider: `curl …/confidential.sh \| sh -s -- CODE --data file.csv --project P` | Data checked and split locally (492 / 508). Approval screen shows the image digest. Key, bucket and attestation rule are created. Only ciphertext is uploaded. |
+| Sealed node boots | Unsealed into tmpfs. Self-test on the provider's task: 0 failures. Serves jobs. |
+| Agent CPU model, validation | spearman_exact 0.952, concordance 0.921 (final-only RMSE/MAE withheld) |
+| Agent GPU model, registered as final candidate, final run | spearman_exact 0.938, RMSE 0.413, MAE 0.332. The model refuses to run without CUDA, so the GPU worked inside the sandbox. |
+| Idle | The node exits after `BMB_IDLE_EXIT_S`; the VM stops |
+
+Fixes found on real hardware:
+- Confidential Space's GPU driver is 535 (CUDA 12.2), so the image uses PyTorch's CUDA 12.1 build.
+- Memory limits are per-process data limits, not cgroups, so math-library thread pools are sized to the CPU limit.
+- A MemoryError anywhere maps to the resource-limit error.
+- The read-only GPU driver mount is allowed in the sandbox's view.
+
+**Not done yet (before production):**
 - **GPU inside the sandbox.** Try gVisor nvproxy through `runsc run` with an
   OCI spec, and check its driver-version support. Otherwise fall back to
   bubblewrap binding only `/dev/nvidia*`, the bundle and the inputs.

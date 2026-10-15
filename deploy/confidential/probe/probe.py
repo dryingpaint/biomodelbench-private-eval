@@ -50,7 +50,8 @@ def claims() -> dict:
         payload = open(TOKEN).read().split(".")[1]
         c = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
         sub = c.get("submods", {})
-        return {"swname": c.get("swname"), "dbgstat": c.get("dbgstat"), "hwmodel": c.get("hwmodel"),
+        return {"submods": sorted(sub), "gpu": {k: v for k, v in sub.items() if "gpu" in k.lower()},
+                "swname": c.get("swname"), "dbgstat": c.get("dbgstat"), "hwmodel": c.get("hwmodel"),
                 "image_digest": sub.get("container", {}).get("image_digest"),
                 "support": sub.get("confidential_space", {}).get("support_attributes")}
     except Exception as e:
@@ -112,7 +113,18 @@ def probe_sandboxes() -> None:
     os.chmod(secret, 0o600)
     readcheck = f"import sys\ntry:\n open('{secret}').read()\n sys.exit('DATA READABLE')\nexcept OSError:\n print('data hidden')"
     try_cmd("unshare-data-hidden", ["unshare", "-Urn", "--map-user=65534", "python3", "-c", readcheck])
-    try_cmd("nvidia-smi", ["nvidia-smi", "-L"])
+    smi = shutil.which("nvidia-smi") or next((p for p in ("/usr/local/nvidia/bin/nvidia-smi",
+                                                            "/var/lib/nvidia/bin/nvidia-smi")
+                                               if os.path.exists(p)), "nvidia-smi")
+    os.environ["LD_LIBRARY_PATH"] = "/usr/local/nvidia/lib64"   # where Confidential Space mounts the driver
+    log(step="gpu-env", smi=smi, devices=sorted(d for d in os.listdir("/dev") if d.startswith("nvidia")),
+        ld=os.environ.get("LD_LIBRARY_PATH"))
+    try_cmd("nvidia-smi", [smi, "-L"])
+    try_cmd("gpu-confidential-mode", [smi, "conf-compute", "-f"])
+    try_cmd("gpu-ready-state", [smi, "conf-compute", "-grs"])
+    # The model must reach the GPU from inside the sandbox (gVisor's nvproxy).
+    try_cmd("gvisor-nvproxy", ["runsc", "--rootless", "--network=none", "--ignore-cgroups", "--nvproxy",
+                               "--nvproxy-docker", f"--root={root}/runsc4", "do", smi, "-L"])
 
 
 if __name__ == "__main__":

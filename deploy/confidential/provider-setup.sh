@@ -13,12 +13,14 @@
 #     attestation, accepting only: production Confidential Space, debugging
 #     off, running exactly --digest, as BioModelBench's workload account.
 # Re-run with a new --digest to approve an updated image (the old one stops
-# working). Requires gcloud and python3 with `cryptography`.
+# working). --allow-gpu-preview also accepts the GPU preview image (H100 in
+# confidential mode). Requires gcloud and python3 with `cryptography`.
 set -euo pipefail
 NAME=bmb; POOL_ID=bmb-eval; LOC=us-central1
 while [ $# -gt 0 ]; do case "$1" in
   --project) PROJECT=$2; shift 2;; --data) DATA=$2; shift 2;;
   --digest) DIGEST=$2; shift 2;; --workload-sa) SA=$2; shift 2;;
+  --allow-gpu-preview) GPU_PREVIEW=1; shift;;
   *) echo "unknown argument $1" >&2; exit 2;; esac; done
 : "${PROJECT:?--project}" "${DATA:?--data}" "${DIGEST:?--digest}" "${SA:?--workload-sa}"
 g() { gcloud --project "$PROJECT" --quiet "$@"; }
@@ -49,7 +51,12 @@ g storage cp "$TMP/data.enc" "$BUCKET/data.csv.enc"
 g storage cp "$TMP/dek.enc" "$BUCKET/data.dek.enc"
 
 echo "3/4 Trust only the attested BioModelBench image"
-COND="assertion.swname == 'CONFIDENTIAL_SPACE' && 'STABLE' in assertion.submods.confidential_space.support_attributes \
+SUPPORT="'STABLE' in assertion.submods.confidential_space.support_attributes"
+# Confidential Space on GPUs is a preview ('EXPERIMENTAL' image). Opt in only
+# for it, and only with the H100 attested in confidential-computing mode.
+[ -n "${GPU_PREVIEW:-}" ] && SUPPORT="($SUPPORT || ('EXPERIMENTAL' in assertion.submods.confidential_space.support_attributes \
+&& assertion.submods.nvidia_gpu.cc_mode == 'ON'))"
+COND="assertion.swname == 'CONFIDENTIAL_SPACE' && $SUPPORT \
 && assertion.dbgstat == 'disabled-since-boot' && assertion.submods.container.image_digest == '$DIGEST' \
 && '$SA' in assertion.google_service_accounts"
 g iam workload-identity-pools describe "$POOL_ID" --location global >/dev/null 2>&1 ||

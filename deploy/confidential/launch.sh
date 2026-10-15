@@ -15,7 +15,8 @@ META="tee-image-reference=$IMAGE,tee-container-log-redirect=true,tee-restart-pol
 while IFS='=' read -r k v; do [ -n "$k" ] && META="$META,tee-env-$k=$v"; done < <(grep -E '^[A-Z_]+=' "$ENV_FILE")
 if [ "$KIND" = h100 ]; then
   HW=(--machine-type a3-highgpu-1g --confidential-compute-type TDX --maintenance-policy TERMINATE
-      --boot-disk-size 100GB --image-family confidential-space-preview-cgpu)
+      --boot-disk-size 100GB --image-family confidential-space-preview-cgpu
+      ${SPOT:+--provisioning-model SPOT --instance-termination-action DELETE})
   META="$META,tee-install-gpu-driver=true"
 elif [ "$KIND" = cpu-tdx ]; then
   HW=(--machine-type c3-standard-4 --confidential-compute-type TDX --maintenance-policy TERMINATE

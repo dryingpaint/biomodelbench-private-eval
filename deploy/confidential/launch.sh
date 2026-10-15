@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Our side (prototype): run an image as a Confidential Space workload.
+#   IMAGE=us-central1-docker.pkg.dev/biomodelbench/bmb/cs-probe@sha256:... \
+#   ENV_FILE=provider.env ./launch.sh [cpu|h100]
+# ENV_FILE holds the KEY=VALUE lines provider-setup.sh printed.
+# cpu:  n2d-standard-2, AMD SEV (Confidential Space GA)
+# cpu-tdx: c3-standard-4, Intel TDX (Confidential Space GA)
+# h100: a3-highgpu-1g, Intel TDX + H100 in confidential mode (Confidential Space on GPU: preview)
+set -euo pipefail
+KIND="${1:-cpu}"
+PROJECT="${PROJECT:-biomodelbench}"; ZONE="${ZONE:-us-central1-a}"
+NAME="${NAME:-bmb-cs-$KIND}"; SA="${SA:-bmb-cs-workload@$PROJECT.iam.gserviceaccount.com}"
+: "${IMAGE:?IMAGE=<registry path>@sha256:<digest>}" "${ENV_FILE:?ENV_FILE=<provider values>}"
+META="tee-image-reference=$IMAGE,tee-container-log-redirect=true,tee-restart-policy=Never"
+while IFS='=' read -r k v; do [ -n "$k" ] && META="$META,tee-env-$k=$v"; done < <(grep -E '^[A-Z_]+=' "$ENV_FILE")
+if [ "$KIND" = h100 ]; then
+  HW=(--machine-type a3-highgpu-1g --confidential-compute-type TDX --maintenance-policy TERMINATE
+      --boot-disk-size 100GB --image-family confidential-space-preview-cgpu)
+  META="$META,tee-install-gpu-driver=true"
+elif [ "$KIND" = cpu-tdx ]; then
+  HW=(--machine-type c3-standard-4 --confidential-compute-type TDX --maintenance-policy TERMINATE
+      --image-family confidential-space)
+else
+  HW=(--machine-type n2d-standard-2 --confidential-compute-type SEV --maintenance-policy MIGRATE
+      --image-family confidential-space)
+fi
+gcloud compute instances create "$NAME" --project "$PROJECT" --zone "$ZONE" "${HW[@]}" \
+  --image-project confidential-space-images --shielded-secure-boot \
+  --service-account "$SA" --scopes cloud-platform --metadata "^,^$META"
+echo "Logs: gcloud logging read 'logName=\"projects/$PROJECT/logs/confidential-space-launcher\" AND textPayload:BMB-PROBE' --project $PROJECT"

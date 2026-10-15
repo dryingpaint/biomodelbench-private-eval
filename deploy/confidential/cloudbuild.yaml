@@ -1,6 +1,6 @@
 # Built from a public git commit by deploy/confidential/build.sh. Cloud Build
 # signs SLSA provenance (source repo + commit -> image digest) that providers
-# can check with deploy/confidential/verify-image.sh.
+# can check with deploy/confidential/verify-image.sh (Google-signed SLSA v1).
 steps:
   - name: gcr.io/cloud-builders/docker
     args: [build, -f, deploy/confidential/Dockerfile, -t,

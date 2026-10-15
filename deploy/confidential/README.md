@@ -23,7 +23,7 @@ provider project                         biomodelbench
 | Sealed node | `src/bmb_eval/confidential.py` (`confidential-node`) |
 | Sandbox | `BwrapSandbox` in `src/bmb_eval/sandbox.py`: bubblewrap as an unprivileged user, no network, minimal filesystem, read-only root, plus a seccomp filter blocking escape-prone kernel interfaces (user namespaces, mount, ptrace, bpf, io_uring, userfaultfd, keyrings, modules). gVisor isn't used here because it can't reach the GPU inside Confidential Space. |
 | Image | `Dockerfile`, built from a public commit by `build.sh` with Cloud Build's signed SLSA provenance. Base image pinned by digest, Debian by snapshot, Python by hash (`requirements.lock`). |
-| Provider check | `curl -fsSL https://eval.biomodelbench.org/verify-image.sh \| sh` (slsa-verifier: digest ← commit) |
+| Provider check | `curl -fsSL https://eval.biomodelbench.org/verify-image.sh \| sh`: checks Google Cloud Build's signature on the SLSA v1 provenance (with Google's published key), and that it binds the approved digest to the published commit |
 | Start on demand | The hub (`bmb-hub serve --launch-sealed`, `src/bmb_eval/sealed_launcher.py`) creates the node's VM when its tasks have queued jobs and it's offline. It tries on-demand, then Spot, across us-central1-a, us-east5-a and europe-west4-c. The node exits when idle (`BMB_IDLE_EXIT_S`), and the VM stops. Manual start: `bmb-hub confidential-launch <node>`. |
 | Status | No logs in production (`log_redirect=debugonly`). The node reports fixed status fields to the hub (`bmb-hub status`). |
 | Final limits | Tasks set `final_limits_sealed` (e.g. `gpus: 1, max_bundle_gb: 80`) for this node; providers' own machines keep `final_limits`. |

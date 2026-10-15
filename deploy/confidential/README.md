@@ -45,7 +45,7 @@ bmb-hub status                                         # node status, launches
   Providers opt in, and their rule then also requires the H100 to attest
   confidential mode.
 - **One H100 per sealed node.** Finals go up to ~70B parameters at 8-bit.
-- **Quota (2026-10-15).** Preemptible (Spot/Flex-start) H100 quota is approved
+- **Quota.** Preemptible (Spot/Flex-start) H100 quota is approved
   in us-central1, us-east5 and europe-west4. On-demand doesn't exist for this
   machine type. The global GPU limit is 1 (a raise was denied for this new
   project), so one sealed node runs at a time: another provider's node starts

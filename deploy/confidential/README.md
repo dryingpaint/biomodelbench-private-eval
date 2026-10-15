@@ -45,9 +45,12 @@ bmb-hub status                                         # node status, launches
   Providers opt in, and their rule then also requires the H100 to attest
   confidential mode.
 - **One H100 per sealed node.** Finals go up to ~70B parameters at 8-bit.
-- **Quota.** Google denied on-demand H100 quota for the new project. Spot
-  (us-central1) is approved, and more requests are pending. Spot VMs can be
-  reclaimed; jobs re-queue and the hub restarts the node.
+- **Quota (2026-10-15).** Spot H100 quota is approved in us-central1, us-east5
+  and europe-west4. On-demand H100 was denied twice: the project is new and has
+  no spend history. The global GPU limit is 1 (a raise to 4 was denied), so only
+  one sealed node can run at a time. Retry after some billing history, or via
+  a Google Cloud sales contact. Spot VMs can be reclaimed; jobs re-queue and
+  the hub restarts the node.
 - **Trust.** Providers trust Intel TDX, NVIDIA H100 CC, Google's Confidential
   Space image, and the code at the commit they verify.
 

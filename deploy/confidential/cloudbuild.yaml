@@ -1,0 +1,9 @@
+# gcloud builds submit --project biomodelbench --region us-central1 \
+#   --config deploy/confidential/cloudbuild.yaml --substitutions _TAG=v1 .
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: [build, -f, deploy/confidential/Dockerfile, -t,
+           "us-central1-docker.pkg.dev/$PROJECT_ID/bmb/sealed-node:${_TAG}", .]
+images: ["us-central1-docker.pkg.dev/$PROJECT_ID/bmb/sealed-node:${_TAG}"]
+options: {diskSizeGb: 100}
+timeout: 3600s

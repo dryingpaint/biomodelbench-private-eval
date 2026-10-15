@@ -42,6 +42,7 @@ class Config:
     retain_bundles: bool
     cache_gb: int      # model-file cache size before least-recently-used files go
     hub: dict          # {url, node_id, secret} once connected; {} before
+    blob_dir: Path | None = None   # model-file cache; default state_dir/blobs
     tasks: dict[str, TaskBinding] = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
@@ -72,8 +73,10 @@ class Config:
             retain_bundles=bool(raw.get("retain_bundles", False)),
             cache_gb=int(raw.get("cache_gb", 300)),
             hub=dict(raw.get("hub") or {}),
+            blob_dir=rel(raw["blob_dir"]) if raw.get("blob_dir") else None,
             raw=raw,
         )
+        cfg.blob_dir = cfg.blob_dir or cfg.state_dir / "blobs"
         for tid, t in (raw.get("tasks") or {}).items():
             d = rel(t["dir"])
             contract = Contract.load(d / "contract.yaml")
@@ -83,8 +86,8 @@ class Config:
                                          rel(t["inputs_dir"]) if t.get("inputs_dir") else None,
                                          rel(t["answers_dir"]) if t.get("answers_dir") else None,
                                          rel(t["test_inputs_dir"]) if t.get("test_inputs_dir") else None)
-        if cfg.backend not in ("docker", "podman", "local"):
-            raise SystemExit("sandbox.backend must be docker, podman or local")
+        if cfg.backend not in ("docker", "podman", "bwrap", "local"):
+            raise SystemExit("sandbox.backend must be docker, podman, bwrap or local")
         if cfg.backend == "local" and not cfg.allow_unisolated:
             raise SystemExit("sandbox.backend local is NOT isolated; set "
                              "sandbox.i_understand_local_backend_is_not_isolated: true "

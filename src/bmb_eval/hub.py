@@ -43,6 +43,7 @@ from .contract import Contract
 from .errors import EvalError
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (name TEXT PRIMARY KEY, token_sha256 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS families (name TEXT PRIMARY KEY, tasks TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS nodes (
@@ -154,7 +155,8 @@ class HubStore:
         for table, col, decl in [("enrollments", "version", "INTEGER NOT NULL DEFAULT 1"),
                                  ("submissions", "split", "TEXT NOT NULL DEFAULT 'validation'"),
                                  ("submissions", "group_id", "TEXT"),
-                                 ("agents", "eval_budget", "INTEGER")]:
+                                 ("agents", "eval_budget", "INTEGER"),
+                                 ("nodes", "confidential", "TEXT")]:
             if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         self.db.commit()
@@ -166,6 +168,13 @@ class HubStore:
             return cur.fetchone() if one else cur.fetchall()
 
     # ---------------------------------------------------------------- auth
+
+    def setting(self, key: str) -> dict | None:
+        row = self.q("SELECT value FROM settings WHERE key=?", (key,), one=True)
+        return json.loads(row[0]) if row else None
+
+    def set_setting(self, key: str, value: dict) -> None:
+        self.q("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
 
     def agent(self, token: str) -> str | None:
         row = self.q("SELECT name FROM agents WHERE token_sha256=?", (_h(token),), one=True)
@@ -291,7 +300,8 @@ class HubStore:
         if node_id is None:
             node_id = "node_" + secrets.token_hex(6)
             secret = "bmbn_" + secrets.token_urlsafe(32)
-            self.q("INSERT INTO nodes VALUES (?,?,?,?,NULL,0)", (node_id, _h(secret), name, time.time()))
+            self.q("INSERT INTO nodes (id, secret_sha256, name, created, last_seen, accepting) "
+                   "VALUES (?,?,?,?,NULL,0)", (node_id, _h(secret), name, time.time()))
             out["secret"] = secret
         if owner and owner[0] != node_id:
             raise KeyError("task is already served by another node")
@@ -363,6 +373,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
     max_bundle = max_bundle_gb << 30
     tarball = code_tarball(repo_root)
     install_sh = repo_root / "install.sh"
+    confidential_sh = repo_root / "confidential.sh"
     pages = {"/guide": repo_root / "docs" / "PROVIDER_SETUP.md"}
     image_tar = store.state / "sandbox-image.tar"
 
@@ -424,6 +435,14 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if p == "/install.sh" and install_sh.is_file():
                 body = install_sh.read_text().replace("__BMB_HUB__", public_url).encode()
                 return self._send(200, body=body, ctype="text/x-shellscript")
+            if p == "/confidential.sh" and confidential_sh.is_file():
+                body = confidential_sh.read_text().replace("__BMB_HUB__", public_url).encode()
+                return self._send(200, body=body, ctype="text/x-shellscript")
+            if p == "/v1/confidential":
+                # The sealed-node image providers approve (public: its digest is the point).
+                conf = store.setting("confidential")
+                return self._send(200, conf) if conf else self._err(
+                    404, "not_found", "Confidential mode isn't set up on this hub.")
             if p == "/bmb-eval.tar.gz" and tarball:
                 return self._send(200, body=tarball, ctype="application/gzip")
             if p in pages and pages[p].is_file():
@@ -652,6 +671,14 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                     if sid not in held:
                         store.q("UPDATE submissions SET status='queued', node_id=NULL WHERE id=?", (sid,))
                 return self._send(200, {"ok": True, "versions": store.task_versions(node)})
+            if p == "/v1/node/confidential":
+                # Where a sealed node's data lives (non-secret pointers), for launching it.
+                keys = ("PROVIDER_PROJECT_NUMBER", "POOL", "PROVIDER_ID", "KEY", "BUCKET", "digest")
+                if not all(isinstance(body.get(k), str) and len(body[k]) < 256 for k in keys):
+                    return self._err(400, "invalid", "Missing pointers.")
+                store.q("UPDATE nodes SET confidential=? WHERE id=?",
+                        (json.dumps({k: body[k] for k in keys}), node))
+                return self._send(200, {"ok": True})
             if m := re.fullmatch(r"/v1/node/results/([\w-]{1,128})", p):
                 sid = m.group(1)
                 # Accept from the node that serves the task, even if the job was
@@ -757,6 +784,16 @@ def main(argv=None) -> None:
 
     sub.add_parser("status", help="nodes, tasks and queue")
 
+    p = sub.add_parser("confidential-image", help="publish the sealed-node image providers approve")
+    p.add_argument("image", help="registry/path@sha256:<digest>")
+    p.add_argument("--workload-sa", required=True, help="service account the sealed VMs run as")
+    p.add_argument("--hardware", default="NVIDIA H100")
+    p.add_argument("--gpu-preview", action="store_true",
+                   help="ask providers to accept the GPU preview image (H100 in confidential mode)")
+
+    p = sub.add_parser("confidential-env", help="launch settings for a sealed node (KEY=value lines)")
+    p.add_argument("node_id")
+
     p = sub.add_parser("final", help="evaluate a submission's model on the held-out test set")
     p.add_argument("submission_id")
 
@@ -818,6 +855,22 @@ def main(argv=None) -> None:
         else:
             for n, t in store.families().items():
                 print(f"{n}: {', '.join(t)}")
+    elif args.cmd == "confidential-image":
+        if "@sha256:" not in args.image:
+            raise SystemExit("give the image by digest: registry/path@sha256:...")
+        store.set_setting("confidential", {
+            "image": args.image, "digest": args.image.split("@", 1)[1],
+            "workload_sa": args.workload_sa, "hardware": args.hardware,
+            "gpu_preview": args.gpu_preview})
+        print(f"providers now approve {args.image.split('@', 1)[1]}; existing sealed tasks need "
+              "their providers to re-run their connect command")
+    elif args.cmd == "confidential-env":
+        row = store.q("SELECT confidential FROM nodes WHERE id=?", (args.node_id,), one=True)
+        if not row or not row[0]:
+            raise SystemExit(f"node {args.node_id} has no sealed data")
+        for k, v in json.loads(row[0]).items():
+            if k != "digest":
+                print(f"{k}={v}")
     elif args.cmd == "status":
         now = time.time()
         for nid, name, seen, acc in store.q("SELECT id, name, last_seen, accepting FROM nodes"):

@@ -24,12 +24,12 @@ from .config import Config, TaskBinding
 from .contract import Contract, gate_metrics
 from .errors import PREDICTION_REASONS, EvalError
 from .sandbox import Mount, make
-from .sandbox_entry.predict import EXIT_DEPS, EXIT_IMPORT, EXIT_RUNTIME
+from .sandbox_entry.predict import EXIT_DEPS, EXIT_IMPORT, EXIT_MEMORY, EXIT_RUNTIME
 from .sandbox_entry.validate import EXIT_INVALID
 
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
-OOM_EXITS = (137, -9)
+OOM_EXITS = (137, -9, EXIT_MEMORY)
 
 
 def new_run_id() -> str:

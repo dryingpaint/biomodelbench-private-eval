@@ -33,6 +33,7 @@ from pathlib import Path
 EXIT_DEPS = 12
 EXIT_IMPORT = 10
 EXIT_RUNTIME = 11
+EXIT_MEMORY = 13       # MemoryError: hit the memory limit (where it's a process limit)
 
 
 def _seed() -> None:
@@ -109,6 +110,8 @@ def main() -> None:
             raise AttributeError("predict.py defines no predict()")
         if callable(getattr(module, "load_model", None)):
             _call(module.load_model, inputs_dir)
+    except MemoryError:
+        sys.exit(EXIT_MEMORY)
     except BaseException:
         traceback.print_exc()
         sys.exit(EXIT_IMPORT)
@@ -134,6 +137,8 @@ def main() -> None:
             if len(res) != len(batch):
                 raise ValueError(f"predict() returned {len(res)} rows for {len(batch)} inputs")
             parts.append(pd.concat([batch[key], res], axis=1))
+    except MemoryError:
+        sys.exit(EXIT_MEMORY)
     except BaseException:
         traceback.print_exc()
         sys.exit(EXIT_RUNTIME)

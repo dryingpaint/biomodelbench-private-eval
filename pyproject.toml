@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 hub = ["google-cloud-storage>=2.14", "markdown>=3.5"]   # the hub: Cloud Storage, web pages
+seal = ["cryptography>=42"]                                # providers sealing data (confidential mode)
 
 [project.scripts]
 bmb-eval = "bmb_eval.cli:main"

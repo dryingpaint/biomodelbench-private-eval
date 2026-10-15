@@ -8,6 +8,7 @@ gated payload, and only once its release time has passed.
 from __future__ import annotations
 
 import json
+import shutil
 import time
 import urllib.error
 import urllib.request
@@ -131,7 +132,7 @@ class Worker:
         self.runner = Runner(cfg, store=self.store)
         self.queue_dir = cfg.state_dir / "queue"      # one <id>.json per job held locally
         self.queue_dir.mkdir(exist_ok=True)
-        self.cache = BlobCache(cfg.state_dir / "blobs")
+        self.cache = BlobCache(cfg.blob_dir)
         self._last_hello = 0.0
         self._hub_failures = 0
         self._unapproved_alerted = False
@@ -290,10 +291,16 @@ class Worker:
             job = json.loads(path.read_text())
             if not all(self.cache.has(f["sha256"], f["size"]) for f in job["files"]):
                 raise EvalError("infra_error", internal="cached files missing")
-            bundle = self.cache.assemble(job["files"], self.cfg.state_dir / "runs" / sid / "bundle")
-            result = self.runner.evaluate(task, bundle, run_id=sid, submitter=submitter,
-                                          bundle_id=job.get("bundle_id"),
-                                          split=job.get("split", "validation"))
+            # Assembled next to the cache (hard links, same filesystem): the
+            # confidential node keeps its state in memory but models on disk.
+            bundle = self.cache.assemble(job["files"], self.cfg.blob_dir.parent / "bundles" / sid)
+            try:
+                result = self.runner.evaluate(task, bundle, run_id=sid, submitter=submitter,
+                                              bundle_id=job.get("bundle_id"),
+                                              split=job.get("split", "validation"))
+            finally:
+                if not self.cfg.retain_bundles:
+                    shutil.rmtree(bundle, ignore_errors=True)
         except Exception as e:
             audit.record(self.cfg.state_dir, "worker_error", run_id=sid, error=type(e).__name__)
             result = {"run_id": sid, "status": "error", "error": EvalError("infra_error").public()}

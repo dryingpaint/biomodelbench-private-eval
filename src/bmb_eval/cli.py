@@ -740,6 +740,9 @@ def main(argv=None) -> None:
                    help="use the final-evaluation limits (e.g. GPUs) instead of validation's")
     p.set_defaults(fn=cmd_dryrun)
 
+    from .confidential import add_parsers
+    add_parsers(sub)
+
     args = ap.parse_args(argv)
     args.fn(args)
 

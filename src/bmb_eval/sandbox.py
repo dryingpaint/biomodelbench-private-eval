@@ -15,6 +15,13 @@ run log.
 Set sandbox.runtime: runsc in config.yaml to add gVisor's kernel isolation
 on top (docker or podman); it is the recommended production setting.
 
+BwrapSandbox is for the confidential-computing node, which runs as a single
+container (Confidential Space) where container engines can't run. Each stage
+runs under bubblewrap as an unprivileged user: no network, its own minimal
+filesystem (system files read-only plus exactly the mounted files), private
+/tmp, process and file limits. Mounted files are made readable to the
+sandbox user only for the stage that mounts them.
+
 LocalSandbox runs the same entrypoints as plain subprocesses. It is NOT
 isolated and exists for tests and for agents dry-running bundles on
 synthetic data.
@@ -165,11 +172,111 @@ class LocalSandbox:
         return "local-unisolated"
 
 
+SANDBOX_UID = 65534    # "nobody": owns nothing on the node, so it can read only what a stage grants
+
+
+def _bytes(size: str) -> int:
+    n, unit = size.strip().lower()[:-1], size.strip().lower()[-1]
+    return int(float(n) * {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[unit]) if unit in "kmg" else int(size)
+
+
+class BwrapSandbox:
+    """bubblewrap stages for the confidential node (see module docstring)."""
+
+    SYSTEM = ["/usr", "/etc", "/opt/bmb"]       # read-only; /usr holds python and the GPU driver
+
+    def __init__(self, image_id: str = "bwrap"):
+        self._image_id = image_id
+
+    def cmd(self, *, entry: str, mounts: list[Mount], env: dict[str, str], limits: Limits,
+            gpus: int = 0) -> list[str]:
+        cmd = ["bwrap", "--unshare-user", "--unshare-net", "--unshare-ipc", "--unshare-uts",
+               "--unshare-cgroup-try", "--die-with-parent", "--new-session",
+               "--uid", str(SANDBOX_UID), "--gid", str(SANDBOX_UID), "--hostname", "sandbox"]
+        for d in self.SYSTEM:
+            cmd += ["--ro-bind-try", d, d]
+        for link, target in (("/bin", "usr/bin"), ("/sbin", "usr/sbin"), ("/lib", "usr/lib"),
+                             ("/lib64", "usr/lib64")):
+            cmd += ["--symlink", target, link]
+        cmd += ["--ro-bind", "/proc", "/proc", "--dev", "/dev",
+                "--size", str(limits.tmpfs_mb << 20), "--tmpfs", "/tmp",
+                "--size", str(limits.shm_mb << 20), "--tmpfs", "/dev/shm"]
+        if gpus:
+            for d in sorted(Path("/dev").glob("nvidia*")):
+                cmd += ["--dev-bind", str(d), str(d)]
+        for m in mounts:
+            cmd += ["--ro-bind", str(m.host.resolve()), m.container]
+        e = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "TMPDIR": "/tmp",
+             "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": "/opt/bmb",
+             "PIP_NO_INDEX": "1", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+             **({"LD_LIBRARY_PATH": "/usr/local/nvidia/lib64"} if gpus else {}),
+             **{m.env: m.container for m in mounts}, **env}
+        cmd += ["--remount-ro", "/"]       # the sandbox's own root: only /tmp and /dev/shm are writable
+        cmd += ["--clearenv", *[x for k, v in e.items() for x in ("--setenv", k, v)],
+                "--chdir", "/tmp", "python3", "-m", f"bmb_eval.sandbox_entry.{entry}"]
+        return cmd
+
+    def run(self, *, name: str, entry: str, mounts: list[Mount], env: dict[str, str],
+            limits: Limits, timeout_s: int, stdout_cap: int, stdin: bytes = b"",
+            gpus: int = 0) -> Result:
+        import resource
+
+        def limit() -> None:          # in the child, before exec: become the sandbox user
+            with open("/proc/self/oom_score_adj", "w") as f:
+                f.write("1000")       # under memory pressure, the kernel kills this, not the node
+            os.setgroups([])
+            os.setgid(SANDBOX_UID)
+            os.setuid(SANDBOX_UID)
+            resource.setrlimit(resource.RLIMIT_NPROC, (limits.pids, limits.pids))
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
+            if not gpus:              # CUDA reserves huge address ranges; cap memory on CPU only
+                mem = _bytes(limits.memory)
+                resource.setrlimit(resource.RLIMIT_AS, (mem, mem))
+
+        granted = _grant([m.host for m in mounts])
+        try:
+            return _run(self.cmd(entry=entry, mounts=mounts, env=env, limits=limits, gpus=gpus),
+                        timeout_s, stdout_cap, stdin, env={}, on_kill=self.kill_all,
+                        preexec=limit)
+        finally:
+            self.kill_all()           # nothing a stage started outlives it
+            _revoke(granted)
+
+    def kill_all(self) -> int:
+        return int(subprocess.run(["pkill", "-KILL", "-u", str(SANDBOX_UID)],
+                                  capture_output=True).returncode == 0)
+
+    def image_id(self) -> str:
+        return self._image_id
+
+
+def _grant(paths: list[Path]) -> list[tuple[Path, int, int]]:
+    """Make exactly these files (and folders' contents) readable to the sandbox
+    user; returns what to restore. Everything else stays root-only."""
+    out = []
+    for top in paths:
+        for p in [top, *(top.rglob("*") if top.is_dir() else [])]:
+            st = p.lstat()
+            if not p.is_symlink():
+                out.append((p, st.st_uid, st.st_gid))
+                os.chown(p, SANDBOX_UID, SANDBOX_UID)
+    return out
+
+
+def _revoke(granted: list[tuple[Path, int, int]]) -> None:
+    for p, uid, gid in granted:
+        try:
+            os.chown(p, uid, gid)
+        except FileNotFoundError:
+            pass
+
+
 def _run(cmd: list[str], timeout_s: int, stdout_cap: int, stdin: bytes,
-         env: dict | None = None, on_kill=None) -> Result:
+         env: dict | None = None, on_kill=None, preexec=None) -> Result:
     t0 = time.time()
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=env)
+                            stderr=subprocess.PIPE, env=env, preexec_fn=preexec)
     out = bytearray()
     err = bytearray()
     overflow = threading.Event()
@@ -233,7 +340,9 @@ def _run(cmd: list[str], timeout_s: int, stdout_cap: int, stdin: bytes,
     )
 
 
-def make(cfg) -> ContainerSandbox | LocalSandbox:
+def make(cfg) -> ContainerSandbox | BwrapSandbox | LocalSandbox:
     if cfg.backend in ENGINES:
         return ContainerSandbox(cfg.backend, cfg.image, cfg.runtime)
+    if cfg.backend == "bwrap":
+        return BwrapSandbox(cfg.image)
     return LocalSandbox()

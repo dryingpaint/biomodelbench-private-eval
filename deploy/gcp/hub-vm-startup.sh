@@ -57,7 +57,7 @@ After=network-online.target
 [Service]
 User=bmb
 WorkingDirectory=$CODE
-ExecStart=$CODE/.venv/bin/bmb-hub --state $STATE serve --port 8790 --public-url https://$DOMAIN --bucket $BUCKET
+ExecStart=$CODE/.venv/bin/bmb-hub --state $STATE serve --port 8790 --public-url https://$DOMAIN --bucket $BUCKET --launch-sealed
 Restart=always
 RestartSec=5
 

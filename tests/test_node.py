@@ -1078,3 +1078,15 @@ def test_final_refused_until_the_gpus_are_there(hub, node_dir, provider_files, t
     r = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
     assert r["error"]["code"] == "final_hardware_missing"
     assert w.store.count_final("gpu_final") == 0      # doesn't use up a final evaluation
+
+
+def test_sealed_final_limits_apply_only_on_the_sealed_node(tmp_path):
+    raw = yaml.safe_load((_split_task(tmp_path, final_limits="gpus: 2, max_bundle_gb: 150")
+                          / "contract.yaml").read_text())
+    raw["final_limits_sealed"] = {"gpus": 1, "max_bundle_gb": 80}
+    c = Contract.from_dict(raw)
+    assert (c.limits_for("test").gpus, c.limits_for("test").max_bundle_gb) == (2, 150)
+    sealed = c.limits_for("test", sealed=True)
+    assert (sealed.gpus, sealed.max_bundle_gb) == (1, 80)
+    assert c.limits_for("validation", sealed=True).gpus == 0
+    assert Contract.from_dict(c.public(), public=True).limits_for("test", sealed=True).gpus == 1

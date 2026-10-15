@@ -199,10 +199,12 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
     for a in ATTACKS:
         limits = a.limits
         if a.gpu_only:
-            gpus = t.contract.limits_for("test").gpus
+            gpus = t.contract.limits_for("test", sealed=cfg.sealed).gpus
             if not (gpus and gpus_here()):
                 continue
             limits = {**limits, "gpus": gpus}
+        if a.backends and cfg.backend not in a.backends:
+            continue
         if a.container_only and local:
             if verbose:
                 print(f"  SKIP  {a.name:14s} {a.what} (local backend has no isolation)")

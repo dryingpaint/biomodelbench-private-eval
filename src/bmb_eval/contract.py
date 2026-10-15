@@ -38,6 +38,8 @@ evaluations, never in benchmark feedback (needs `split`).
 `{gpus: 2, gpu_memory_gb: 80, max_bundle_gb: 150}`: validation runs stay
 small (CPU), the final runs get the hardware for the largest models. Models
 too big for validation are registered for finals without a validation run.
+`final_limits_sealed` adjusts those for BioModelBench's sealed node (one
+H100), e.g. `{gpus: 1, max_bundle_gb: 80}`; providers' own machines ignore it.
 
 `per` on a metric expands it into one metric per group, e.g.
 `{name: mae, per: [hERG, AMES]}` -> `mae[hERG]`, `mae[AMES]`. Every group adds
@@ -203,6 +205,9 @@ class Contract:
     # Overrides of `limits` for final (test set) evaluations, e.g. GPUs for the
     # largest models; validation runs keep the plain limits. Quotas don't apply.
     final_limits: dict = field(default_factory=dict)
+    # Further overrides for final runs on BioModelBench's sealed (confidential-
+    # computing) node, which has one H100: e.g. {gpus: 1, max_bundle_gb: 80}.
+    final_limits_sealed: dict = field(default_factory=dict)
     data: DataLayout = field(default_factory=DataLayout)
     split: Split | None = None
     path: Path | None = None
@@ -247,6 +252,7 @@ class Contract:
             batch_size=int(raw.get("prediction", {}).get("batch_size", 1024)),
             limits=Limits(**raw.get("limits", {})),
             final_limits=dict(raw.get("final_limits") or {}),
+            final_limits_sealed=dict(raw.get("final_limits_sealed") or {}),
             data=DataLayout(samples=data.get("samples"), include=list(data.get("include") or []),
                             private=list(data.get("private") or [])),
             split=Split(**raw["split"]) if raw.get("split") else None,
@@ -286,6 +292,13 @@ class Contract:
             if bad := set(self.final_limits) & quotas:
                 raise ValueError(f"final_limits can't set {sorted(bad)}: quotas apply to validation")
             Limits(**self.final_limits)   # unknown keys raise here
+        if self.final_limits_sealed:
+            if not self.split:
+                raise ValueError("final_limits_sealed need a held-out test set (split)")
+            quotas = {"submissions_per_day", "submissions_total", "release_after_s"}
+            if bad := set(self.final_limits_sealed) & quotas:
+                raise ValueError(f"final_limits_sealed can't set {sorted(bad)}")
+            Limits(**self.final_limits_sealed)
         if self.headline not in {m.name for m in self.metrics}:
             raise ValueError(f"headline {self.headline!r} is not a declared metric")
         if self.metric(self.headline).final_only:
@@ -324,16 +337,19 @@ class Contract:
         }
         if self.final_limits:
             out["final_limits"] = dict(self.final_limits)
+        if self.final_limits_sealed:
+            out["final_limits_sealed"] = dict(self.final_limits_sealed)
         if self.data.include:
             out["data"] = {"include": self.data.include}
         if self.split:
             out["split"] = dict(self.split.__dict__)
         return out
 
-    def limits_for(self, split: str) -> Limits:
+    def limits_for(self, split: str, sealed: bool = False) -> Limits:
         """Resource limits for a validation or a final (split="test") evaluation."""
-        if split == "test" and self.final_limits:
-            return dataclasses.replace(self.limits, **self.final_limits)
+        if split == "test" and (self.final_limits or (sealed and self.final_limits_sealed)):
+            return dataclasses.replace(self.limits, **{**self.final_limits,
+                                                       **(self.final_limits_sealed if sealed else {})})
         return self.limits
 
     def sha256(self) -> str:

@@ -156,7 +156,8 @@ class HubStore:
                                  ("submissions", "split", "TEXT NOT NULL DEFAULT 'validation'"),
                                  ("submissions", "group_id", "TEXT"),
                                  ("agents", "eval_budget", "INTEGER"),
-                                 ("nodes", "confidential", "TEXT")]:
+                                 ("nodes", "confidential", "TEXT"),
+                                 ("nodes", "status", "TEXT")]:
             if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         self.db.commit()
@@ -374,6 +375,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
     tarball = code_tarball(repo_root)
     install_sh = repo_root / "install.sh"
     confidential_sh = repo_root / "confidential.sh"
+    verify_sh = repo_root / "deploy" / "confidential" / "verify-image.sh"
     pages = {"/guide": repo_root / "docs" / "PROVIDER_SETUP.md"}
     image_tar = store.state / "sandbox-image.tar"
 
@@ -437,6 +439,13 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._send(200, body=body, ctype="text/x-shellscript")
             if p == "/confidential.sh" and confidential_sh.is_file():
                 body = confidential_sh.read_text().replace("__BMB_HUB__", public_url).encode()
+                return self._send(200, body=body, ctype="text/x-shellscript")
+            if p == "/v1/confidential/provenance":
+                prov = store.setting("confidential_provenance")
+                return self._send(200, prov) if prov else self._err(404, "not_found", "No provenance.")
+            if p == "/verify-image.sh" and verify_sh.is_file():
+                body = verify_sh.read_text().replace(
+                    '${BMB_HUB:-https://eval.biomodelbench.org}', f"${{BMB_HUB:-{public_url}}}").encode()
                 return self._send(200, body=body, ctype="text/x-shellscript")
             if p == "/v1/confidential":
                 # The sealed-node image providers approve (public: its digest is the point).
@@ -664,6 +673,9 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                                 (json.dumps(contract), task))
                 store.q("UPDATE nodes SET accepting=? WHERE id=?",
                         (1 if body.get("accepting") else 0, node))
+                st = body.get("status")
+                if isinstance(st, dict) and len(json.dumps(st)) < 8192:
+                    store.q("UPDATE nodes SET status=? WHERE id=?", (json.dumps(st), node))
                 # Jobs this node claimed but no longer holds (crash before saving) go back.
                 held = set(body.get("held") or [])
                 for (sid,) in store.q("SELECT id FROM submissions WHERE node_id=? AND status='assigned'",
@@ -757,6 +769,8 @@ def main(argv=None) -> None:
     p.add_argument("--public-url", required=True, help="https URL providers and agents use")
     p.add_argument("--bucket", help="Cloud Storage bucket for model files (default: hub disk)")
     p.add_argument("--max-bundle-gb", type=int, default=160)
+    p.add_argument("--launch-sealed", action="store_true",
+                   help="start sealed nodes' VMs when they have queued work (on GCP)")
 
     p = sub.add_parser("new-task", help="write a contract + scorer from a column list")
     p.add_argument("task")
@@ -790,6 +804,11 @@ def main(argv=None) -> None:
     p.add_argument("--hardware", default="NVIDIA H100")
     p.add_argument("--gpu-preview", action="store_true",
                    help="ask providers to accept the GPU preview image (H100 in confidential mode)")
+    p.add_argument("--source", help="repo@commit the image was built from (deploy/confidential/build.sh)")
+    p.add_argument("--provenance", help="Cloud Build SLSA provenance JSON for the image")
+
+    p = sub.add_parser("confidential-launch", help="start a sealed node's VM now (normally automatic)")
+    p.add_argument("node_id")
 
     p = sub.add_parser("confidential-env", help="launch settings for a sealed node (KEY=value lines)")
     p.add_argument("node_id")
@@ -819,6 +838,9 @@ def main(argv=None) -> None:
         handler = make_handler(store, make_blobs(state, url, args.bucket), url, _repo_root(),
                                args.max_bundle_gb)
         httpd = ThreadingHTTPServer((args.host, args.port), handler)
+        if args.launch_sealed:
+            from .sealed_launcher import loop
+            loop(store)
         print(f"bmb-hub on http://{args.host}:{args.port} (public: {url}; "
               f"model files: {'gs://' + args.bucket if args.bucket else 'hub disk'})")
         try:
@@ -861,9 +883,19 @@ def main(argv=None) -> None:
         store.set_setting("confidential", {
             "image": args.image, "digest": args.image.split("@", 1)[1],
             "workload_sa": args.workload_sa, "hardware": args.hardware,
-            "gpu_preview": args.gpu_preview})
+            "gpu_preview": args.gpu_preview, "source": args.source})
+        if args.provenance:
+            store.set_setting("confidential_provenance", json.loads(Path(args.provenance).read_text()))
         print(f"providers now approve {args.image.split('@', 1)[1]}; existing sealed tasks need "
               "their providers to re-run their connect command")
+    elif args.cmd == "confidential-launch":
+        from .sealed_launcher import launch
+        row = store.q("SELECT confidential FROM nodes WHERE id=?", (args.node_id,), one=True)
+        if not row or not row[0]:
+            raise SystemExit(f"node {args.node_id} has no sealed data")
+        res = launch(args.node_id, json.loads(row[0]), store.setting("confidential"))
+        store.set_setting(f"sealed_launch:{args.node_id}", {"at": time.time(), **res})
+        print(json.dumps(res, indent=2))
     elif args.cmd == "confidential-env":
         row = store.q("SELECT confidential FROM nodes WHERE id=?", (args.node_id,), one=True)
         if not row or not row[0]:
@@ -873,10 +905,13 @@ def main(argv=None) -> None:
                 print(f"{k}={v}")
     elif args.cmd == "status":
         now = time.time()
-        for nid, name, seen, acc in store.q("SELECT id, name, last_seen, accepting FROM nodes"):
+        for nid, name, seen, acc, st in store.q("SELECT id, name, last_seen, accepting, status FROM nodes"):
             age = f"{int(now - seen)}s ago" if seen else "never"
             tasks = [r[0] for r in store.q("SELECT task FROM node_tasks WHERE node_id=?", (nid,))]
             print(f"node {nid} ({name}) last seen {age}, {'accepting' if acc else 'NOT accepting'}: {tasks}")
+            for step, kv in sorted((json.loads(st) if st else {}).items(), key=lambda x: x[1].get("at", 0)):
+                fields = ", ".join(f"{k}={v}" for k, v in kv.items() if k not in ("step", "at"))
+                print(f"    {time.strftime('%m-%d %H:%M', time.gmtime(kv.get('at', 0)))} {step}: {fields}")
         for task, split, status, n in store.q(
                 "SELECT task, split, status, COUNT(*) FROM submissions GROUP BY 1, 2, 3"):
             print(f"task {task}: {split} {status} {n}")

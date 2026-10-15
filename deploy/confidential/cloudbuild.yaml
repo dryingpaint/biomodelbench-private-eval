@@ -1,9 +1,12 @@
-# gcloud builds submit --project biomodelbench --region us-central1 \
-#   --config deploy/confidential/cloudbuild.yaml --substitutions _TAG=v1 .
+# Built from a public git commit by deploy/confidential/build.sh. Cloud Build
+# signs SLSA provenance (source repo + commit -> image digest) that providers
+# can check with deploy/confidential/verify-image.sh.
 steps:
   - name: gcr.io/cloud-builders/docker
     args: [build, -f, deploy/confidential/Dockerfile, -t,
            "us-central1-docker.pkg.dev/$PROJECT_ID/bmb/sealed-node:${_TAG}", .]
 images: ["us-central1-docker.pkg.dev/$PROJECT_ID/bmb/sealed-node:${_TAG}"]
-options: {diskSizeGb: 100}
+options:
+  diskSizeGb: 100
+  requestedVerifyOption: VERIFIED
 timeout: 3600s

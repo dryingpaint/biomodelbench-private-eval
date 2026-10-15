@@ -267,7 +267,12 @@ def cmd_connect_confidential(args) -> None:
     print(f"  Runs on:             BioModelBench's sealed machine (Google Confidential Space, "
           f"{conf.get('hardware', 'NVIDIA H100')}). Your data is encrypted with your own key in\n"
           f"                       your own Google Cloud project, and only this exact software can "
-          f"open it:\n                       {conf['digest']}\n")
+          f"open it:\n                       {conf['digest']}")
+    if conf.get("source"):
+        repo, _, commit = conf["source"].rpartition("@")
+        print(f"                       built by Google Cloud Build from {repo}/tree/{commit}\n"
+              f"                       (check it: curl -fsSL {hub_url}/verify-image.sh | sh)")
+    print()
     if not args.yes and _ask("Approve, encrypt and upload? [y/N] ") not in ("y", "yes"):
         raise SystemExit("Nothing was uploaded or shared. Run the same command again whenever you're ready.")
 
@@ -335,9 +340,25 @@ def _attested_credentials(env: dict):
     }).with_scopes(["https://www.googleapis.com/auth/cloud-platform"])
 
 
+STATUS: dict = {}
+
+
 def say(**kv) -> None:
-    """The only things the node logs: fixed status fields, never data."""
+    """The node's only output: fixed status fields, never data. Printed (visible
+    only on the debug image, which can't open provider data) and kept in STATUS,
+    which the node reports to the hub."""
+    kv["at"] = round(time.time())
+    STATUS[kv.get("step", "note")] = kv
     print("BMB " + json.dumps(kv), flush=True)
+
+
+def _report(cfg) -> None:
+    """Send STATUS to the hub now (e.g. before refusing work and exiting)."""
+    from .node import HubAPI, HubError
+    try:
+        HubAPI(cfg.hub["url"], cfg.hub["secret"]).hello({}, False, [], STATUS)
+    except (HubError, KeyError):
+        pass
 
 
 class SealedState:
@@ -529,12 +550,15 @@ def cmd_confidential_node(args) -> None:
                 print(f"BMB-DIAG {log.parent.name}: " + " | ".join(tail)[-1500:], flush=True)
         if failed:
             say(step="refused", reason="security self-test failed; not taking work")
+            if not selftest_only:
+                _report(cfg)
             sys.exit(3)
     if selftest_only:
         say(step="exit", reason="self-test only (no provider configured)")
         return
 
     worker = Worker(cfg)
+    worker.status = STATUS
     n = worker.store.requeue_running()
     say(step="running", requeued=n)
     idle_since = time.time()

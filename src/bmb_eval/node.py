@@ -83,9 +83,11 @@ class HubAPI:
         return self._req("POST", f"/v1/enroll/{code}", {"name": name})
 
     # work
-    def hello(self, tasks: dict, accepting: bool, held: list[str]) -> dict:
-        return self._req("POST", "/v1/node/hello",
-                         {"tasks": tasks, "accepting": accepting, "held": held}) or {}
+    def hello(self, tasks: dict, accepting: bool, held: list[str], status: dict | None = None) -> dict:
+        body = {"tasks": tasks, "accepting": accepting, "held": held}
+        if status is not None:
+            body["status"] = status      # fixed fields only (sealed node; it has no logs)
+        return self._req("POST", "/v1/node/hello", body) or {}
 
     def next(self) -> dict | None:
         return self._req("GET", "/v1/node/next")
@@ -137,6 +139,7 @@ class Worker:
         self._hub_failures = 0
         self._unapproved_alerted = False
         self._accepting = (0.0, False)
+        self.status: dict | None = None   # set by the sealed node: reported to the hub
 
     # ------------------------------------------------------------- gates
 
@@ -165,7 +168,7 @@ class Worker:
             # hub hasn't received; otherwise the hub would re-queue them.
             held = sorted({p.stem for p in self.queue_dir.glob("*.json")} | set(self.store.unposted()))
             reply = self.api.hello({t: b.contract.public() for t, b in self.cfg.tasks.items()},
-                                   accepting, held)
+                                   accepting, held, self.status)
             self._note_updates(reply.get("versions") or {})
             self._last_hello = time.time()
         for sid, payload in self.store.released_unposted():
@@ -239,7 +242,7 @@ class Worker:
             return
         t = self.cfg.tasks.get(task)
         split = job.get("split", "validation")
-        lim = t.contract.limits_for(split) if t else None
+        lim = t.contract.limits_for(split, sealed=self.cfg.sealed) if t else None
         refusal, files = None, []
         if t is None or split not in ("validation", "test"):
             refusal = EvalError("task_unknown")

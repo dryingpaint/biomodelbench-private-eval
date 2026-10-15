@@ -39,6 +39,21 @@ gcloud iam service-accounts add-iam-policy-binding "$SA" --project "$PROJECT" \
   gcloud projects add-iam-policy-binding "$PROJECT" --condition None \
     --member "serviceAccount:$SA" --role roles/iam.serviceAccountTokenCreator >/dev/null
 
+say "Sealed nodes (confidential computing)"
+# The account sealed VMs run as (providers' attestation rules name it), and the
+# hub's right to start those VMs when jobs are queued (bmb-hub serve --launch-sealed).
+WL="bmb-cs-workload@$PROJECT.iam.gserviceaccount.com"
+exists gcloud iam service-accounts describe "$WL" --project "$PROJECT" ||
+  gcloud iam service-accounts create bmb-cs-workload --display-name "BMB sealed node" --project "$PROJECT"
+for role in roles/confidentialcomputing.workloadUser roles/logging.logWriter roles/artifactregistry.reader; do
+  gcloud projects add-iam-policy-binding "$PROJECT" --condition None \
+    --member "serviceAccount:$WL" --role "$role" >/dev/null
+done
+gcloud projects add-iam-policy-binding "$PROJECT" --condition None \
+  --member "serviceAccount:$SA" --role roles/compute.instanceAdmin.v1 >/dev/null
+gcloud iam service-accounts add-iam-policy-binding "$WL" --project "$PROJECT" \
+  --member "serviceAccount:$SA" --role roles/iam.serviceAccountUser >/dev/null
+
 say "Bucket gs://$BUCKET for model files"
 exists gcloud storage buckets describe "gs://$BUCKET" ||
   gcloud storage buckets create "gs://$BUCKET" --project "$PROJECT" --location "$REGION" \

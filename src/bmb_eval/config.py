@@ -95,6 +95,11 @@ class Config:
         cfg.state_dir.mkdir(parents=True, exist_ok=True)
         return cfg
 
+    @property
+    def sealed(self) -> bool:
+        """The confidential-computing node (Confidential Space, one H100)."""
+        return self.backend == "bwrap"
+
     def save_raw(self) -> None:
         save_yaml(self.path, self.raw)
 

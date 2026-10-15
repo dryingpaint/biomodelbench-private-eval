@@ -174,6 +174,37 @@ class LocalSandbox:
 
 SANDBOX_UID = 65534    # "nobody": owns nothing on the node, so it can read only what a stage grants
 
+# Kernel interfaces a model never needs and container escapes often use. The
+# sealed node's sandbox shares the kernel (bubblewrap; gVisor can't reach the GPU
+# inside Confidential Space), so these fail with EPERM there. clone3 gets ENOSYS
+# so libc falls back to clone, whose CLONE_NEWUSER flag is refused.
+BLOCKED_SYSCALLS = (
+    "unshare", "setns", "mount", "umount2", "pivot_root", "chroot", "move_mount", "open_tree",
+    "fsopen", "fsconfig", "fsmount", "fspick", "mount_setattr", "ptrace", "process_vm_readv",
+    "process_vm_writev", "kcmp", "bpf", "perf_event_open", "userfaultfd", "io_uring_setup",
+    "io_uring_enter", "io_uring_register", "keyctl", "add_key", "request_key", "kexec_load",
+    "kexec_file_load", "init_module", "finit_module", "delete_module", "reboot", "swapon",
+    "swapoff", "acct", "quotactl", "open_by_handle_at", "name_to_handle_at", "syslog",
+    "fanotify_init", "lookup_dcookie", "vhangup", "iopl", "ioperm")
+CLONE_NEWUSER = 0x10000000
+
+
+def seccomp_filter(path: Path) -> Path:
+    """Write the sandbox's seccomp BPF program (default allow, BLOCKED_SYSCALLS denied)."""
+    import errno
+    import pyseccomp as sc
+    f = sc.SyscallFilter(sc.ALLOW)
+    for name in BLOCKED_SYSCALLS:
+        try:
+            f.add_rule(sc.ERRNO(errno.EPERM), name)
+        except Exception:
+            pass                       # not a syscall on this architecture
+    f.add_rule(sc.ERRNO(errno.ENOSYS), "clone3")
+    f.add_rule(sc.ERRNO(errno.EPERM), "clone", sc.Arg(0, sc.MASKED_EQ, CLONE_NEWUSER, CLONE_NEWUSER))
+    with open(path, "wb") as out:
+        f.export_bpf(out)
+    return path
+
 
 def _bytes(size: str) -> int:
     n, unit = size.strip().lower()[:-1], size.strip().lower()[-1]
@@ -185,11 +216,12 @@ class BwrapSandbox:
 
     SYSTEM = ["/usr", "/etc", "/opt/bmb"]       # read-only; /usr holds python and the GPU driver
 
-    def __init__(self, image_id: str = "bwrap"):
+    def __init__(self, image_id: str = "bwrap", seccomp: Path | None = None):
         self._image_id = image_id
+        self.seccomp = seccomp          # BPF file from seccomp_filter(); None = no filter
 
     def cmd(self, *, entry: str, mounts: list[Mount], env: dict[str, str], limits: Limits,
-            gpus: int = 0) -> list[str]:
+            gpus: int = 0, seccomp_fd: int | None = None) -> list[str]:
         cmd = ["bwrap", "--unshare-user", "--unshare-net", "--unshare-ipc", "--unshare-uts",
                "--unshare-cgroup-try", "--die-with-parent", "--new-session",
                "--uid", str(SANDBOX_UID), "--gid", str(SANDBOX_UID), "--hostname", "sandbox"]
@@ -215,6 +247,8 @@ class BwrapSandbox:
              **({"LD_LIBRARY_PATH": "/usr/local/nvidia/lib64"} if gpus else {}),
              **{m.env: m.container for m in mounts}, **env}
         cmd += ["--remount-ro", "/"]       # the sandbox's own root: only /tmp and /dev/shm are writable
+        if seccomp_fd is not None:
+            cmd += ["--seccomp", str(seccomp_fd)]   # the BPF program, an fd passed by run()
         cmd += ["--clearenv", *[x for k, v in e.items() for x in ("--setenv", k, v)],
                 "--chdir", "/tmp", "python3", "-m", f"bmb_eval.sandbox_entry.{entry}"]
         return cmd
@@ -240,13 +274,18 @@ class BwrapSandbox:
         # GPU stages: the device files too (root-only inside the container otherwise).
         granted = _grant([m.host for m in mounts]
                          + (sorted(Path("/dev").glob("nvidia*")) if gpus else []))
+        bpf = open(self.seccomp, "rb") if self.seccomp else None
+        fd = bpf.fileno() if bpf else None
         try:
-            return _run(self.cmd(entry=entry, mounts=mounts, env=env, limits=limits, gpus=gpus),
+            return _run(self.cmd(entry=entry, mounts=mounts, env=env, limits=limits, gpus=gpus,
+                                 seccomp_fd=fd),
                         timeout_s, stdout_cap, stdin, env={}, on_kill=self.kill_all,
-                        preexec=limit)
+                        preexec=limit, pass_fds=(fd,) if bpf else ())
         finally:
             self.kill_all()           # nothing a stage started outlives it
             _revoke(granted)
+            if bpf:
+                bpf.close()
 
     def kill_all(self) -> int:
         return int(subprocess.run(["pkill", "-KILL", "-u", str(SANDBOX_UID)],
@@ -278,10 +317,10 @@ def _revoke(granted: list[tuple[Path, int, int]]) -> None:
 
 
 def _run(cmd: list[str], timeout_s: int, stdout_cap: int, stdin: bytes,
-         env: dict | None = None, on_kill=None, preexec=None) -> Result:
+         env: dict | None = None, on_kill=None, preexec=None, pass_fds=()) -> Result:
     t0 = time.time()
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=env, preexec_fn=preexec)
+                            stderr=subprocess.PIPE, env=env, preexec_fn=preexec, pass_fds=pass_fds)
     out = bytearray()
     err = bytearray()
     overflow = threading.Event()
@@ -349,5 +388,8 @@ def make(cfg) -> ContainerSandbox | BwrapSandbox | LocalSandbox:
     if cfg.backend in ENGINES:
         return ContainerSandbox(cfg.backend, cfg.image, cfg.runtime)
     if cfg.backend == "bwrap":
-        return BwrapSandbox(cfg.image)
+        bpf = cfg.state_dir / "sandbox.seccomp.bpf"
+        if not bpf.exists():
+            seccomp_filter(bpf)
+        return BwrapSandbox(cfg.image, seccomp=bpf)
     return LocalSandbox()

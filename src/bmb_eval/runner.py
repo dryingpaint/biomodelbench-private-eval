@@ -67,7 +67,7 @@ class Runner:
                     raise EvalError("no_test_split")
                 t = dataclasses.replace(t, inputs=t.test_inputs, inputs_dir=t.test_inputs_dir)
             c = t.contract
-            c = dataclasses.replace(c, limits=c.limits_for(split))
+            c = dataclasses.replace(c, limits=c.limits_for(split, sealed=self.cfg.sealed))
             if limits_override:
                 c = dataclasses.replace(c, limits=dataclasses.replace(c.limits, **limits_override))
             metrics = self._pipeline(t, c, bundle, run_id, run_dir, internal, split)

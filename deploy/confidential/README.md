@@ -1,72 +1,60 @@
-# Confidential computing (prototype)
+# Sealed node (confidential computing)
 
-BioModelBench runs the evaluation node on its own hardware, inside a
-Confidential Space VM. The provider's data stays encrypted with the
-provider's own key, which Google releases only to a VM that proves (hardware
-attestation) it is running the exact image the provider approved, in
-production mode. We own the machine but can't read the data.
+The provider keeps the key, and BioModelBench runs the machine. The
+provider's data is encrypted with their own Cloud KMS key in their own
+bucket. Google releases that key only to a Confidential Space VM that proves,
+through hardware attestation, that it runs the exact image the provider
+approved, in production mode (debugging off). We own the VM but can't read
+its memory or log into it.
 
 ```
 provider project                         biomodelbench
-  encrypted CSV  ◄──── read ──────────  Confidential Space VM (sealed memory)
-  KMS key        ◄──── attested ──────    image sha256:X decrypts in memory,
-  rule: digest X,      token              runs models, sends only scores
-  debug off
+  encrypted task + data  ◄── read ─────  Confidential Space VM, 1x H100 (TDX, GPU CC mode)
+  KMS key  ◄── attested token ─────────    sealed-node image sha256:X
+  rule: digest X, debug off, our SA        unseals into tmpfs, sandboxes every stage,
+  quotas/finals, encrypted  ◄── write ──    posts only gated scores to the hub
 ```
 
-- `provider-setup.sh`: the provider runs it in their project. It creates the
-  key and bucket, encrypts on their machine, and trusts only `--digest`.
-  Re-run with a new digest to approve an updated image.
-- `launch.sh`: we run it. It starts the image as a Confidential Space workload
-  (`cpu` = AMD SEV, `cpu-tdx` = Intel TDX, `h100` = TDX + H100, preview;
-  `SPOT=1` for Spot).
-- `probe/`: test workload. It decrypts and logs only row count and hash, then
-  checks which sandboxes work inside.
+## Pieces
 
-## Results (2026-10-15)
-
-| Test | Result |
+| | |
 |---|---|
-| Approved image, production mode (AMD SEV and Intel TDX CPUs) | Decrypted; 5,000 rows, hash identical to the provider's file |
-| Approved image on an **H100** Confidential VM (Spot `a3-highgpu-1g`, preview image, `--allow-gpu-preview`) | Decrypted (same hash); `nvidia_gpu.cc_mode: ON` attested; `nvidia-smi conf-compute`: CC ON, ready |
-| Unapproved image digest | Refused: "rejected by the attribute condition" |
-| Approved digest on the debug image (operator can log in) | Refused (`dbgstat: enabled`) |
-| GPU preview image without the provider's opt-in | Refused (`EXPERIMENTAL`, not `STABLE`) |
-| Re-approval (provider re-runs with the new digest) | Decrypted |
-| Sandboxes inside the container: gVisor (systrap, ptrace), bubblewrap, user+net namespaces | All run with no network |
-| GPU inside the gVisor sandbox (`runsc --nvproxy do`) | **Fails**: can't reach the driver |
+| Provider command | `curl -fsSL https://eval.biomodelbench.org/confidential.sh \| sh -s -- CODE --data FILE --project PROJECT` (`bmb-eval connect-confidential`). It checks and splits the data locally, shows the approval screen (with the image digest and its source commit), creates the key, bucket and attestation rule, and uploads only ciphertext. |
+| Sealed node | `src/bmb_eval/confidential.py` (`confidential-node`) |
+| Sandbox | `BwrapSandbox` in `src/bmb_eval/sandbox.py`: bubblewrap as an unprivileged user, no network, minimal filesystem, read-only root, plus a seccomp filter blocking escape-prone kernel interfaces (user namespaces, mount, ptrace, bpf, io_uring, userfaultfd, keyrings, modules). gVisor isn't used here because it can't reach the GPU inside Confidential Space. |
+| Image | `Dockerfile`, built from a public commit by `build.sh` with Cloud Build's signed SLSA provenance. Base image pinned by digest, Debian by snapshot, Python by hash (`requirements.lock`). |
+| Provider check | `curl -fsSL https://eval.biomodelbench.org/verify-image.sh \| sh` (slsa-verifier: digest ← commit) |
+| Start on demand | The hub (`bmb-hub serve --launch-sealed`, `src/bmb_eval/sealed_launcher.py`) creates the node's VM when its tasks have queued jobs and it's offline. It tries on-demand, then Spot, across us-central1-a, us-east5-a and europe-west4-c. The node exits when idle (`BMB_IDLE_EXIT_S`), and the VM stops. Manual start: `bmb-hub confidential-launch <node>`. |
+| Status | No logs in production (`log_redirect=debugonly`). The node reports fixed status fields to the hub (`bmb-hub status`). |
+| Final limits | Tasks set `final_limits_sealed` (e.g. `gpus: 1, max_bundle_gb: 80`) for this node; providers' own machines keep `final_limits`. |
+| Self-test | `ENV_FILE=none ./launch.sh h100` runs every sandbox attack on synthetic data, on the debug image with logs. |
 
+## Operator
 
-## End to end (2026-10-15): the real sealed node, H100
+```bash
+deploy/confidential/build.sh <commit>                  # build + provenance (commit must be pushed)
+bmb-hub confidential-image <image@digest> --workload-sa bmb-cs-workload@biomodelbench.iam.gserviceaccount.com \
+    --gpu-preview --source <repo@commit> --provenance provenance.json
+# providers re-run their connect command to approve the new digest
+bmb-hub status                                         # node status, launches
+```
 
-Image `sealed-node@sha256:1e5976d2…` (`src/bmb_eval/confidential.py`,
-`deploy/confidential/Dockerfile`), simulated provider project `bmb-provider-sim-1014`.
+## Limits
 
-| Step | Result |
-|---|---|
-| Synthetic self-test on sealed H100 (no provider) | 13/13 attacks contained, including GPU access from inside the sandbox |
-| Provider: `curl …/confidential.sh \| sh -s -- CODE --data file.csv --project P` | Data checked and split locally (492 / 508). Approval screen shows the image digest. Key, bucket and attestation rule are created. Only ciphertext is uploaded. |
-| Sealed node boots | Unsealed into tmpfs. Self-test on the provider's task: 0 failures. Serves jobs. |
-| Agent CPU model, validation | spearman_exact 0.952, concordance 0.921 (final-only RMSE/MAE withheld) |
-| Agent GPU model, registered as final candidate, final run | spearman_exact 0.938, RMSE 0.413, MAE 0.332. The model refuses to run without CUDA, so the GPU worked inside the sandbox. |
-| Idle | The node exits after `BMB_IDLE_EXIT_S`; the VM stops |
+- **GPU Confidential Space is a Google preview** (`EXPERIMENTAL` image).
+  Providers opt in, and their rule then also requires the H100 to attest
+  confidential mode.
+- **One H100 per sealed node.** Finals go up to ~70B parameters at 8-bit.
+- **Quota.** Google denied on-demand H100 quota for the new project. Spot
+  (us-central1) is approved, and more requests are pending. Spot VMs can be
+  reclaimed; jobs re-queue and the hub restarts the node.
+- **Trust.** Providers trust Intel TDX, NVIDIA H100 CC, Google's Confidential
+  Space image, and the code at the commit they verify.
 
-Fixes found on real hardware:
-- Confidential Space's GPU driver is 535 (CUDA 12.2), so the image uses PyTorch's CUDA 12.1 build.
-- Memory limits are per-process data limits, not cgroups, so math-library thread pools are sized to the CPU limit.
-- A MemoryError anywhere maps to the resource-limit error.
-- The read-only GPU driver mount is allowed in the sandbox's view.
-
-**Not done yet (before production):**
-- **GPU inside the sandbox.** Try gVisor nvproxy through `runsc run` with an
-  OCI spec, and check its driver-version support. Otherwise fall back to
-  bubblewrap binding only `/dev/nvidia*`, the bundle and the inputs.
-- **Filesystem isolation.** A quick `unshare` sandbox shares the container's
-  files. The real sandbox must mount only the bundle and inputs (an OCI spec,
-  or bubblewrap without `--ro-bind / /`).
-- **Running the node itself here.** Pull jobs from the hub, score, and post
-  gated results.
-- **Logs.** The probe uses `log_redirect=always`. The production image should
-  not, and the provider's rule should require it.
-- **Quota.** On-demand H100 quota was denied. Spot H100 (1) and the global GPU
-  quota (1) were granted.
+Test history: the probe (`probe/`) and an end-to-end run on a sealed H100
+with a simulated provider (`bmb-provider-sim-1014`).
+- Key release was refused for an unapproved digest, the debug image, and a
+  GPU preview image without the provider's opt-in.
+- 13/13 sandbox attacks were contained.
+- Validation and a GPU final were scored without the data ever leaving
+  sealed memory.

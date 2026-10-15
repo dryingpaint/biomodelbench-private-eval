@@ -53,6 +53,7 @@ class Attack:
     container_only: bool = False       # meaningless (or unsafe) on the local backend
     limits: dict = field(default_factory=dict)
     gpu_only: bool = False             # run only for tasks that use GPUs
+    backends: tuple = ()               # run only on these sandbox backends (empty = all)
 
 
 ATTACKS = [
@@ -212,6 +213,31 @@ ATTACKS = [
             torch.ones(1, device="cuda").sum().item()
         predict = baseline
         '''), "ok", container_only=True, gpu_only=True),
+
+    Attack("kernel_surface", "reach kernel interfaces used in escapes (user namespaces, mount, "
+           "ptrace, bpf, userfaultfd, io_uring, keyrings, modules)", textwrap.dedent('''\
+        import ctypes, errno, platform
+        # x86_64 syscall numbers
+        CALLS = {"unshare(NEWUSER)": (272, 0x10000000), "mount": (165, 0), "ptrace": (101, 0),
+                 "bpf": (321, 0), "userfaultfd": (323, 0), "perf_event_open": (298, 0),
+                 "io_uring_setup": (425, 0), "keyctl": (250, 0), "add_key": (248, 0),
+                 "init_module": (175, 0), "kexec_load": (246, 0)}
+        BLOCKED = {errno.EPERM, errno.EACCES, errno.ENOSYS}
+
+        def load_model():
+            if platform.machine() != "x86_64":
+                return
+            libc = ctypes.CDLL(None, use_errno=True)
+            reachable = []
+            for name, (nr, arg) in CALLS.items():
+                ctypes.set_errno(0)
+                r = libc.syscall(nr, ctypes.c_long(arg), 0, 0, 0, 0)
+                if r >= 0 or ctypes.get_errno() not in BLOCKED:
+                    reachable.append(name)
+            if reachable:
+                raise RuntimeError(f"ESCAPED: reachable {reachable}")
+        predict = baseline
+        '''), "ok", container_only=True, backends=("bwrap",)),
 ]
 
 

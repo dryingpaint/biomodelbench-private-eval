@@ -2,8 +2,14 @@
 
 A sealed node (Confidential Space VM, one H100) exits when idle and its VM
 stops. When jobs are queued for a sealed node's tasks and the node hasn't
-checked in recently, the hub creates its VM again, trying each place in
-`PLACES` in order (zone x on-demand/Spot) until one has capacity and quota.
+checked in recently, the hub creates its VM again.
+
+Confidential a3-highgpu-1g VMs come only as Flex-start or Spot (no on-demand).
+Flex-start comes first: the request waits for capacity (up to
+`FLEX_WAIT_S`), and once running the VM isn't preempted (up to
+`MAX_RUN_S`). Spot is the fallback; if it's reclaimed mid-job, the hub hands
+the job out again and the node, restarted, drops what it lost. Attempts
+rotate through `PLACES`, starting after the last place tried.
 The VM gets the provider's (non-secret) pointers and the approved image; it
 has no logs (production Confidential Space image).
 
@@ -19,12 +25,16 @@ import time
 import urllib.error
 import urllib.request
 
-PLACES = [  # where a3-highgpu-1g Confidential VMs exist; on-demand first, then Spot
-    ("us-central1-a", "STANDARD"), ("us-east5-a", "STANDARD"), ("europe-west4-c", "STANDARD"),
+PLACES = [  # where a3-highgpu-1g Confidential VMs exist: Flex-start first, then Spot
+    ("us-central1-a", "FLEX_START"), ("us-east5-a", "FLEX_START"), ("europe-west4-c", "FLEX_START"),
     ("us-central1-a", "SPOT"), ("us-east5-a", "SPOT"), ("europe-west4-c", "SPOT"),
 ]
 OFFLINE_S = 180          # node silent this long = not running
 COOLDOWN_S = 20 * 60     # after a launch, give the VM this long to boot and check in
+RETRY_S = 5 * 60         # after a failed launch (no capacity anywhere), try again this soon
+FLEX_WAIT_S = 20 * 60    # how long a Flex-start request waits for capacity
+MAX_RUN_S = 3 * 24 * 3600   # Flex-start VMs end after this (the node normally exits when idle)
+LIVE = ("PROVISIONING", "STAGING", "RUNNING", "PENDING", "REPAIRING")
 TMPFS_BYTES = 32 << 30
 API = "https://compute.googleapis.com/compute/v1"
 
@@ -73,9 +83,12 @@ def instance_body(name: str, zone: str, model: str, project: str, conf: dict, po
             "tee-install-gpu-driver": "true",
             "tee-mount": f"type=tmpfs,source=tmpfs,destination=/run/tmp,size={TMPFS_BYTES}",
             **{f"tee-env-{k}": v for k, v in pointers.items() if k != "digest"}}
-    sched = {"onHostMaintenance": "TERMINATE", "provisioningModel": model, "automaticRestart": False}
-    if model == "SPOT":
-        sched["instanceTerminationAction"] = "DELETE"
+    sched = {"onHostMaintenance": "TERMINATE", "provisioningModel": model, "automaticRestart": False,
+             "instanceTerminationAction": "DELETE"}
+    extra = {}
+    if model == "FLEX_START":
+        sched["maxRunDuration"] = {"seconds": str(MAX_RUN_S)}
+        extra["params"] = {"requestValidForDuration": {"seconds": str(FLEX_WAIT_S)}}
     family = "confidential-space-preview-cgpu" if conf.get("gpu_preview") else "confidential-space"
     return {
         "name": name, "machineType": f"zones/{zone}/machineTypes/a3-highgpu-1g",
@@ -91,23 +104,34 @@ def instance_body(name: str, zone: str, model: str, project: str, conf: dict, po
                              "scopes": ["https://www.googleapis.com/auth/cloud-platform"]}],
         "metadata": {"items": [{"key": k, "value": v} for k, v in meta.items()]},
         "labels": {"bmb-role": "sealed-node"},
+        **extra,
     }
 
 
-def launch(node_id: str, pointers: dict, conf: dict, project: str | None = None) -> dict:
-    """(Re)create a sealed node's VM wherever there's capacity. Returns {zone, model} or {error}."""
+def launch(node_id: str, pointers: dict, conf: dict, project: str | None = None,
+           start_at: int = 0) -> dict:
+    """(Re)create a sealed node's VM wherever there's capacity, trying PLACES from
+    `start_at`. Returns {zone, model, place} or {error}, or {state: "waiting"} if
+    a VM (or a Flex-start request still waiting for capacity) already exists."""
     project = project or _project()
     name = instance_name(node_id)
     errors = []
-    for zone, _ in dict.fromkeys(PLACES):               # remove any stopped copy first
-        _wait(_call("DELETE", f"{API}/projects/{project}/zones/{zone}/instances/{name}"))
-    for zone, model in PLACES:
+    for zone in dict.fromkeys(z for z, _ in PLACES):
+        inst = _call("GET", f"{API}/projects/{project}/zones/{zone}/instances/{name}")
+        if inst.get("status") in LIVE:
+            return {"state": "waiting", "zone": zone, "status": inst["status"]}
+        if "error" not in inst:                            # a stopped copy: replace it
+            _wait(_call("DELETE", f"{API}/projects/{project}/zones/{zone}/instances/{name}"))
+    order = PLACES[start_at % len(PLACES):] + PLACES[:start_at % len(PLACES)]
+    last = start_at % len(PLACES)
+    for zone, model in order:
+        last = PLACES.index((zone, model))
         op = _call("POST", f"{API}/projects/{project}/zones/{zone}/instances",
                    instance_body(name, zone, model, project, conf, pointers))
         op = _wait(op)
         err = op.get("error")
         if not err:
-            return {"zone": zone, "model": model, "name": name}
+            return {"zone": zone, "model": model, "name": name, "place": PLACES.index((zone, model))}
         msg = json.dumps(err)[:300]
         errors.append(f"{zone}/{model}: {msg}")
         # A failed create can leave a stopped instance that still holds GPU quota:
@@ -116,7 +140,23 @@ def launch(node_id: str, pointers: dict, conf: dict, project: str | None = None)
         if not any(k in msg for k in ("QUOTA", "Quota", "STOCKOUT", "stockout", "unavailable",
                                       "does not have enough resources", "ZONE_RESOURCE_POOL_EXHAUSTED")):
             break                                         # not a capacity problem: don't spray zones
-    return {"error": errors}
+    return {"error": errors, "place": last}
+
+
+def reclaim(store, now: float | None = None) -> int:
+    """Jobs held by a sealed node that has gone silent (its VM was preempted or
+    died): back to the queue, so they run again when the node restarts."""
+    now = now or time.time()
+    n = 0
+    for (nid,) in store.q("SELECT id FROM nodes WHERE confidential IS NOT NULL AND "
+                          "(last_seen IS NULL OR last_seen < ?)", (now - OFFLINE_S,)):
+        held = store.q("SELECT COUNT(*) FROM submissions WHERE node_id=? AND status='assigned'",
+                       (nid,), one=True)[0]
+        if held:
+            store.q("UPDATE submissions SET status='queued', node_id=NULL "
+                    "WHERE node_id=? AND status='assigned'", (nid,))
+            n += held
+    return n
 
 
 def due(store, now: float | None = None) -> list[tuple[str, dict]]:
@@ -126,8 +166,9 @@ def due(store, now: float | None = None) -> list[tuple[str, dict]]:
     for nid, seen, ptr in store.q("SELECT id, last_seen, confidential FROM nodes WHERE confidential IS NOT NULL"):
         queued = store.q("SELECT COUNT(*) FROM submissions s JOIN node_tasks t ON t.task = s.task "
                          "WHERE t.node_id=? AND s.status='queued'", (nid,), one=True)[0]
-        last = (store.setting(f"sealed_launch:{nid}") or {}).get("at", 0)
-        if queued and (not seen or now - seen > OFFLINE_S) and now - last > COOLDOWN_S:
+        rec = store.setting(f"sealed_launch:{nid}") or {}
+        wait = RETRY_S if rec.get("error") else COOLDOWN_S
+        if queued and (not seen or now - seen > OFFLINE_S) and now - rec.get("at", 0) > wait:
             out.append((nid, json.loads(ptr)))
     return out
 
@@ -137,9 +178,14 @@ def loop(store, every_s: int = 60) -> threading.Thread:
         while True:
             try:
                 conf = store.setting("confidential")
+                if conf:
+                    reclaim(store)
                 for nid, ptr in (due(store) if conf else []):
-                    store.set_setting(f"sealed_launch:{nid}", {"at": time.time(), "state": "launching"})
-                    res = launch(nid, ptr, conf)
+                    prev = store.setting(f"sealed_launch:{nid}") or {}
+                    store.set_setting(f"sealed_launch:{nid}", {**prev, "at": time.time(), "state": "launching"})
+                    # Reuse the place that last worked; after a failure, start after it.
+                    start = prev.get("place", 0) + (1 if prev.get("error") else 0)
+                    res = launch(nid, ptr, conf, start_at=start)
                     store.set_setting(f"sealed_launch:{nid}", {"at": time.time(), **res})
             except Exception as e:              # never take the hub down
                 store.set_setting("sealed_launch:last_error", {"at": time.time(), "error": repr(e)[:300]})

@@ -114,6 +114,17 @@ class Store:
         with self.lock, self.db:
             self.db.execute("UPDATE submissions SET posted=1 WHERE id=?", (sid,))
 
+    def unfinished(self) -> list[str]:
+        with self.lock:
+            return [r[0] for r in self.db.execute(
+                "SELECT id FROM submissions WHERE status IN ('queued', 'running')").fetchall()]
+
+    def forget(self, sid: str) -> None:
+        """Drop a job that can't be resumed: it no longer counts toward any quota
+        or final-evaluation cap, and the hub hands it out again."""
+        with self.lock, self.db:
+            self.db.execute("DELETE FROM submissions WHERE id=?", (sid,))
+
     def requeue_running(self) -> int:
         """On restart, runs interrupted mid-flight go back to the queue."""
         with self.lock, self.db:

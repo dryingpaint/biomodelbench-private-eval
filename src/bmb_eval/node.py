@@ -208,7 +208,19 @@ class Worker:
                             "run `bmb-eval update` to review and approve it", task=task)
         updates_path(self.cfg).write_text(json.dumps(pending))
 
+    def drop_lost_jobs(self) -> int:
+        """Jobs the store says are unfinished but whose job file is gone (a sealed
+        node's VM was replaced, e.g. Spot preemption: its queue lived in memory).
+        Forgetting them, rather than failing them, lets the hub re-run them
+        without using up a quota slot or a final evaluation."""
+        lost = [sid for sid in self.store.unfinished() if not (self.queue_dir / f"{sid}.json").exists()]
+        for sid in lost:
+            self.store.forget(sid)
+            audit.record(self.cfg.state_dir, "job_lost", run_id=sid)
+        return len(lost)
+
     def run_forever(self) -> None:
+        self.drop_lost_jobs()
         n = self.store.requeue_running()
         audit.record(self.cfg.state_dir, "node_start", requeued=n)
         print(f"bmb-eval node running; connected to {self.api.url}. Ctrl-C to stop.")

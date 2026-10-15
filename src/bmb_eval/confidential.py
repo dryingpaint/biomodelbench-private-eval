@@ -559,8 +559,9 @@ def cmd_confidential_node(args) -> None:
 
     worker = Worker(cfg)
     worker.status = STATUS
+    lost = worker.drop_lost_jobs()     # interrupted by a VM replacement: the hub re-runs them
     n = worker.store.requeue_running()
-    say(step="running", requeued=n)
+    say(step="running", requeued=n, lost_on_restart=lost)
     idle_since = time.time()
     while True:
         try:

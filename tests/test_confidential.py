@@ -158,3 +158,46 @@ def test_launcher_starts_only_offline_sealed_nodes_with_work(hub, provider_files
     assert meta["tee-env-BUCKET"] == "gs://b" and "tee-env-digest" not in meta
     assert "tee-container-log-redirect" not in meta                # production: no logs
     assert body["scheduling"]["provisioningModel"] == "SPOT"
+
+
+def test_preempted_sealed_node_loses_nothing(hub, provider_files, tmp_path):  # noqa: F811
+    """A job held by a node whose VM vanished goes back to the queue (hub), and the
+    restarted node forgets it instead of failing it (no quota or final used)."""
+    import time as _t
+    from bmb_eval import sealed_launcher as L
+    from bmb_eval.node import HubAPI
+    from bmb_eval.store import Store
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    creds = HubAPI(url).activate(code, "sealed-test")
+    nid = creds["node_id"]
+    store.q("UPDATE nodes SET confidential=?, last_seen=? WHERE id=?",
+            (json.dumps({"BUCKET": "gs://b"}), _t.time() - 3600, nid))
+    task = store.q("SELECT task FROM node_tasks WHERE node_id=?", (nid,), one=True)[0]
+    store.q("INSERT INTO submissions (id, task, agent, created, status, node_id, manifest, split) VALUES "
+            "('f1', ?, 'a', ?, 'assigned', ?, '{}', 'test')", (task, _t.time(), nid))
+    assert L.reclaim(store) == 1
+    assert store.q("SELECT status, node_id FROM submissions WHERE id='f1'", one=True) == ("queued", None)
+    assert [n for n, _ in L.due(store)] == [nid]
+
+    node_store = Store(tmp_path)                    # the node's store, restored from the bucket
+    node_store.add("f1", task, "a", 0, "test")
+    node_store.start("f1")                          # it was running when the VM died
+    assert node_store.count_final(task) == 1
+    from bmb_eval.node import Worker
+    w = Worker.__new__(Worker)
+    w.store, w.queue_dir, w.cfg = node_store, tmp_path / "queue", type("C", (), {"state_dir": tmp_path})()
+    w.queue_dir.mkdir()
+    assert w.drop_lost_jobs() == 1
+    assert node_store.count_final(task) == 0 and not node_store.has("f1")
+
+
+def test_flex_start_request_shape():
+    from bmb_eval import sealed_launcher as L
+    body = L.instance_body("n", "us-central1-a", "FLEX_START", "p",
+                           {"image": "i@sha256:1", "workload_sa": "wl@p", "gpu_preview": True}, {})
+    assert body["scheduling"]["provisioningModel"] == "FLEX_START"
+    assert body["params"]["requestValidForDuration"]["seconds"] == str(L.FLEX_WAIT_S)
+    assert "maxRunDuration" in body["scheduling"]
+    assert all(m in ("FLEX_START", "SPOT") for _, m in L.PLACES)    # no on-demand for this machine

@@ -24,7 +24,7 @@ provider project                         biomodelbench
 | Sandbox | `BwrapSandbox` in `src/bmb_eval/sandbox.py`: bubblewrap as an unprivileged user, no network, minimal filesystem, read-only root, plus a seccomp filter blocking escape-prone kernel interfaces (user namespaces, mount, ptrace, bpf, io_uring, userfaultfd, keyrings, modules). gVisor isn't used here because it can't reach the GPU inside Confidential Space. |
 | Image | `Dockerfile`, built from a public commit by `build.sh` with Cloud Build's signed SLSA provenance. Base image pinned by digest, Debian by snapshot, Python by hash (`requirements.lock`). |
 | Provider check | `curl -fsSL https://eval.biomodelbench.org/verify-image.sh \| sh`: checks Google Cloud Build's signature on the SLSA v1 provenance (with Google's published key), and that it binds the approved digest to the published commit |
-| Start on demand | The hub (`bmb-hub serve --launch-sealed`, `src/bmb_eval/sealed_launcher.py`) creates the node's VM when its tasks have queued jobs and it's offline. It tries on-demand, then Spot, across us-central1-a, us-east5-a and europe-west4-c. The node exits when idle (`BMB_IDLE_EXIT_S`), and the VM stops. Manual start: `bmb-hub confidential-launch <node>`. |
+| Start on demand | The hub (`bmb-hub serve --launch-sealed`, `src/bmb_eval/sealed_launcher.py`) creates the node's VM when its tasks have queued jobs and it's offline. Confidential a3-highgpu-1g comes only as **Flex-start** or **Spot**, so the hub tries Flex-start first: the request waits for capacity (20 min), and once running the VM isn't preempted (up to 3 days). Spot is the fallback. It rotates through us-central1-a, us-east5-a and europe-west4-c. If a Spot VM is reclaimed mid-job, the hub re-queues the job and the restarted node drops what it lost (no quota or final used). The node exits when idle (`BMB_IDLE_EXIT_S`), and the VM stops. Manual start: `bmb-hub confidential-launch <node>`. |
 | Status | No logs in production (`log_redirect=debugonly`). The node reports fixed status fields to the hub (`bmb-hub status`). |
 | Final limits | Tasks set `final_limits_sealed` (e.g. `gpus: 1, max_bundle_gb: 80`) for this node; providers' own machines keep `final_limits`. |
 | Self-test | `ENV_FILE=none ./launch.sh h100` runs every sandbox attack on synthetic data, on the debug image with logs. |
@@ -45,12 +45,11 @@ bmb-hub status                                         # node status, launches
   Providers opt in, and their rule then also requires the H100 to attest
   confidential mode.
 - **One H100 per sealed node.** Finals go up to ~70B parameters at 8-bit.
-- **Quota (2026-10-15).** Spot H100 quota is approved in us-central1, us-east5
-  and europe-west4. On-demand H100 was denied twice: the project is new and has
-  no spend history. The global GPU limit is 1 (a raise to 4 was denied), so only
-  one sealed node can run at a time. Retry after some billing history, or via
-  a Google Cloud sales contact. Spot VMs can be reclaimed; jobs re-queue and
-  the hub restarts the node.
+- **Quota (2026-10-15).** Preemptible (Spot/Flex-start) H100 quota is approved
+  in us-central1, us-east5 and europe-west4. On-demand doesn't exist for this
+  machine type. The global GPU limit is 1 (a raise was denied for this new
+  project), so one sealed node runs at a time: another provider's node starts
+  once the first goes idle.
 - **Trust.** Providers trust Intel TDX, NVIDIA H100 CC, Google's Confidential
   Space image, and the code at the commit they verify.
 

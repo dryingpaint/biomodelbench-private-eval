@@ -1115,3 +1115,21 @@ def test_fixed_split_by_column(tmp_path):
     raw["split"] = {"final_evaluations": 1}
     with pytest.raises(ValueError, match="by_column"):
         Contract.from_dict(raw)
+
+
+def test_container_caps_math_thread_pools_to_the_cpu_limit():
+    """On a 32-CPU host, OpenBLAS started 32 threads in every stage and crashed under
+    the fork_bomb attack's pid limit (a provider's self-test failed on this)."""
+    from bmb_eval.contract import Limits
+    from bmb_eval.sandbox import container_cmd
+    cmd = container_cmd("podman", "img", None, name="n", entry="score", mounts=[], env={},
+                        limits=Limits(cpus=2))
+    for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        assert f"{v}=2" in cmd
+
+
+def test_flood_output_accepts_truncated_delivery():
+    from bmb_eval.redteam import ATTACKS
+    flood = next(a for a in ATTACKS if a.name == "flood_output")
+    assert flood.expect == "predictions_too_large" and "predictions_invalid" in flood.also
+    assert all(not a.also for a in ATTACKS if a.name != "flood_output")

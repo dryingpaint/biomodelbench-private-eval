@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -220,7 +221,7 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
         p = runner.evaluate(task, bundle_bytes(a), submitter="selftest", limits_override=limits)
         got = "ok" if p["status"] == "ok" else p["error"]["code"]
         leaked = first_row in json.dumps(p)
-        ok = got == a.expect and not leaked
+        ok = (got == a.expect or got in a.also) and not leaked
         failed += not ok
         if verbose or not ok:
             why = "" if ok else f"  expected {a.expect}, got {got}" + (
@@ -252,7 +253,18 @@ def gpu_problems(lim) -> list[str]:
         elif lim.gpu_memory_gb and min(sorted(mem)[-lim.gpus:]) < lim.gpu_memory_gb:
             out.append(f"This task needs {lim.gpu_memory_gb} GB of GPU memory; the GPU here has "
                        f"{max(mem)} GB.")
+        if (v := podman_version()) and v < (4, 1) and not shutil.which("docker"):
+            out.append(f"GPU tasks need Podman 4.1 or later (this machine has {'.'.join(map(str, v))}), "
+                       "or Docker with the NVIDIA container toolkit.")
     return out
+
+
+def podman_version() -> tuple | None:
+    if not shutil.which("podman"):
+        return None
+    r = subprocess.run(["podman", "--version"], capture_output=True, text=True)
+    m = re.search(r"(\d+)\.(\d+)", r.stdout)
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def disk_note(lim, root: Path) -> str | None:

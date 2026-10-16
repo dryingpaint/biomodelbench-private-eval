@@ -95,6 +95,11 @@ def container_cmd(engine: str, image: str, runtime: str | None, *, name: str, en
         "-e", "HOME=/tmp", "-e", "TMPDIR=/tmp", "-e", "PYTHONHASHSEED=0",
         "-e", "PYTHONDONTWRITEBYTECODE=1",
     ]
+    # Math libraries start one thread per host CPU, not per allowed CPU: on a big
+    # machine that alone can exceed the pid limit (OpenBLAS then crashes).
+    threads = str(max(1, int(min(limits.cpus, os.cpu_count() or 1))))
+    for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        cmd += ["-e", f"{v}={threads}"]
     if engine == "podman":
         cmd += ["--userns", "keep-id"]  # rootless: container uid == operator uid
     if runtime:

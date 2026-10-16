@@ -54,6 +54,7 @@ class Attack:
     limits: dict = field(default_factory=dict)
     gpu_only: bool = False             # run only for tasks that use GPUs
     backends: tuple = ()               # run only on these sandbox backends (empty = all)
+    also: tuple = ()                   # other outcomes that are equally safe
 
 
 ATTACKS = [
@@ -181,7 +182,10 @@ ATTACKS = [
                     except OSError:
                         pass
             return baseline(df)
-        '''), "predictions_too_large", limits={"max_predictions_mb": 1}),
+        '''), "predictions_too_large", limits={"max_predictions_mb": 1},
+        # Podman < 4 can deliver the flood truncated: then it fails validation
+        # instead. Either way nothing past the cap is scored.
+        also=("predictions_invalid",)),
 
     Attack("leak_in_error", "put private input values in an exception message", textwrap.dedent('''\
         def predict(df):

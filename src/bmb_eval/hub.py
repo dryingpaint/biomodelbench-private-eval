@@ -242,8 +242,10 @@ class HubStore:
         if out["status"] == "done":
             datasets = {t: json.loads(r) for t, _, r in rows}
             ok = [d for d in datasets.values() if d.get("status") == "ok"]
-            headline = ok[0]["headline"] if ok else None
-            vals = [d["metrics"].get(headline) for d in ok if d["metrics"].get(headline) is not None]
+            # Each dataset counts with its own headline metric (a family can mix metrics).
+            heads = {d["headline"] for d in ok}
+            headline = heads.pop() if len(heads) == 1 else ("mean of headlines" if heads else None)
+            vals = [d["metrics"][d["headline"]] for d in ok if d["metrics"].get(d["headline"]) is not None]
             out["result"] = {"status": "ok" if vals else "error", "headline": headline,
                              "combined": round(sum(vals) / len(vals), 4) if vals else None,
                              "datasets_scored": len(vals), "datasets": datasets}

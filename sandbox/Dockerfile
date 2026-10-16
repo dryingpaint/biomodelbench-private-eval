@@ -8,6 +8,9 @@
 # it instead of building.
 FROM docker.io/library/python:3.12-slim
 
+# libgomp: OpenMP runtime for LightGBM/XGBoost; libxrender/libxext: RDKit drawing deps.
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libxrender1 libxext6 \
+ && rm -rf /var/lib/apt/lists/*
 COPY sandbox/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
 

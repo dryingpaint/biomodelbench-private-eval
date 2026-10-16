@@ -13,3 +13,6 @@ accelerate>=0.33
 peft>=0.12            # LoRA adapters on top of a base model
 anndata>=0.10         # .h5ad single-cell data
 pillow>=10            # images
+rdkit>=2024.9          # small-molecule tasks (SMILES parsing, fingerprints)
+lightgbm>=4.3
+xgboost>=2.0

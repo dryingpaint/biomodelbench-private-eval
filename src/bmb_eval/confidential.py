@@ -363,11 +363,15 @@ def _report(cfg) -> None:
 
 class SealedState:
     """The node's store (quotas, final counts, undelivered results), kept
-    encrypted in the provider's bucket so a restart can't reset it."""
+    encrypted in the provider's bucket so a restart can't reset it. One object per
+    node (a provider's bucket can serve several); a node first started before
+    that falls back to the shared legacy object, so its counts carry over."""
 
-    def __init__(self, bucket, kms, key: str):
+    def __init__(self, bucket, kms, key: str, node_id: str | None = None):
         self.bucket, self.kms, self.key = bucket, kms, key
         self.dek = None
+        self.name, self.aad = ((f"{PREFIX}/state-{node_id}.enc", f"state:{node_id}") if node_id
+                               else (f"{PREFIX}/state.enc", "state"))
 
     def _dek(self) -> bytes:
         if self.dek is None:
@@ -380,16 +384,17 @@ class SealedState:
         return self.dek
 
     def load(self, db_path: Path) -> bool:
-        blob = self.bucket.blob(f"{PREFIX}/state.enc")
-        if not blob.exists():
-            return False
-        db_path.write_bytes(decrypt(self._dek(), blob.download_as_bytes(), aad="state"))
-        return True
+        for name, aad in ((self.name, self.aad), (f"{PREFIX}/state.enc", "state")):
+            blob = self.bucket.blob(name)
+            if blob.exists():
+                db_path.write_bytes(decrypt(self._dek(), blob.download_as_bytes(), aad=aad))
+                return True
+        return False
 
     def save(self, store) -> None:
         with store.lock:
             raw = store.db.serialize()
-        self.bucket.blob(f"{PREFIX}/state.enc").upload_from_string(encrypt(self._dek(), raw, aad="state"))
+        self.bucket.blob(self.name).upload_from_string(encrypt(self._dek(), raw, aad=self.aad))
 
 
 def unseal(env: dict, root: Path):
@@ -414,6 +419,21 @@ def unseal(env: dict, root: Path):
             raise ValueError(f"sealed bundle {task} names task {node.get('task')}")
         tasks[task] = (task_dir, data_dir, node)
     return tasks, bucket, kms
+
+
+def for_node(tasks: dict, node_id: str | None) -> dict:
+    """The tasks this VM serves. One provider's bucket can hold tasks of several
+    nodes (e.g. connected from two machines); the hub launches one VM per node
+    and names it in BMB_NODE_ID. Without it, all tasks must agree."""
+    if node_id:
+        mine = {t: v for t, v in tasks.items() if v[2].get("node_id") == node_id}
+        if len(mine) < len(tasks):
+            say(step="skipped", reason="tasks of another sealed node",
+                tasks=sorted(set(tasks) - set(mine)))
+        return mine
+    if len({v[2].get("node_id") for v in tasks.values()}) > 1:
+        raise ValueError("sealed tasks disagree about the node identity")
+    return tasks
 
 
 def write_config(root: Path, tasks: dict, image: str, blob_dir: Path) -> Path:
@@ -523,13 +543,14 @@ def cmd_confidential_node(args) -> None:
         tasks, bucket, kms = synthetic_tasks(root), None, None
     else:
         tasks, bucket, kms = unseal(env, root)
+        tasks = for_node(tasks, env.get("BMB_NODE_ID"))
     if not tasks:
         say(step="idle", reason="no sealed tasks in the provider's bucket")
         return
     blob_dir = Path(env.get("BMB_BLOB_DIR", "/var/bmb/blobs"))   # agents' model files: disk is fine
     cfg_path = write_config(root, tasks, env.get("BMB_IMAGE", "confidential"), blob_dir)
     (root / "state").mkdir(exist_ok=True)
-    sealed = None if selftest_only else SealedState(bucket, kms, env["KEY"])
+    sealed = None if selftest_only else SealedState(bucket, kms, env["KEY"], env.get("BMB_NODE_ID"))
     restored = bool(sealed and sealed.load(root / "state" / "node.db"))
     _traversable(root)
     cfg = Config.load(cfg_path)

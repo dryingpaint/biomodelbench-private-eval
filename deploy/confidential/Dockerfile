@@ -27,6 +27,6 @@ ENV PYTHONPATH=/opt/bmb PYTHONDONTWRITEBYTECODE=1 \
 # runs the debug image, which providers' keys never open. The node reports fixed
 # status fields to the hub instead (bmb-hub status).
 LABEL "tee.launch_policy.log_redirect"="debugonly"
-LABEL "tee.launch_policy.allow_env_override"="PROVIDER_PROJECT_NUMBER,POOL,PROVIDER_ID,KEY,BUCKET,BMB_IDLE_EXIT_S"
+LABEL "tee.launch_policy.allow_env_override"="PROVIDER_PROJECT_NUMBER,POOL,PROVIDER_ID,KEY,BUCKET,BMB_IDLE_EXIT_S,BMB_NODE_ID"
 LABEL "tee.launch_policy.allow_mount_destinations"="/run/tmp"
 CMD ["python3", "-c", "from bmb_eval.cli import main; main(['confidential-node'])"]

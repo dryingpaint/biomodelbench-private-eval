@@ -201,3 +201,59 @@ def test_flex_start_request_shape():
     assert body["params"]["requestValidForDuration"]["seconds"] == str(L.FLEX_WAIT_S)
     assert "maxRunDuration" in body["scheduling"]
     assert all(m in ("FLEX_START", "SPOT") for _, m in L.PLACES)    # no on-demand for this machine
+
+
+def test_bucket_with_two_nodes_serves_only_the_launched_one(tmp_path, monkeypatch):
+    """A provider who connected tasks from two machines has two node identities in
+    one bucket: the VM the hub launches for one node serves only that node's tasks
+    (before, every VM refused to start)."""
+    from bmb_eval import sealed_launcher as L
+    tasks = {"a": (tmp_path, tmp_path, {"node_id": "node_1"}),
+             "b": (tmp_path, tmp_path, {"node_id": "node_1"}),
+             "old": (tmp_path, tmp_path, {"node_id": "node_0"})}
+    assert sorted(conf.for_node(tasks, "node_1")) == ["a", "b"]
+    assert sorted(conf.for_node(tasks, "node_0")) == ["old"]
+    assert conf.for_node(tasks, "node_9") == {}
+    with pytest.raises(ValueError):
+        conf.for_node(tasks, None)                       # unnamed VM: still refuses to guess
+    assert sorted(conf.for_node({k: tasks[k] for k in "ab"}, None)) == ["a", "b"]
+
+    calls = []
+    monkeypatch.setattr(L, "_call", lambda m, url, body=None: calls.append((m, body)) or
+                        ({"error": {"code": 404}} if m == "GET" else {"status": "DONE"}))
+    monkeypatch.setattr(L, "_wait", lambda op, timeout=300: op)
+    L.launch("node_1", {"BUCKET": "gs://b", "digest": "sha256:1"},
+             {"image": "i@sha256:1", "workload_sa": "wl@p"}, project="p")
+    body = next(b for m, b in calls if m == "POST")
+    meta = {i["key"]: i["value"] for i in body["metadata"]["items"]}
+    assert meta["tee-env-BMB_NODE_ID"] == "node_1"
+
+
+def test_sealed_state_is_per_node_and_keeps_legacy_counts(tmp_path):
+    class Blob:
+        def __init__(self, store, name): self.store, self.name = store, name
+        def exists(self): return self.name in self.store
+        def download_as_bytes(self): return self.store[self.name]
+        def upload_from_string(self, b): self.store[self.name] = b
+
+    class Bucket(dict):
+        def blob(self, name): return Blob(self, name)
+
+    class Kms:
+        def encrypt(self, name, plaintext): return type("R", (), {"ciphertext": plaintext})()
+        def decrypt(self, name, ciphertext): return type("R", (), {"plaintext": ciphertext})()
+
+    class Store:
+        def __init__(self, raw): self.lock, self.db = __import__("threading").Lock(), type("D", (), {"serialize": lambda s: raw})()
+
+    bucket = Bucket()
+    legacy = conf.SealedState(bucket, Kms(), "k")                  # a node started before this change
+    legacy.save(Store(b"legacy counts"))
+    one = conf.SealedState(bucket, Kms(), "k", "node_1")
+    assert one.load(tmp_path / "a.db") and (tmp_path / "a.db").read_bytes() == b"legacy counts"
+    one.save(Store(b"node_1 counts"))
+    two = conf.SealedState(bucket, Kms(), "k", "node_2")
+    two.save(Store(b"node_2 counts"))
+    assert conf.SealedState(bucket, Kms(), "k", "node_1").load(tmp_path / "b.db")
+    assert (tmp_path / "b.db").read_bytes() == b"node_1 counts"     # not overwritten by node_2
+    assert sorted(k for k in bucket if "state-" in k) == ["bmb/state-node_1.enc", "bmb/state-node_2.enc"]

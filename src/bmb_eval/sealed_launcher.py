@@ -127,7 +127,7 @@ def launch(node_id: str, pointers: dict, conf: dict, project: str | None = None,
     for zone, model in order:
         last = PLACES.index((zone, model))
         op = _call("POST", f"{API}/projects/{project}/zones/{zone}/instances",
-                   instance_body(name, zone, model, project, conf, pointers))
+                   instance_body(name, zone, model, project, conf, {**pointers, "BMB_NODE_ID": node_id}))
         op = _wait(op)
         err = op.get("error")
         if not err:

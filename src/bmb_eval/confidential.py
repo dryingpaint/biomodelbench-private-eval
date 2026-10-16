@@ -558,7 +558,15 @@ def cmd_confidential_node(args) -> None:
 
     approval.approve(cfg)   # the provider approved by sealing this exact package
     for task in sorted(cfg.tasks):
-        failed = _selftest(cfg, task, verbose=True)   # prints attack names and PASS/FAIL only
+        try:
+            failed = _selftest(cfg, task, verbose=True)   # prints attack names and PASS/FAIL only
+        except Exception as e:
+            # Production nodes have no logs: tell the hub what stopped us (the error's
+            # type only; its message could quote the provider's data).
+            say(step="refused", reason=f"self-test error on {task}: {type(e).__name__}")
+            if not selftest_only:
+                _report(cfg)
+            raise
         say(step="selftest", task=task, failed=failed)
         if failed and selftest_only:
             # Synthetic data only: safe to show why (never done with a provider's data).

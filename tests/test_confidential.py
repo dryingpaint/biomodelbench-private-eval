@@ -257,3 +257,18 @@ def test_sealed_state_is_per_node_and_keeps_legacy_counts(tmp_path):
     assert conf.SealedState(bucket, Kms(), "k", "node_1").load(tmp_path / "b.db")
     assert (tmp_path / "b.db").read_bytes() == b"node_1 counts"     # not overwritten by node_2
     assert sorted(k for k in bucket if "state-" in k) == ["bmb/state-node_1.enc", "bmb/state-node_2.enc"]
+
+
+def test_selftest_skips_a_task_with_no_validation_rows(tmp_path, monkeypatch):
+    """A published-test-set task can have an empty validation half. Its self-test used
+    to crash (first row of an empty table), which stopped the whole sealed node."""
+    import types
+    import pandas as pd
+    pd.DataFrame({"row_id": pd.Series([], dtype=str)}).to_parquet(tmp_path / "samples.parquet")
+    field = types.SimpleNamespace(name="row_id")
+    t = types.SimpleNamespace(inputs=tmp_path / "samples.parquet",
+                              contract=types.SimpleNamespace(inputs=[field]))
+    cfg = types.SimpleNamespace(tasks={"empty": t}, state_dir=tmp_path, backend="bwrap")
+    monkeypatch.setattr("bmb_eval.runner.Runner", lambda *a, **k: pytest.fail("ran attacks"))
+    assert cli._selftest(cfg, "empty", verbose=False) == 0
+    assert '"skipped": true' in (tmp_path / "audit.jsonl").read_text()

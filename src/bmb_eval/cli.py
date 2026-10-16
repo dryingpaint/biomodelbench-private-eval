@@ -191,8 +191,16 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
     from .runner import Runner
     import pandas as pd
     t = cfg.tasks[task]
-    first_row = " ".join(map(str, pd.read_parquet(
-        t.inputs, columns=[f.name for f in t.contract.inputs]).iloc[0].tolist()))
+    rows = pd.read_parquet(t.inputs, columns=[f.name for f in t.contract.inputs])
+    if rows.empty:
+        # No validation rows (e.g. a published test set with no validation half): the
+        # attacks need rows to run on, and test rows are reserved for finals. The
+        # sandbox itself is the same for every task, so it's checked on the others.
+        if verbose:
+            print("  SKIP  (no validation rows to test with)")
+        audit.record(cfg.state_dir, "selftest", task=task, backend=cfg.backend, failed=0, skipped=True)
+        return 0
+    first_row = " ".join(map(str, rows.iloc[0].tolist()))
     runner = Runner(cfg, send_alerts=False)
     local = cfg.backend == "local"
     failed = 0

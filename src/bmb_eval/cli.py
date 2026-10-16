@@ -274,8 +274,11 @@ def _summary(c, n_rows: int) -> str:
         f"  What leaves:         only scores ({', '.join(m.name for m in c.metrics)}), "
         f"{c.decimals} decimals",
         f"  Worst case:          a model built to extract data could learn {worst}",
-        *([f"  Held-out test set:   {c.split.validation_fraction:.0%} of rows scored during the "
-           f"benchmark; the rest only for final evaluations (at most {c.split.final_evaluations})"]
+        *([(f"  Held-out test set:   rows marked 'validation' in '{c.split.by_column}' are scored "
+            f"during the benchmark; 'test' rows only for final evaluations (at most "
+            f"{c.split.final_evaluations})") if c.split.by_column else
+           (f"  Held-out test set:   {c.split.validation_fraction:.0%} of rows scored during the "
+            f"benchmark; the rest only for final evaluations (at most {c.split.final_evaluations})")]
           if c.split else []),
     ])
 

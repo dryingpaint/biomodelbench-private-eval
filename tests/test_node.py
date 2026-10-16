@@ -1090,3 +1090,28 @@ def test_sealed_final_limits_apply_only_on_the_sealed_node(tmp_path):
     assert (sealed.gpus, sealed.max_bundle_gb) == (1, 80)
     assert c.limits_for("validation", sealed=True).gpus == 0
     assert Contract.from_dict(c.public(), public=True).limits_for("test", sealed=True).gpus == 1
+
+
+def test_fixed_split_by_column(tmp_path):
+    """A published test set: the provider's own column decides validation vs test,
+    and the column is never shown to the model."""
+    import pandas as pd
+    from bmb_eval.prepare import apply_split, prepare
+    d = scaffold.write_task("fixed", tmp_path / "t", [("id", "string", False), ("seq", "string", False)],
+                            [("id", "string", False), ("y", "float", False),
+                             ("half", "string", False)], ["id"], "regression", "y")
+    raw = yaml.safe_load((d / "contract.yaml").read_text())
+    raw["split"] = {"by_column": "half", "final_evaluations": 1}
+    c = Contract.from_dict(raw)
+    rows = pd.DataFrame({"id": [f"r{i}" for i in range(10)], "seq": ["ACGT"] * 10,
+                         "y": range(10), "half": ["validation"] * 4 + ["test"] * 6})
+    rows.to_csv(tmp_path / "data.csv", index=False)
+    inputs_dir, answers, n = prepare(c, tmp_path / "data.csv", tmp_path / "out")
+    val, test, n_val, n_test = apply_split(c, tmp_path / "out")
+    assert (n_val, n_test) == (4, 6)
+    assert set(pd.read_parquet(val / "samples.parquet")["id"]) == {"r0", "r1", "r2", "r3"}
+    assert "half" not in pd.read_parquet(val / "samples.parquet").columns
+    assert Contract.from_dict(c.public(), public=True).split.by_column == "half"
+    raw["split"] = {"final_evaluations": 1}
+    with pytest.raises(ValueError, match="by_column"):
+        Contract.from_dict(raw)

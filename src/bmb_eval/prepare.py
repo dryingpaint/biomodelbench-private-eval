@@ -195,14 +195,26 @@ def apply_split(c: Contract, dest: Path) -> tuple[Path, Path, int, int]:
     full = dest / "inputs"
     samples = pd.read_parquet(full / "samples.parquet")
     keys = samples[c.key].astype(str).agg("\x1f".join, axis=1)
-    # Rows are assigned by group (e.g. molecule) when group_by is set, else by row.
-    groups = samples[c.split.group_by].astype(str) if c.split.group_by else keys
     split_file = dest / "split.json"
-    assignment = json.loads(split_file.read_text()) if split_file.exists() else {}
-    rng = np.random.default_rng(_secrets.randbits(64))
-    for g in groups:
-        if g not in assignment:
-            assignment[g] = "validation" if rng.random() < c.split.validation_fraction else "test"
+    if c.split.by_column:
+        # Fixed split from the provider's own column (it lives with the answers).
+        ans = pd.read_parquet(dest / "answers.parquet", columns=[*c.key, c.split.by_column])
+        akeys = ans[c.key].astype(str).agg("\x1f".join, axis=1)
+        values = ans[c.split.by_column].astype(str).str.strip().str.lower()
+        bad = sorted(set(values) - {"validation", "test"})
+        if bad:
+            raise DataError([f"Column '{c.split.by_column}' must be 'validation' or 'test' "
+                             f"on every row; found {bad[:3]}."])
+        groups = keys
+        assignment = dict(zip(akeys, values))
+    else:
+        # Rows are assigned by group (e.g. molecule) when group_by is set, else by row.
+        groups = samples[c.split.group_by].astype(str) if c.split.group_by else keys
+        assignment = json.loads(split_file.read_text()) if split_file.exists() else {}
+        rng = np.random.default_rng(_secrets.randbits(64))
+        for g in groups:
+            if g not in assignment:
+                assignment[g] = "validation" if rng.random() < c.split.validation_fraction else "test"
     split_file.write_text(json.dumps(assignment))
     os.chmod(split_file, 0o600)
 

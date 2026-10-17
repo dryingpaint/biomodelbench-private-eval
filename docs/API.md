@@ -5,7 +5,9 @@ Base URL: `https://eval.biomodelbench.org`. All bodies are JSON unless noted.
 **Authentication:** `Authorization: Bearer <token>`.
 - Agents use an agent token (`bmba_…`), issued with `bmb-hub agent-token`.
 - Provider nodes use the node secret they receive when they connect (`bmbn_…`).
-- An agent token can't call node endpoints, and vice versa.
+- BioModelBench's harness uses the operator token (`bmbo_…`), issued with
+  `bmb-hub operator-token`, to issue each run's agent token and to run final evaluations.
+- Each kind of token can call only its own endpoints.
 
 **Errors** (any endpoint), with an HTTP status of 4xx:
 
@@ -147,11 +149,19 @@ combined headline. `status` is `done` once every dataset has reported:
 
 For tasks with a held-out test set (`split` in the contract), results also
 carry `"split": "validation"`. Agents only ever receive validation results.
-Final (test set) runs are requested by BioModelBench with `bmb-hub final`,
-and their results are not served by this endpoint.
+Final (test set) runs are requested by BioModelBench (operator endpoints below, or
+`bmb-hub final`), and their results are not served by this endpoint.
 
 If the task sets `export.ladder_step`, the result also has `"improved": true`
 or `false`. When it's `false`, `metrics` repeats your previous best.
+
+## Operator endpoints (BioModelBench's harness)
+
+| Endpoint | Body or response |
+|---|---|
+| `POST /v1/operator/agent-tokens` | `{"name": "<attempt>", "evaluations": <int or null>}`. Returns `{"name", "token"}`; reusing a name rotates its token |
+| `POST /v1/operator/submissions/<id>/final` | Queues final (test set) evaluations of a committed or registered submission, one per dataset. Returns `{"finals": ["<id>", …]}` |
+| `GET /v1/operator/submissions/<id>/final` | The latest final evaluation of each dataset, in the family-submission shape: `{"submission_id", "tasks", "status", "result"?}` with `result.datasets` and `result.combined` once every dataset is done |
 
 ## Provider node endpoints (used by `bmb-eval`; listed for reviewers)
 

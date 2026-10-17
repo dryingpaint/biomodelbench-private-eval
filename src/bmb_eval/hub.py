@@ -147,6 +147,25 @@ def _public_status(status: str) -> str:
     return status if status in ("done", "registered") else "pending"
 
 
+def _summary(sid: str, rows) -> dict:
+    """(task, status, result) rows of one submission -> its status and, once every
+    dataset is done, an equal-weight combined headline over the datasets."""
+    status = {_public_status(r[1]) for r in rows}
+    out = {"submission_id": sid, "tasks": [r[0] for r in rows],
+           "status": status.pop() if len(status) == 1 else "pending"}
+    if out["status"] == "done":
+        datasets = {t: json.loads(r) for t, _, r in rows}
+        ok = [d for d in datasets.values() if d.get("status") == "ok"]
+        # Each dataset counts with its own headline metric (a family can mix metrics).
+        heads = {d["headline"] for d in ok}
+        headline = heads.pop() if len(heads) == 1 else ("mean of headlines" if heads else None)
+        vals = [d["metrics"][d["headline"]] for d in ok if d["metrics"].get(d["headline"]) is not None]
+        out["result"] = {"status": "ok" if vals else "error", "headline": headline,
+                         "combined": round(sum(vals) / len(vals), 4) if vals else None,
+                         "datasets_scored": len(vals), "datasets": datasets}
+    return out
+
+
 class HubStore:
     def __init__(self, state: Path):
         self.state = state
@@ -182,6 +201,17 @@ class HubStore:
     def agent(self, token: str) -> str | None:
         row = self.q("SELECT name FROM agents WHERE token_sha256=?", (_h(token),), one=True)
         return row[0] if row else None
+
+    def is_operator(self, token: str) -> bool:
+        op = self.setting("operator")
+        return bool(token) and op is not None and op["token_sha256"] == _h(token)
+
+    def set_operator(self) -> str:
+        """Create or rotate the operator token (bmbo_…): issues agent tokens and requests
+        and reads final evaluations over the API, for automated runs."""
+        token = "bmbo_" + secrets.token_urlsafe(32)
+        self.set_setting("operator", {"token_sha256": _h(token)})
+        return token
 
     def node(self, secret: str) -> str | None:
         row = self.q("SELECT id FROM nodes WHERE secret_sha256=?", (_h(secret),), one=True)
@@ -236,22 +266,15 @@ class HubStore:
         q = ("SELECT task, status, result FROM submissions WHERE group_id=? AND split='validation'"
              + (" AND agent=?" if agent else "") + " ORDER BY task")
         rows = self.q(q, (gid, agent) if agent else (gid,))
-        if not rows:
-            return None
-        status = {_public_status(r[1]) for r in rows}
-        out = {"submission_id": gid, "tasks": [r[0] for r in rows],
-               "status": status.pop() if len(status) == 1 else "pending"}
-        if out["status"] == "done":
-            datasets = {t: json.loads(r) for t, _, r in rows}
-            ok = [d for d in datasets.values() if d.get("status") == "ok"]
-            # Each dataset counts with its own headline metric (a family can mix metrics).
-            heads = {d["headline"] for d in ok}
-            headline = heads.pop() if len(heads) == 1 else ("mean of headlines" if heads else None)
-            vals = [d["metrics"][d["headline"]] for d in ok if d["metrics"].get(d["headline"]) is not None]
-            out["result"] = {"status": "ok" if vals else "error", "headline": headline,
-                             "combined": round(sum(vals) / len(vals), 4) if vals else None,
-                             "datasets_scored": len(vals), "datasets": datasets}
-        return out
+        return _summary(gid, rows) if rows else None
+
+    def final_view(self, sid: str) -> dict | None:
+        """The latest final (test set) evaluation of each dataset of a submission, in
+        group_view's shape. Operator only."""
+        rows = self.q("SELECT task, status, result FROM submissions WHERE split='test' AND id LIKE ? "
+                      "ORDER BY created", (sid + "-%",))
+        latest = {task: (task, status, result) for task, status, result in rows}
+        return _summary(sid, sorted(latest.values())) if latest else None
 
     # ----------------------------------------------------------- enrollment
 
@@ -484,6 +507,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._blob_get(m.group(1))
             if p.startswith("/v1/node/"):
                 return self._node_get(p)
+            if p.startswith("/v1/operator/"):
+                return self._operator("GET", p)
             agent = store.agent(self._bearer())
             if agent is None:
                 return self._err(401, "unauthorized", "Missing or invalid token.")
@@ -549,6 +574,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._send(200, out)
             if p.startswith("/v1/node/"):
                 return self._node_post(p)
+            if p.startswith("/v1/operator/"):
+                return self._operator("POST", p)
             agent = store.agent(self._bearer())
             if agent is None:
                 return self._err(401, "unauthorized", "Missing or invalid token.")
@@ -556,6 +583,34 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._submit(agent, m.group(1))
             if m := re.fullmatch(r"/v1/submissions/([\w-]{1,128})/commit", p):
                 return self._commit(agent, m.group(1))
+            self._err(404, "not_found", "No such endpoint.")
+
+        # ---------------------------------------------------------- operator
+
+        def _operator(self, method: str, p: str) -> None:
+            """Automated runs (BioModelBench's harness): issue an attempt's agent token,
+            request final evaluations and read their results."""
+            if not store.is_operator(self._bearer()):
+                return self._err(401, "unauthorized", "Missing or invalid token.")
+            if method == "POST" and p == "/v1/operator/agent-tokens":
+                try:
+                    body = self._json_body()
+                    name, evals = str(body["name"])[:128], body.get("evaluations")
+                    if not name or (evals is not None and (not isinstance(evals, int) or evals < 0)):
+                        raise ValueError
+                except (ValueError, KeyError, TypeError):
+                    return self._err(400, "bad_request",
+                                     'Body must be {"name": str, "evaluations": int or null}.')
+                return self._send(200, {"name": name, "token": store.add_agent(name, evals)})
+            if m := re.fullmatch(r"/v1/operator/submissions/([\w-]{1,128})/final", p):
+                if method == "GET":
+                    view = store.final_view(m.group(1))
+                    return self._send(200, view) if view else self._err(
+                        404, "not_found", "No final evaluation for this submission.")
+                try:
+                    return self._send(202, {"finals": store.request_finals(m.group(1))})
+                except KeyError:
+                    return self._err(404, "not_found", "No such committed submission.")
             self._err(404, "not_found", "No such endpoint.")
 
         # ------------------------------------------------------------ agents
@@ -797,6 +852,7 @@ def main(argv=None) -> None:
     p = sub.add_parser("revoke", help="cancel an unused connect code")
     p.add_argument("code")
 
+    sub.add_parser("operator-token", help="create or rotate the operator token (API for automated runs)")
     p = sub.add_parser("agent-token", help="create or rotate an agent token (one per attempt)")
     p.add_argument("name")
     p.add_argument("--evaluations", type=int, help="evaluation budget for this attempt, across all datasets")
@@ -891,6 +947,8 @@ def main(argv=None) -> None:
             n = store.db.execute("UPDATE enrollments SET used_by='revoked' WHERE code=? AND used_by IS NULL",
                                  (args.code,)).rowcount
         print(f"revoked {args.code}" if n else f"{args.code} is unknown or already used")
+    elif args.cmd == "operator-token":
+        print(store.set_operator())
     elif args.cmd == "agent-token":
         print(store.add_agent(args.name, args.evaluations))
     elif args.cmd == "family":

@@ -98,6 +98,22 @@ class Client:
         {submission_id, status: "registered"}."""
         return self.submit_async(task, bundle, final_candidate=True)
 
+    # Operator token (bmbo_…) only, for automated runs. Like every call here, these
+    # return the hub's JSON, {"error": ...} included.
+
+    def agent_token(self, name: str, evaluations: int | None = None) -> dict:
+        """Issue (or rotate) one attempt's agent token with an evaluation budget: {name, token}."""
+        return self._req("POST", "/v1/operator/agent-tokens", {"name": name, "evaluations": evaluations})
+
+    def request_final(self, submission_id: str) -> dict:
+        """Queue final (test set) evaluations of a submission, one per dataset: {finals: [ids]}."""
+        return self._req("POST", f"/v1/operator/submissions/{submission_id}/final", {})
+
+    def final(self, submission_id: str) -> dict:
+        """The latest final evaluations of a submission: {status, tasks, result}, where
+        result (once every dataset is done) has the per-dataset results and the combined headline."""
+        return self._req("GET", f"/v1/operator/submissions/{submission_id}/final")
+
     def status(self, submission_id: str) -> dict:
         return self._req("GET", f"/v1/submissions/{submission_id}")
 

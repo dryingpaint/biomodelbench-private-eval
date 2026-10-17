@@ -217,25 +217,35 @@ class HubStore:
         row = self.q("SELECT id FROM nodes WHERE secret_sha256=?", (_h(secret),), one=True)
         return row[0] if row else None
 
-    def request_final(self, sid: str) -> str:
+    def _finals_of(self, sid: str) -> list[str]:
+        """Final evaluations of one submission row (ids "<sid>-final<n>"), oldest first.
+        Matched on the exact prefix: LIKE would treat "_" in an id as a wildcard."""
+        pre = sid + "-final"
+        return [r[0] for r in self.q("SELECT id FROM submissions WHERE split='test' "
+                                     "AND substr(id, 1, ?) = ? ORDER BY created", (len(pre), pre))]
+
+    def request_final(self, sid: str, again: bool = True) -> str:
         """Queue a final (test set) evaluation of an existing submission's model.
-        Admin only. The provider's node decides whether it may run (its cap)."""
+        Admin only. The provider's node decides whether it may run (its cap). With
+        again=False, an existing final is returned instead of spending another."""
         row = self.q("SELECT task, agent, manifest FROM submissions WHERE id=? AND split='validation' "
                      "AND status NOT IN ('uploading', 'uploading_final')", (sid,), one=True)
         if not row:
             raise KeyError(f"no committed submission {sid}")
-        n = self.q("SELECT COUNT(*) FROM submissions WHERE id LIKE ?", (sid + "-final%",), one=True)[0]
-        fid = f"{sid}-final{n + 1}"
+        done = self._finals_of(sid)
+        if done and not again:
+            return done[-1]
+        fid = f"{sid}-final{len(done) + 1}"
         self.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, manifest, split) "
                "VALUES (?,?,?,?, 'queued', NULL, NULL, ?, 'test')", (fid, row[0], row[1], time.time(), row[2]))
         return fid
 
-    def request_finals(self, sid: str) -> list[str]:
+    def request_finals(self, sid: str, again: bool = True) -> list[str]:
         """Final evaluations for a task submission, or for every dataset of a
         family submission."""
         children = [r[0] for r in self.q("SELECT id FROM submissions WHERE group_id=? "
                                          "AND split='validation' ORDER BY task", (sid,))]
-        return [self.request_final(c) for c in (children or [sid])]
+        return [self.request_final(c, again) for c in (children or [sid])]
 
     def add_agent(self, name: str, evaluations: int | None = None) -> str:
         """Token for one attempt. `evaluations` caps its submissions across all
@@ -271,10 +281,11 @@ class HubStore:
     def final_view(self, sid: str) -> dict | None:
         """The latest final (test set) evaluation of each dataset of a submission, in
         group_view's shape. Operator only."""
-        rows = self.q("SELECT task, status, result FROM submissions WHERE split='test' AND id LIKE ? "
-                      "ORDER BY created", (sid + "-%",))
-        latest = {task: (task, status, result) for task, status, result in rows}
-        return _summary(sid, sorted(latest.values())) if latest else None
+        children = [r[0] for r in self.q("SELECT id FROM submissions WHERE group_id=? "
+                                         "AND split='validation' ORDER BY task", (sid,))]
+        latest = [f[-1] for f in map(self._finals_of, children or [sid]) if f]
+        rows = [self.q("SELECT task, status, result FROM submissions WHERE id=?", (f,), one=True) for f in latest]
+        return _summary(sid, sorted(rows)) if rows else None
 
     # ----------------------------------------------------------- enrollment
 
@@ -593,14 +604,20 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if not store.is_operator(self._bearer()):
                 return self._err(401, "unauthorized", "Missing or invalid token.")
             if method == "POST" and p == "/v1/operator/agent-tokens":
+                # Always a budget, and an existing name (a live attempt's token) is only
+                # replaced on request: a leaked or buggy caller can't mint unlimited tokens
+                # or silently cut off a running attempt.
                 try:
                     body = self._json_body()
-                    name, evals = str(body["name"])[:128], body.get("evaluations")
-                    if not name or (evals is not None and (not isinstance(evals, int) or evals < 0)):
+                    name, evals = str(body["name"])[:128], body["evaluations"]
+                    if not name or type(evals) is not int or evals < 0:
                         raise ValueError
                 except (ValueError, KeyError, TypeError):
                     return self._err(400, "bad_request",
-                                     'Body must be {"name": str, "evaluations": int or null}.')
+                                     'Body must be {"name": str, "evaluations": int >= 0, "rotate"?: bool}.')
+                if store.q("SELECT 1 FROM agents WHERE name=?", (name,), one=True) and not body.get("rotate"):
+                    return self._err(409, "name_taken", f"An agent token named {name!r} exists; "
+                                     'send "rotate": true to replace it.')
                 return self._send(200, {"name": name, "token": store.add_agent(name, evals)})
             if m := re.fullmatch(r"/v1/operator/submissions/([\w-]{1,128})/final", p):
                 if method == "GET":
@@ -608,7 +625,10 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                     return self._send(200, view) if view else self._err(
                         404, "not_found", "No final evaluation for this submission.")
                 try:
-                    return self._send(202, {"finals": store.request_finals(m.group(1))})
+                    again = bool(self._json_body().get("again"))
+                    return self._send(202, {"finals": store.request_finals(m.group(1), again)})
+                except (ValueError, AttributeError):
+                    return self._err(400, "bad_request", 'Body must be {} or {"again": true}.')
                 except KeyError:
                     return self._err(404, "not_found", "No such committed submission.")
             self._err(404, "not_found", "No such endpoint.")

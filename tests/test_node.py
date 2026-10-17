@@ -1252,15 +1252,19 @@ def test_operator_issues_tokens_and_runs_finals_over_the_api(family):
     store, url, agent, workers = family
     op = Client(url, store.set_operator())
     assert op.tasks()["error"]["code"] == "unauthorized"                 # not an agent token
-    assert agent.agent_token("x")["error"]["code"] == "unauthorized"     # agents can't issue tokens
-    assert op.agent_token("x", -1)["error"]["code"] == "bad_request"
+    assert agent.agent_token("x", 1)["error"]["code"] == "unauthorized"  # agents can't issue tokens
+    for bad in (-1, None, 1.5, True):
+        assert op._req("POST", "/v1/operator/agent-tokens",
+                       {"name": "x", "evaluations": bad})["error"]["code"] == "bad_request"
     run = Client(url, op.agent_token("run-1", 2)["token"])
     assert run.tasks()["budget"] == {"evaluations": 2, "used": 0}
+    assert op.agent_token("run-1", 2)["error"]["code"] == "name_taken"   # a live token isn't cut off
     sid = run.register_final("fitness", EXAMPLE_BUNDLE)["submission_id"]
     assert op.final(sid)["error"]["code"] == "not_found"                 # nothing requested yet
     assert run.request_final(sid)["error"]["code"] == "unauthorized"     # only the operator asks
     finals = op.request_final(sid)["finals"]
     assert len(finals) == 2 and op.final(sid)["status"] == "pending"
+    assert op.request_final(sid)["finals"] == finals                     # a retry spends no final
     _drain(workers)
     view = op.final(sid)
     assert view["status"] == "done" and view["tasks"] == ["fit_lab_a", "fit_lab_b"]
@@ -1268,5 +1272,10 @@ def test_operator_issues_tokens_and_runs_finals_over_the_api(family):
     assert all(d["split"] == "test" for d in view["result"]["datasets"].values())
     assert run.status(sid)["status"] == "registered"                     # the attempt never sees finals
     assert run.tasks()["budget"]["used"] == 0                            # finals cost no budget
-    rotated = store.set_operator()
-    assert op.final(sid)["error"]["code"] == "unauthorized" and Client(url, rotated).final(sid)["status"] == "done"
+    again = op.request_final(sid, again=True)["finals"]
+    assert len(again) == 2 and not set(again) & set(finals)
+    assert op.final(sid.replace("-", "_", 1))["error"]["code"] == "not_found"   # no wildcard match
+    rotated = op.agent_token("run-1", 2, rotate=True)["token"]
+    assert run.tasks()["error"]["code"] == "unauthorized" and Client(url, rotated).tasks()["budget"]
+    new_op = store.set_operator()
+    assert op.final(sid)["error"]["code"] == "unauthorized" and Client(url, new_op).final(sid)["tasks"]

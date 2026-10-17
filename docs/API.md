@@ -3,7 +3,8 @@
 Base URL: `https://eval.biomodelbench.org`. All bodies are JSON unless noted.
 
 **Authentication:** `Authorization: Bearer <token>`.
-- Agents use an agent token (`bmba_…`), issued with `bmb-hub agent-token`.
+- Agents use an agent token (`bmba_…`), issued with `bmb-hub agent-token` or the
+  operator endpoint below.
 - Provider nodes use the node secret they receive when they connect (`bmbn_…`).
 - BioModelBench's harness uses the operator token (`bmbo_…`), issued with
   `bmb-hub operator-token`, to issue each run's agent token and to run final evaluations.
@@ -159,8 +160,8 @@ or `false`. When it's `false`, `metrics` repeats your previous best.
 
 | Endpoint | Body or response |
 |---|---|
-| `POST /v1/operator/agent-tokens` | `{"name": "<attempt>", "evaluations": <int or null>}`. Returns `{"name", "token"}`; reusing a name rotates its token |
-| `POST /v1/operator/submissions/<id>/final` | Queues final (test set) evaluations of a committed or registered submission, one per dataset. Returns `{"finals": ["<id>", …]}` |
+| `POST /v1/operator/agent-tokens` | `{"name": "<attempt>", "evaluations": <int >= 0>, "rotate"?: true}`. Returns `{"name", "token"}`. An existing name is refused (`409 name_taken`) unless `rotate` |
+| `POST /v1/operator/submissions/<id>/final` | `{}` or `{"again": true}`. Queues final (test set) evaluations of a committed or registered submission, one per dataset, and returns `{"finals": ["<id>", …]}`. Idempotent: a dataset that already has a final keeps it unless `again` (each dataset allows only `final_evaluations`) |
 | `GET /v1/operator/submissions/<id>/final` | The latest final evaluation of each dataset, in the family-submission shape: `{"submission_id", "tasks", "status", "result"?}` with `result.datasets` and `result.combined` once every dataset is done |
 
 ## Provider node endpoints (used by `bmb-eval`; listed for reviewers)

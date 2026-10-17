@@ -101,13 +101,17 @@ class Client:
     # Operator token (bmbo_…) only, for automated runs. Like every call here, these
     # return the hub's JSON, {"error": ...} included.
 
-    def agent_token(self, name: str, evaluations: int | None = None) -> dict:
-        """Issue (or rotate) one attempt's agent token with an evaluation budget: {name, token}."""
-        return self._req("POST", "/v1/operator/agent-tokens", {"name": name, "evaluations": evaluations})
+    def agent_token(self, name: str, evaluations: int, rotate: bool = False) -> dict:
+        """Issue one attempt's agent token with an evaluation budget: {name, token}. An
+        existing name is refused unless rotate=True."""
+        return self._req("POST", "/v1/operator/agent-tokens",
+                         {"name": name, "evaluations": evaluations, "rotate": rotate})
 
-    def request_final(self, submission_id: str) -> dict:
-        """Queue final (test set) evaluations of a submission, one per dataset: {finals: [ids]}."""
-        return self._req("POST", f"/v1/operator/submissions/{submission_id}/final", {})
+    def request_final(self, submission_id: str, again: bool = False) -> dict:
+        """Final (test set) evaluations of a submission, one per dataset: {finals: [ids]}.
+        Idempotent: a dataset that already has one keeps it unless again=True, since each
+        dataset allows only a few."""
+        return self._req("POST", f"/v1/operator/submissions/{submission_id}/final", {"again": again})
 
     def final(self, submission_id: str) -> dict:
         """The latest final evaluations of a submission: {status, tasks, result}, where

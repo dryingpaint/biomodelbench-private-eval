@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run a bmb-hub admin command on the hub VM from your laptop:
 #   deploy/gcp/hub agent-token my-agent
-#   deploy/gcp/hub enroll examples/tasks/sequence_regression    (copies the task up first)
+#   deploy/gcp/hub enroll examples/tasks/sequence_regression    (copies the task up first; --replace
+#                                                                to change an enrolled task's package)
 #   deploy/gcp/hub status
 set -euo pipefail
 NAME="${NAME:-bmb-hub}"; ZONE="${ZONE:-us-central1-a}"
@@ -12,12 +13,13 @@ DOMAIN="$(gcloud compute instances describe "$NAME" --zone "$ZONE" --project "$P
 HUB="sudo -u bmb -H /home/bmb/bmb-eval/.venv/bin/bmb-hub --state /home/bmb/hub_state"
 
 if [ "${1:-}" = "enroll" ]; then
-  dir="${2:?usage: hub enroll <task folder>}"
+  dir="${2:?usage: hub enroll <task folder> [--replace]}"
   task="$(basename "$dir")"
+  shift 2
   gcloud compute scp --recurse "$dir" "$NAME:/tmp/bmb-task-$task" --zone "$ZONE" --project "$PROJECT" --quiet
   run "sudo rm -rf /home/bmb/tasks/$task && sudo mkdir -p /home/bmb/tasks && \
        sudo mv /tmp/bmb-task-$task /home/bmb/tasks/$task && sudo chown -R bmb /home/bmb/tasks && \
-       $HUB enroll /home/bmb/tasks/$task --public-url https://$DOMAIN"
+       $HUB enroll /home/bmb/tasks/$task --public-url https://$DOMAIN $*"
 else
   run "$HUB $*"
 fi

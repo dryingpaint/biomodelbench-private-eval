@@ -18,7 +18,7 @@ from .blobs import BlobCache, check_manifest
 from .config import Config
 from .errors import EvalError
 from .runner import Runner
-from .sandbox import gpus_here
+from .sandbox import gpus_here, stale_image_message
 from .store import Store
 
 POLL_S = 5
@@ -27,7 +27,12 @@ HUB_ALERT_AFTER = 60   # consecutive failed hub calls (~5 minutes) before alerti
 
 
 class HubError(Exception):
-    pass
+    """A hub call failed: `status` is the HTTP status the hub answered with, or None
+    when it couldn't be reached."""
+
+    def __init__(self, msg: str, status: int | None = None):
+        super().__init__(msg)
+        self.status = status
 
 
 def parse_connect(link: str, hub: str | None = None) -> tuple[str, str]:
@@ -71,7 +76,7 @@ class HubAPI:
                 msg = json.loads(e.read())["error"]["message"]
             except Exception:
                 msg = f"HTTP {e.code}"
-            raise HubError(msg)
+            raise HubError(msg, e.code)
         except (urllib.error.URLError, OSError) as e:
             raise HubError(f"cannot reach {self.url}: {e}")
 
@@ -139,6 +144,8 @@ class Worker:
         self._hub_failures = 0
         self._unapproved_alerted = False
         self._accepting = (0.0, False)
+        self._hello_rejected: str | None = None
+        self._stale_alerted = False
         self.status: dict | None = None   # set by the sealed node: reported to the hub
 
     # ------------------------------------------------------------- gates
@@ -149,6 +156,14 @@ class Worker:
         checked, ok = self._accepting
         if time.time() - checked < 30:
             return ok
+        if stale := stale_image_message(self.cfg):
+            if not self._stale_alerted:
+                audit.record(self.cfg.state_dir, "sandbox_stale")
+                alerts.send(self.cfg, "infra", stale)
+                self._stale_alerted = True
+            self._accepting = (time.time(), False)
+            return False
+        self._stale_alerted = False
         drift = approval.diff(self.cfg)
         self._accepting = (time.time(), not drift)
         if drift and not self._unapproved_alerted:
@@ -167,9 +182,25 @@ class Worker:
             # Held = anything not yet delivered, including finished results the
             # hub hasn't received; otherwise the hub would re-queue them.
             held = sorted({p.stem for p in self.queue_dir.glob("*.json")} | set(self.store.unposted()))
-            reply = self.api.hello({t: b.contract.public() for t, b in self.cfg.tasks.items()},
-                                   accepting, held, self.status)
-            self._note_updates(reply.get("versions") or {})
+            try:
+                reply = self.api.hello({t: b.contract.public() for t, b in self.cfg.tasks.items()},
+                                       accepting, held, self.status)
+                self._note_updates(reply.get("versions") or {})
+                if self._hello_rejected:
+                    audit.record(self.cfg.state_dir, "hello_accepted")
+                    self._hello_rejected = None
+            except HubError as e:
+                if e.status is None or e.status >= 500:
+                    raise          # hub unreachable: retry the whole step later
+                # The hub refused the hello itself (e.g. too large). Keep evaluating:
+                # jobs and results use other calls. But the hub's view of this node
+                # (new contracts, accepting) is now stale, so tell the operator once.
+                if self._hello_rejected != str(e):
+                    audit.record(self.cfg.state_dir, "hello_rejected", status=e.status, error=str(e)[:200])
+                    alerts.send(self.cfg, "infra", f"the hub rejected this node's check-in (HTTP {e.status}: "
+                                f"{e}); evaluations continue, but task changes won't register until "
+                                "BioModelBench fixes it", status=e.status)
+                    self._hello_rejected = str(e)
             self._last_hello = time.time()
         for sid, payload in self.store.released_unposted():
             try:

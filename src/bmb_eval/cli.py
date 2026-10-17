@@ -22,7 +22,7 @@ import yaml
 
 from . import approval, audit, leakage, scaffold
 from .config import save_yaml
-from .sandbox import ENGINES, detect_engine, gpus_here, make as make_sandbox
+from .sandbox import ENGINES, detect_engine, gpus_here, make as make_sandbox, sandbox_stamp, stale_image_message
 
 IMAGE = "bmb-eval-sandbox:latest"
 
@@ -107,8 +107,8 @@ def cmd_build_image(args) -> None:
             print(f"prebuilt image unavailable ({type(e).__name__}: {e}); building locally instead")
     root = _repo_root()
     print("building the sandbox image (a few minutes the first time)...")
-    subprocess.run([engine, "build", "-q", "-t", IMAGE, "-f", str(root / "sandbox" / "Dockerfile"),
-                    str(root)], check=True)
+    subprocess.run([engine, "build", "-q", "--build-arg", f"BMB_SANDBOX_STAMP={sandbox_stamp(root)}",
+                    "-t", IMAGE, "-f", str(root / "sandbox" / "Dockerfile"), str(root)], check=True)
     print("sandbox image ready")
 
 
@@ -328,8 +328,11 @@ def cmd_connect(args) -> None:
     if not cfg_path.exists():
         cmd_init(argparse.Namespace(config=str(cfg_path), engine="auto", force=False))
     cfg = Config.load(cfg_path)
-    if cfg.backend in ENGINES and make_sandbox(cfg).image_id() == "missing":
+    if cfg.backend in ENGINES and (make_sandbox(cfg).image_id() == "missing" or stale_image_message(cfg)):
         cmd_build_image(argparse.Namespace(config=str(cfg_path), from_url=f"{hub_url}/sandbox-image.tar"))
+    if stale := stale_image_message(cfg):
+        raise SystemExit(f"\nCan't start: {stale}.\nIf the hub is still publishing a new image, "
+                         "wait a few minutes and run the same command again.")
     task_dir = root / "tasks" / task
     task_dir.mkdir(parents=True, exist_ok=True)
     for name, text in pkg["files"].items():
@@ -363,7 +366,9 @@ def cmd_connect(args) -> None:
         raise SystemExit("\nFix it and run the same command again.")
     print(f"✓ Your data looks good ({n_rows:,} rows)")
     if split_counts:
-        print(f"✓ Split at random on this machine: {split_counts[0]:,} validation rows (scored during "
+        how = (f"by the '{contract.split.by_column}' column" if contract.split.by_column
+               else "at random on this machine")
+        print(f"✓ Split {how}: {split_counts[0]:,} validation rows (scored during "
               f"the benchmark), {split_counts[1]:,} test rows (held out for final evaluations)")
 
     if problems := hardware_problems(cfg.tasks[task].contract.limits, root):
@@ -569,6 +574,8 @@ def cmd_check(args) -> None:
         errors.append(f"{cfg.backend} is not running")
     elif make_sandbox(cfg).image_id() == "missing":
         errors.append(f"sandbox image {cfg.image} missing (bmb-eval build-image)")
+    elif stale := stale_image_message(cfg):
+        errors.append(stale)
     elif not cfg.runtime:
         warnings.append("gVisor not configured (optional hardening; see docs/PROVIDER_SETUP.md)")
     for tid, t in cfg.tasks.items():

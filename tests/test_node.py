@@ -1143,3 +1143,107 @@ def test_flood_output_accepts_truncated_delivery():
     flood = next(a for a in ATTACKS if a.name == "flood_output")
     assert flood.expect == "predictions_too_large" and "predictions_invalid" in flood.also
     assert all(not a.also for a in ATTACKS if a.name != "flood_output")
+
+
+# ------------------------------------------- robustness (found stress-testing a 36-task node)
+
+def test_rejected_hello_keeps_the_node_working(connected):
+    # A node's check-in can be refused (it outgrew the hub's size cap). That used to
+    # abort every step, so the node silently stopped taking work.
+    from bmb_eval.node import HubError
+    cfg, store, url, agent = connected
+    w = Worker(cfg)
+    w.step()                                                 # publishes the contract
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+
+    def refused(*a, **k):
+        raise HubError("Body too large.", 413)
+    w.api.hello = refused
+    w._last_hello = 0
+    w.drain()
+    assert agent.status(sid)["status"] == "done"
+    events = [json.loads(l)["event"] for l in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert events.count("hello_rejected") == 1               # recorded (and alerted) once
+
+
+def test_unreachable_hub_still_raises(connected):
+    from bmb_eval.node import HubError
+    cfg, *_ = connected
+    w = Worker(cfg)
+
+    def unreachable(*a, **k):
+        raise HubError("cannot reach the hub")
+    w.api.hello = unreachable
+    with pytest.raises(HubError):
+        w.step()
+
+
+def test_job_reassembles_after_an_interrupted_run(tmp_path):
+    # A restart mid-job leaves the bundle's hard links behind; the re-run used to fail
+    # with SameFileError (copyfile onto its own link) and report infra_error.
+    import hashlib
+    cache = BlobCache(tmp_path / "blobs")
+    blob = b"print('hi')\n"
+    sha = hashlib.sha256(blob).hexdigest()
+    cache.put(sha, len(blob), io.BytesIO(blob).read)
+    files = [{"path": "predict.py", "sha256": sha, "size": len(blob)}]
+    dest = tmp_path / "bundles" / "sid1"
+    cache.assemble(files, dest)
+    cache.assemble(files, dest)                               # interrupted job, run again
+    assert (dest / "predict.py").read_bytes() == blob
+
+
+def test_stale_sandbox_image_is_reported(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    from bmb_eval import sandbox
+    root = Path(sandbox.__file__).resolve().parents[2]
+    stamp = sandbox.sandbox_stamp(root)
+    # Same digest as the hub's `cat $SANDBOX_FILES | sha256sum | cut -c1-16`.
+    shell = subprocess.run("cat " + " ".join(sandbox.SANDBOX_FILES) + " | sha256sum | cut -c1-16",
+                           shell=True, cwd=root, capture_output=True, text=True).stdout.strip()
+    assert stamp == shell
+    cfg = SimpleNamespace(backend="podman", image="bmb-eval-sandbox:latest", runtime=None)
+    monkeypatch.setattr(sandbox.ContainerSandbox, "image_label", lambda self, key: "0123456789abcdef")
+    assert "older than this node's code" in sandbox.stale_image_message(cfg)
+    monkeypatch.setattr(sandbox.ContainerSandbox, "image_label", lambda self, key: stamp)
+    assert sandbox.stale_image_message(cfg) is None
+    assert sandbox.stale_image_message(SimpleNamespace(backend="local")) is None
+
+
+def test_enrolling_a_different_package_needs_replace(tmp_path, capsys):
+    state = str(tmp_path / "h")
+    hub_mod.main(["--state", state, "new-task", "kd", "--tasks-dir", str(tmp_path / "t"),
+                  "--inputs", "id:string,seq:string", "--target", "kd:float", "--key", "id"])
+    task = tmp_path / "t" / "kd"
+    enroll = ["--state", state, "enroll", str(task), "--public-url", "https://hub.example.org"]
+    hub_mod.main(enroll)
+    store = hub_mod.HubStore(Path(state))
+    code = store.code_for("kd")
+    hub_mod.main(enroll)                                      # same package: no new version
+    assert store.enrollment(code)[3] == 1 and "nothing changed" in capsys.readouterr().out
+    text = (task / "contract.yaml").read_text().replace('description: ""', 'description: "other"')
+    (task / "contract.yaml").write_text(text)
+    with pytest.raises(SystemExit, match="contract.yaml"):    # another package under the same id
+        hub_mod.main(enroll)
+    assert store.enrollment(code)[3] == 1
+    hub_mod.main(enroll + ["--replace"])
+    assert store.code_for("kd") == code and store.enrollment(code)[3] == 2
+
+
+def test_connect_names_a_fixed_split(hub, node_dir, provider_files, capsys):
+    # A split taken from the provider's column was announced as "Split at random".
+    import pandas as pd
+    store, url = hub
+    data, task_dir = provider_files
+    df = pd.read_csv(data)
+    df["half"] = ["validation" if i % 2 else "test" for i in range(len(df))]
+    df.to_csv(data, index=False)
+    raw = yaml.safe_load((task_dir / "contract.yaml").read_text())
+    raw["answers"].append({"name": "half", "type": "string"})
+    raw["split"] = {"by_column": "half", "final_evaluations": 1}
+    (task_dir / "contract.yaml").write_text(yaml.safe_dump(raw, sort_keys=False))
+    code, _ = store.add_enrollment(task_dir)
+    _connect(node_dir, url, code, data)
+    out = capsys.readouterr().out
+    assert "Split by the 'half' column" in out and "at random" not in out

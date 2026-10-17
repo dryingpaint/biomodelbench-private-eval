@@ -147,6 +147,25 @@ def _public_status(status: str) -> str:
     return status if status in ("done", "registered") else "pending"
 
 
+def _summary(sid: str, rows) -> dict:
+    """(task, status, result) rows of one submission -> its status and, once every
+    dataset is done, an equal-weight combined headline over the datasets."""
+    status = {_public_status(r[1]) for r in rows}
+    out = {"submission_id": sid, "tasks": [r[0] for r in rows],
+           "status": status.pop() if len(status) == 1 else "pending"}
+    if out["status"] == "done":
+        datasets = {t: json.loads(r) for t, _, r in rows}
+        ok = [d for d in datasets.values() if d.get("status") == "ok"]
+        # Each dataset counts with its own headline metric (a family can mix metrics).
+        heads = {d["headline"] for d in ok}
+        headline = heads.pop() if len(heads) == 1 else ("mean of headlines" if heads else None)
+        vals = [d["metrics"][d["headline"]] for d in ok if d["metrics"].get(d["headline"]) is not None]
+        out["result"] = {"status": "ok" if vals else "error", "headline": headline,
+                         "combined": round(sum(vals) / len(vals), 4) if vals else None,
+                         "datasets_scored": len(vals), "datasets": datasets}
+    return out
+
+
 class HubStore:
     def __init__(self, state: Path):
         self.state = state
@@ -183,29 +202,50 @@ class HubStore:
         row = self.q("SELECT name FROM agents WHERE token_sha256=?", (_h(token),), one=True)
         return row[0] if row else None
 
+    def is_operator(self, token: str) -> bool:
+        op = self.setting("operator")
+        return bool(token) and op is not None and op["token_sha256"] == _h(token)
+
+    def set_operator(self) -> str:
+        """Create or rotate the operator token (bmbo_…): issues agent tokens and requests
+        and reads final evaluations over the API, for automated runs."""
+        token = "bmbo_" + secrets.token_urlsafe(32)
+        self.set_setting("operator", {"token_sha256": _h(token)})
+        return token
+
     def node(self, secret: str) -> str | None:
         row = self.q("SELECT id FROM nodes WHERE secret_sha256=?", (_h(secret),), one=True)
         return row[0] if row else None
 
-    def request_final(self, sid: str) -> str:
+    def _finals_of(self, sid: str) -> list[str]:
+        """Final evaluations of one submission row (ids "<sid>-final<n>"), oldest first.
+        Matched on the exact prefix: LIKE would treat "_" in an id as a wildcard."""
+        pre = sid + "-final"
+        return [r[0] for r in self.q("SELECT id FROM submissions WHERE split='test' "
+                                     "AND substr(id, 1, ?) = ? ORDER BY created", (len(pre), pre))]
+
+    def request_final(self, sid: str, again: bool = True) -> str:
         """Queue a final (test set) evaluation of an existing submission's model.
-        Admin only. The provider's node decides whether it may run (its cap)."""
+        Admin only. The provider's node decides whether it may run (its cap). With
+        again=False, an existing final is returned instead of spending another."""
         row = self.q("SELECT task, agent, manifest FROM submissions WHERE id=? AND split='validation' "
                      "AND status NOT IN ('uploading', 'uploading_final')", (sid,), one=True)
         if not row:
             raise KeyError(f"no committed submission {sid}")
-        n = self.q("SELECT COUNT(*) FROM submissions WHERE id LIKE ?", (sid + "-final%",), one=True)[0]
-        fid = f"{sid}-final{n + 1}"
+        done = self._finals_of(sid)
+        if done and not again:
+            return done[-1]
+        fid = f"{sid}-final{len(done) + 1}"
         self.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, manifest, split) "
                "VALUES (?,?,?,?, 'queued', NULL, NULL, ?, 'test')", (fid, row[0], row[1], time.time(), row[2]))
         return fid
 
-    def request_finals(self, sid: str) -> list[str]:
+    def request_finals(self, sid: str, again: bool = True) -> list[str]:
         """Final evaluations for a task submission, or for every dataset of a
         family submission."""
         children = [r[0] for r in self.q("SELECT id FROM submissions WHERE group_id=? "
                                          "AND split='validation' ORDER BY task", (sid,))]
-        return [self.request_final(c) for c in (children or [sid])]
+        return [self.request_final(c, again) for c in (children or [sid])]
 
     def add_agent(self, name: str, evaluations: int | None = None) -> str:
         """Token for one attempt. `evaluations` caps its submissions across all
@@ -236,22 +276,16 @@ class HubStore:
         q = ("SELECT task, status, result FROM submissions WHERE group_id=? AND split='validation'"
              + (" AND agent=?" if agent else "") + " ORDER BY task")
         rows = self.q(q, (gid, agent) if agent else (gid,))
-        if not rows:
-            return None
-        status = {_public_status(r[1]) for r in rows}
-        out = {"submission_id": gid, "tasks": [r[0] for r in rows],
-               "status": status.pop() if len(status) == 1 else "pending"}
-        if out["status"] == "done":
-            datasets = {t: json.loads(r) for t, _, r in rows}
-            ok = [d for d in datasets.values() if d.get("status") == "ok"]
-            # Each dataset counts with its own headline metric (a family can mix metrics).
-            heads = {d["headline"] for d in ok}
-            headline = heads.pop() if len(heads) == 1 else ("mean of headlines" if heads else None)
-            vals = [d["metrics"][d["headline"]] for d in ok if d["metrics"].get(d["headline"]) is not None]
-            out["result"] = {"status": "ok" if vals else "error", "headline": headline,
-                             "combined": round(sum(vals) / len(vals), 4) if vals else None,
-                             "datasets_scored": len(vals), "datasets": datasets}
-        return out
+        return _summary(gid, rows) if rows else None
+
+    def final_view(self, sid: str) -> dict | None:
+        """The latest final (test set) evaluation of each dataset of a submission, in
+        group_view's shape. Operator only."""
+        children = [r[0] for r in self.q("SELECT id FROM submissions WHERE group_id=? "
+                                         "AND split='validation' ORDER BY task", (sid,))]
+        latest = [f[-1] for f in map(self._finals_of, children or [sid]) if f]
+        rows = [self.q("SELECT task, status, result FROM submissions WHERE id=?", (f,), one=True) for f in latest]
+        return _summary(sid, sorted(rows)) if rows else None
 
     # ----------------------------------------------------------- enrollment
 
@@ -484,6 +518,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._blob_get(m.group(1))
             if p.startswith("/v1/node/"):
                 return self._node_get(p)
+            if p.startswith("/v1/operator/"):
+                return self._operator("GET", p)
             agent = store.agent(self._bearer())
             if agent is None:
                 return self._err(401, "unauthorized", "Missing or invalid token.")
@@ -549,6 +585,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._send(200, out)
             if p.startswith("/v1/node/"):
                 return self._node_post(p)
+            if p.startswith("/v1/operator/"):
+                return self._operator("POST", p)
             agent = store.agent(self._bearer())
             if agent is None:
                 return self._err(401, "unauthorized", "Missing or invalid token.")
@@ -556,6 +594,47 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._submit(agent, m.group(1))
             if m := re.fullmatch(r"/v1/submissions/([\w-]{1,128})/commit", p):
                 return self._commit(agent, m.group(1))
+            self._err(404, "not_found", "No such endpoint.")
+
+        # ---------------------------------------------------------- operator
+
+        def _operator(self, method: str, p: str) -> None:
+            """Automated runs (BioModelBench's harness): issue an attempt's agent token,
+            request final evaluations and read their results."""
+            # Read the body first, even to refuse: a reply sent before the client has
+            # finished sending resets the connection, and the client sees no reply.
+            try:
+                body = self._json_body() if method == "POST" else {}
+            except ValueError:
+                body = None
+            if not store.is_operator(self._bearer()):
+                return self._err(401, "unauthorized", "Missing or invalid token.")
+            if method == "POST" and p == "/v1/operator/agent-tokens":
+                # Always a budget, and an existing name (a live attempt's token) is only
+                # replaced on request: a leaked or buggy caller can't mint unlimited tokens
+                # or silently cut off a running attempt.
+                try:
+                    name, evals = str(body["name"])[:128], body["evaluations"]
+                    if not name or type(evals) is not int or evals < 0:
+                        raise ValueError
+                except (ValueError, KeyError, TypeError):
+                    return self._err(400, "bad_request",
+                                     'Body must be {"name": str, "evaluations": int >= 0, "rotate"?: bool}.')
+                if store.q("SELECT 1 FROM agents WHERE name=?", (name,), one=True) and not body.get("rotate"):
+                    return self._err(409, "name_taken", f"An agent token named {name!r} exists; "
+                                     'send "rotate": true to replace it.')
+                return self._send(200, {"name": name, "token": store.add_agent(name, evals)})
+            if m := re.fullmatch(r"/v1/operator/submissions/([\w-]{1,128})/final", p):
+                if method == "GET":
+                    view = store.final_view(m.group(1))
+                    return self._send(200, view) if view else self._err(
+                        404, "not_found", "No final evaluation for this submission.")
+                if not isinstance(body, dict):
+                    return self._err(400, "bad_request", 'Body must be {} or {"again": true}.')
+                try:
+                    return self._send(202, {"finals": store.request_finals(m.group(1), bool(body.get("again")))})
+                except KeyError:
+                    return self._err(404, "not_found", "No such committed submission.")
             self._err(404, "not_found", "No such endpoint.")
 
         # ------------------------------------------------------------ agents
@@ -797,6 +876,7 @@ def main(argv=None) -> None:
     p = sub.add_parser("revoke", help="cancel an unused connect code")
     p.add_argument("code")
 
+    sub.add_parser("operator-token", help="create or rotate the operator token (API for automated runs)")
     p = sub.add_parser("agent-token", help="create or rotate an agent token (one per attempt)")
     p.add_argument("name")
     p.add_argument("--evaluations", type=int, help="evaluation budget for this attempt, across all datasets")
@@ -891,6 +971,8 @@ def main(argv=None) -> None:
             n = store.db.execute("UPDATE enrollments SET used_by='revoked' WHERE code=? AND used_by IS NULL",
                                  (args.code,)).rowcount
         print(f"revoked {args.code}" if n else f"{args.code} is unknown or already used")
+    elif args.cmd == "operator-token":
+        print(store.set_operator())
     elif args.cmd == "agent-token":
         print(store.add_agent(args.name, args.evaluations))
     elif args.cmd == "family":

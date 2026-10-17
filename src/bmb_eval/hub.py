@@ -601,6 +601,12 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
         def _operator(self, method: str, p: str) -> None:
             """Automated runs (BioModelBench's harness): issue an attempt's agent token,
             request final evaluations and read their results."""
+            # Read the body first, even to refuse: a reply sent before the client has
+            # finished sending resets the connection, and the client sees no reply.
+            try:
+                body = self._json_body() if method == "POST" else {}
+            except ValueError:
+                body = None
             if not store.is_operator(self._bearer()):
                 return self._err(401, "unauthorized", "Missing or invalid token.")
             if method == "POST" and p == "/v1/operator/agent-tokens":
@@ -608,7 +614,6 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 # replaced on request: a leaked or buggy caller can't mint unlimited tokens
                 # or silently cut off a running attempt.
                 try:
-                    body = self._json_body()
                     name, evals = str(body["name"])[:128], body["evaluations"]
                     if not name or type(evals) is not int or evals < 0:
                         raise ValueError
@@ -624,11 +629,10 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                     view = store.final_view(m.group(1))
                     return self._send(200, view) if view else self._err(
                         404, "not_found", "No final evaluation for this submission.")
-                try:
-                    again = bool(self._json_body().get("again"))
-                    return self._send(202, {"finals": store.request_finals(m.group(1), again)})
-                except (ValueError, AttributeError):
+                if not isinstance(body, dict):
                     return self._err(400, "bad_request", 'Body must be {} or {"again": true}.')
+                try:
+                    return self._send(202, {"finals": store.request_finals(m.group(1), bool(body.get("again")))})
                 except KeyError:
                     return self._err(404, "not_found", "No such committed submission.")
             self._err(404, "not_found", "No such endpoint.")

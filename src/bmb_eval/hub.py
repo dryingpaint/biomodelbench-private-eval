@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS submissions (
 """
 ONLINE_S = 120          # a node that polled within this window is "online"
 MAX_JSON_BYTES = 16 << 20   # manifests of large bundles can be a few MB
+MAX_HELLO_BYTES = 4 << 20   # a node's hello carries every task's public contract (~2-6 KB each)
+MAX_RESULT_BYTES = 64 << 10
 URL_TTL = datetime.timedelta(hours=24)
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
 
@@ -664,7 +666,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if node is None:
                 return
             try:
-                body = self._json_body(64 << 10)
+                body = self._json_body(MAX_HELLO_BYTES if p == "/v1/node/hello" else MAX_RESULT_BYTES)
             except ValueError:
                 return self._err(413, "too_large", "Body too large.")
             if p == "/v1/node/hello":

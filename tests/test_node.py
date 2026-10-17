@@ -435,6 +435,16 @@ def test_node_cannot_publish_contract_for_task_it_doesnt_own(connected):
     assert store.q("SELECT 1 FROM node_tasks WHERE task='someone_else'", one=True) is None
 
 
+def test_hello_with_many_contracts_publishes_them(connected):
+    # A node serving dozens of tasks sends every public contract in each hello;
+    # that grows past 64 KB (36 tasks reached it), and a rejected hello silently
+    # stops contract updates.
+    cfg, store, url, agent = connected
+    big = {"id": "binding", "description": "x" * (80 << 10)}
+    HubAPI(url, cfg.hub["secret"]).hello({"binding": big}, True, [])
+    assert [t["contract"]["description"] for t in agent.tasks()["tasks"]] == [big["description"]]
+
+
 def test_install_script_and_code_tarball(hub):
     import urllib.request
     store, url = hub

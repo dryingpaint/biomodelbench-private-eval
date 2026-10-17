@@ -7,6 +7,9 @@
 # it once and publish it from the hub (docs/OPERATOR.md); providers download
 # it instead of building.
 FROM docker.io/library/python:3.12-slim
+# Digest of the code below (sandbox.SANDBOX_FILES); nodes refuse work when it isn't theirs.
+ARG BMB_SANDBOX_STAMP=unstamped
+LABEL bmb.sandbox=$BMB_SANDBOX_STAMP
 
 # libgomp: OpenMP runtime for LightGBM/XGBoost; libxrender/libxext: RDKit drawing deps.
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libxrender1 libxext6 \

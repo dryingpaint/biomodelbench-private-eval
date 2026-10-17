@@ -38,7 +38,8 @@ STAMP="$(cd "$CODE" && cat $SANDBOX_FILES | sha256sum | cut -c1-16)"
 if [ "$(cat "$STATE/sandbox-image.stamp" 2>/dev/null)" != "$STAMP" ] ||
    ! sha256sum --status -c "$STATE/sandbox-image.tar.sha256" 2>/dev/null; then
   rm -f "$STATE/sandbox-image.stamp"
-  (cd "$CODE" && podman build -q -t bmb-eval-sandbox:latest -f sandbox/Dockerfile . >/dev/null)
+  (cd "$CODE" && podman build -q --build-arg BMB_SANDBOX_STAMP="$STAMP" -t bmb-eval-sandbox:latest \
+     -f sandbox/Dockerfile . >/dev/null)
   podman save -o "$STATE/sandbox-image.tar.tmp" bmb-eval-sandbox:latest
   sync
   tar -tf "$STATE/sandbox-image.tar.tmp" >/dev/null

@@ -270,8 +270,7 @@ class HubStore:
         then reports an update, which the provider reviews and approves with
         `bmb-eval update`; until then it keeps serving the approved version."""
         c = Contract.load(task_dir / "contract.yaml")
-        files = {p.name: p.read_text() for p in sorted(task_dir.iterdir())
-                 if p.is_file() and p.suffix in (".yaml", ".py", ".txt", ".json", ".csv", ".tsv")}
+        files = self.package_files(task_dir)
         code = self.code_for(c.id)
         if code:
             self.q("UPDATE enrollments SET files=?, version=version+1 WHERE code=?",
@@ -281,6 +280,11 @@ class HubStore:
             self.q("INSERT INTO enrollments (code, task, files, created, used_by, version) "
                    "VALUES (?,?,?,?,NULL,1)", (code, c.id, json.dumps(files), time.time()))
         return code, c
+
+    @staticmethod
+    def package_files(task_dir: Path) -> dict[str, str]:
+        return {p.name: p.read_text() for p in sorted(task_dir.iterdir())
+                if p.is_file() and p.suffix in (".yaml", ".py", ".txt", ".json", ".csv", ".tsv")}
 
     def enrollment(self, code: str) -> tuple[str, dict, str | None, int] | None:
         row = self.q("SELECT task, files, used_by, version FROM enrollments WHERE code=?", (code,), one=True)
@@ -787,6 +791,8 @@ def main(argv=None) -> None:
     p = sub.add_parser("enroll", help="make a connect code for a task; prints the provider email")
     p.add_argument("task_dir")
     p.add_argument("--public-url", required=True)
+    p.add_argument("--replace", action="store_true",
+                   help="replace an existing task's package even though it differs")
 
     p = sub.add_parser("revoke", help="cancel an unused connect code")
     p.add_argument("code")
@@ -852,8 +858,23 @@ def main(argv=None) -> None:
         except KeyboardInterrupt:
             pass
     elif args.cmd == "enroll":
-        existing = store.code_for(Contract.load(Path(args.task_dir) / "contract.yaml").id)
+        task_id = Contract.load(Path(args.task_dir) / "contract.yaml").id
+        existing = store.code_for(task_id)
         used = existing and store.enrollment(existing)[2]
+        if existing:
+            _, old, _, old_version = store.enrollment(existing)
+            new = store.package_files(Path(args.task_dir))
+            if new == old:
+                print(f"Task {task_id} is already enrolled with this exact package (version "
+                      f"{old_version}); nothing changed. The code stays {existing}.")
+                return
+            if not args.replace:
+                changed = sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+                raise SystemExit(
+                    f"Task {task_id} is already enrolled (version {old_version}"
+                    f"{', connected to a provider' if used else ''}) with a different package; "
+                    f"these files differ: {', '.join(changed)}.\nIf you mean to replace it, run "
+                    f"again with --replace. Use another task id for a separate task.")
         code, c = store.add_enrollment(Path(args.task_dir))
         version = store.enrollment(code)[3]
         if not existing or not used:

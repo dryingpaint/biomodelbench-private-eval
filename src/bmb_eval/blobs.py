@@ -111,7 +111,10 @@ class BlobCache:
                 os.unlink(tmp)
 
     def assemble(self, files: list[dict], dest: Path) -> Path:
-        """Hard-link a bundle's files from the cache into dest."""
+        """Hard-link a bundle's files from the cache into dest. A job interrupted by a
+        restart leaves its links behind; re-linking onto them made copyfile raise
+        SameFileError, so dest starts empty."""
+        shutil.rmtree(dest, ignore_errors=True)
         dest.mkdir(parents=True, exist_ok=True)
         for f in files:
             src, dst = self.path(f["sha256"]), dest / f["path"]

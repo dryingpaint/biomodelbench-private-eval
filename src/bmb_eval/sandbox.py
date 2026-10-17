@@ -62,6 +62,40 @@ class Result:
 
 ENGINES = ("docker", "podman")
 
+# What runs inside the sandbox; deploy/gcp/hub-vm-startup.sh stamps the image it
+# publishes with the same digest (label bmb.sandbox), so a node can tell when its
+# image is older than its code: the validator inside would then fail every run.
+SANDBOX_FILES = ("sandbox/Dockerfile", "sandbox/requirements.txt", "src/bmb_eval/__init__.py",
+                 "src/bmb_eval/contract.py", "src/bmb_eval/errors.py",
+                 "src/bmb_eval/sandbox_entry/__init__.py", "src/bmb_eval/sandbox_entry/predict.py",
+                 "src/bmb_eval/sandbox_entry/validate.py", "src/bmb_eval/sandbox_entry/score.py")
+
+
+def sandbox_stamp(root: Path) -> str | None:
+    """Digest of the sandbox's code, as `cat $SANDBOX_FILES | sha256sum | cut -c1-16`."""
+    import hashlib
+    h = hashlib.sha256()
+    for f in SANDBOX_FILES:
+        if not (root / f).is_file():
+            return None
+        h.update((root / f).read_bytes())
+    return h.hexdigest()[:16]
+
+
+def stale_image_message(cfg) -> str | None:
+    """Why this node's container image can't run its code, or None."""
+    if cfg.backend not in ENGINES:
+        return None
+    root = next((d for d in Path(__file__).resolve().parents if (d / "sandbox" / "Dockerfile").is_file()), None)
+    want = sandbox_stamp(root) if root else None
+    if want is None:
+        return None
+    have = ContainerSandbox(cfg.backend, cfg.image, cfg.runtime).image_label("bmb.sandbox")
+    if have == want:
+        return None
+    return (f"the sandbox image ({have or 'unstamped'}) is older than this node's code ({want}); "
+            "run `bmb-eval build-image` (or re-run the install command) to update it")
+
 
 def detect_engine() -> str | None:
     """First container engine whose daemon/service actually answers."""
@@ -145,6 +179,16 @@ class ContainerSandbox:
         if ids:
             subprocess.run([self.engine, "kill", *ids], capture_output=True)
         return len(ids)
+
+    def image_label(self, key: str) -> str | None:
+        try:
+            r = subprocess.run([self.engine, "image", "inspect", "-f",
+                                "{{index .Config.Labels \"%s\"}}" % key, self.image],
+                               capture_output=True, text=True)
+        except FileNotFoundError:
+            return None
+        v = r.stdout.strip()
+        return v if r.returncode == 0 and v and v != "<no value>" else None
 
     def image_id(self) -> str:
         try:

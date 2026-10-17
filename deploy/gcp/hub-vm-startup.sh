@@ -23,6 +23,11 @@ fi
 as_bmb() { sudo -u bmb -H bash -lc "$*"; }
 as_bmb 'command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null'
 if [ -d "$CODE/.git" ]; then as_bmb "git -C $CODE pull -q"; else as_bmb "git clone -q $REPO $CODE"; fi
+# The VM runs the copy of this script stored in its metadata at setup time. Run the
+# repo's current copy instead, so "push, then reboot" also deploys changes to this script.
+if [ -z "${BMB_STARTUP_REEXEC:-}" ] && ! cmp -s "$0" "$CODE/deploy/gcp/hub-vm-startup.sh"; then
+  BMB_STARTUP_REEXEC=1 exec bash "$CODE/deploy/gcp/hub-vm-startup.sh"
+fi
 as_bmb "cd $CODE && ~/.local/bin/uv venv -q --python 3.12 .venv 2>/dev/null || true; \
         ~/.local/bin/uv pip install -q --python .venv/bin/python -e '.[hub]'"
 as_bmb "mkdir -p $STATE"

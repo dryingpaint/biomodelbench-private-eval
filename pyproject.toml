@@ -15,7 +15,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 hub = ["google-cloud-storage>=2.14", "markdown>=3.5"]   # the hub: Cloud Storage, web pages
-seal = ["cryptography>=42"]                                # providers sealing data (confidential mode)
+# Providers sealing data (confidential mode). cryptography 49+ has no Intel-Mac wheels
+# (it would need a Rust compiler there), so Intel Macs stay on 48.
+seal = ["cryptography>=42; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+        "cryptography>=42,<49; sys_platform == 'darwin' and platform_machine == 'x86_64'"]
 
 [project.scripts]
 bmb-eval = "bmb_eval.cli:main"

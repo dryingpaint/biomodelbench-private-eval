@@ -28,8 +28,9 @@ hardware, that it runs the exact software you approved, with debugging off.
   The project's Owner has all of these. Otherwise ask for these roles:
   Service Usage Admin, Cloud KMS Admin, Cloud KMS CryptoKey Encrypter, Storage
   Admin, Workload Identity Pool Admin.
-- **The Google Cloud CLI (`gcloud`)**, logged in (`gcloud auth login`), on any
-  macOS or Linux computer that has your data.
+- **The Google Cloud CLI (`gcloud`)**, version 450 or newer, logged in
+  (`gcloud auth login`), on any macOS or Linux computer (Intel or ARM) that has
+  your data. Windows: use WSL.
 - **Your data**, as one file or one folder, as described in our email.
 - **Network:** outbound HTTPS to `eval.biomodelbench.org`, Google Cloud
   (`accounts.google.com`, `*.googleapis.com`) and PyPI (`pypi.org`,

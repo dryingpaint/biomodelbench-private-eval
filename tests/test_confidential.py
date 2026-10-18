@@ -315,3 +315,25 @@ def test_selftest_skips_a_task_with_no_validation_rows(tmp_path, monkeypatch):
     monkeypatch.setattr("bmb_eval.runner.Runner", lambda *a, **k: pytest.fail("ran attacks"))
     assert cli._selftest(cfg, "empty", verbose=False) == 0
     assert '"skipped": true' in (tmp_path / "audit.jsonl").read_text()
+
+
+def test_exited_sealed_vm_is_deleted_so_its_disk_frees_quota(hub, provider_files, monkeypatch):  # noqa: F811
+    import time as _t
+    from bmb_eval import sealed_launcher as L
+    from bmb_eval.node import HubAPI
+    store, url = hub
+    _, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    nid = HubAPI(url).activate(code, "sealed-test")["node_id"]
+    store.q("UPDATE nodes SET confidential=?, last_seen=? WHERE id=?",
+            (json.dumps({"BUCKET": "gs://b"}), _t.time() - 3600, nid))
+    store.set_setting(f"sealed_launch:{nid}", {"at": _t.time() - 3600, "zone": "z1"})
+    status = {"value": "RUNNING"}
+    calls = []
+    monkeypatch.setattr(L, "_call", lambda m, u, b=None: calls.append(m) or
+                        ({"status": status["value"]} if m == "GET" else {"status": "DONE"}))
+    monkeypatch.setattr(L, "_wait", lambda op, timeout=300: op)
+    assert L.remove_stopped(store, project="p") == 0 and "DELETE" not in calls   # still running
+    status["value"] = "TERMINATED"
+    assert L.remove_stopped(store, project="p") == 1 and calls[-1] == "DELETE"
+    assert L.remove_stopped(store, project="p") == 0                              # done once

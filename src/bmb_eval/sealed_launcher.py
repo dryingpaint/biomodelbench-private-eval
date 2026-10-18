@@ -143,6 +143,31 @@ def launch(node_id: str, pointers: dict, conf: dict, project: str | None = None,
     return {"error": errors, "place": last}
 
 
+def remove_stopped(store, now: float | None = None, project: str | None = None) -> int:
+    """Delete the VMs of sealed nodes that exited (idle, done or refused). A stopped VM
+    keeps its 300 GB boot disk, which counts against the region's SSD quota, so a few
+    of them block every other sealed node from starting. The disk holds only cached
+    model files; the node's state is in the provider's bucket."""
+    now = now or time.time()
+    n = 0
+    for (nid,) in store.q("SELECT id FROM nodes WHERE confidential IS NOT NULL AND "
+                          "(last_seen IS NULL OR last_seen < ?)", (now - OFFLINE_S,)):
+        rec = store.setting(f"sealed_launch:{nid}") or {}
+        if not rec.get("zone") or rec.get("removed") or now - rec.get("at", 0) < COOLDOWN_S:
+            continue
+        project = project or _project()
+        url = f"{API}/projects/{project}/zones/{rec['zone']}/instances/{instance_name(nid)}"
+        inst = _call("GET", url)
+        status = inst.get("status")
+        if status in LIVE or (not status and inst.get("error", {}).get("code") != 404):
+            continue                                   # running, or the API call failed: later
+        if status:                                     # TERMINATED, STOPPED, SUSPENDED...
+            _wait(_call("DELETE", url))
+            n += 1
+        store.set_setting(f"sealed_launch:{nid}", {**rec, "removed": now})
+    return n
+
+
 def reclaim(store, now: float | None = None) -> int:
     """Jobs held by a sealed node that has gone silent (its VM was preempted or
     died): back to the queue, so they run again when the node restarts."""
@@ -185,6 +210,7 @@ def loop(store, every_s: int = 60) -> threading.Thread:
                 conf = store.setting("confidential")
                 if conf:
                     reclaim(store)
+                    remove_stopped(store)
                 for nid, ptr in (due(store, digest=conf.get("digest")) if conf else []):
                     prev = store.setting(f"sealed_launch:{nid}") or {}
                     store.set_setting(f"sealed_launch:{nid}", {**prev, "at": time.time(), "state": "launching"})

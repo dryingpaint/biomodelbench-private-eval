@@ -4,6 +4,7 @@
 #   deploy/gcp/hub enroll examples/tasks/sequence_regression    (copies the task up first; --replace
 #                                                                to change an enrolled task's package)
 #   deploy/gcp/hub status
+#   deploy/gcp/hub deploy        (update the live hub to the repo's code; no reboot, ~1s pause)
 set -euo pipefail
 NAME="${NAME:-bmb-hub}"; ZONE="${ZONE:-us-central1-a}"
 PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
@@ -12,7 +13,11 @@ DOMAIN="$(gcloud compute instances describe "$NAME" --zone "$ZONE" --project "$P
   python3 -c 'import json, sys; print(next(i["value"] for i in json.load(sys.stdin)["metadata"]["items"] if i["key"] == "domain"))')"
 HUB="sudo -u bmb -H /home/bmb/bmb-eval/.venv/bin/bmb-hub --state /home/bmb/hub_state"
 
-if [ "${1:-}" = "enroll" ]; then
+if [ "${1:-}" = "deploy" ]; then
+  # Update the live hub to the repo's current code without a reboot: everything slow happens
+  # while the old hub serves; the restart itself is about a second, with requests held.
+  run "sudo -u bmb -H git -C /home/bmb/bmb-eval pull -q && sudo bash /home/bmb/bmb-eval/deploy/gcp/hub-deploy.sh"
+elif [ "${1:-}" = "enroll" ]; then
   dir="${2:?usage: hub enroll <task folder> [--replace]}"
   task="$(basename "$dir")"
   shift 2

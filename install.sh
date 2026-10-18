@@ -23,7 +23,9 @@ engine_ok() {
 if ! engine_ok; then
   say "Installing Podman, the sandbox software (asks for your password once)"
   if command -v apt-get >/dev/null; then
-    sudo apt-get update -qq && sudo apt-get install -y -qq podman
+    # dbus-user-session: rootless Podman applies limits through the user's systemd, which
+    # it reaches over the user's D-Bus (Debian's cloud images don't have it).
+    sudo apt-get update -qq && sudo apt-get install -y -qq podman dbus-user-session
   elif command -v dnf >/dev/null; then
     sudo dnf install -y -q podman
   elif command -v yum >/dev/null; then
@@ -53,6 +55,29 @@ if [ "$ENGINE" != "local" ] && [ "$(id -u)" != 0 ] && command -v podman >/dev/nu
   sleep 1
   if ! grep -qw cpu "$UCG" 2>/dev/null; then
     echo "Couldn't give the sandbox CPU limits. Log out and back in, then run the same command again." >&2
+    exit 1
+  fi
+fi
+
+# Rootless Podman without the user's systemd (no D-Bus user session) falls back to
+# "cgroupfs", where memory and process limits aren't applied: the self-test then refuses
+# to start. Install the D-Bus user session (Debian, older Ubuntu) and restart systemd.
+if [ "$ENGINE" != "local" ] && [ "$(id -u)" != 0 ] && command -v podman >/dev/null &&
+   [ -f /sys/fs/cgroup/cgroup.controllers ] &&
+   [ "$(podman info --format '{{.Host.CgroupManager}}' 2>/dev/null)" != systemd ]; then
+  say "Setting up the user session the sandbox needs for its limits"
+  if command -v apt-get >/dev/null; then
+    sudo apt-get install -y -qq dbus-user-session
+  elif command -v dnf >/dev/null; then
+    sudo dnf install -y -q dbus-daemon
+  fi
+  sudo loginctl enable-linger "$(id -un)" 2>/dev/null || true
+  sudo systemctl restart "user@$(id -u).service" 2>/dev/null ||
+    { sleep 5; sudo systemctl restart "user@$(id -u).service" 2>/dev/null; } || true
+  export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  sleep 2
+  if [ "$(podman info --format '{{.Host.CgroupManager}}' 2>/dev/null)" != systemd ]; then
+    echo "The sandbox can't set its limits yet. Log out and back in, then run the same command again." >&2
     exit 1
   fi
 fi

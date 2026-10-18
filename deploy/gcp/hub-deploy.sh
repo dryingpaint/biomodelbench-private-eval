@@ -27,6 +27,10 @@ if [ "$(cat "$STATE/sandbox-image.stamp" 2>/dev/null)" != "$STAMP" ] ||
   rm -f "$STATE/sandbox-image.stamp"
   (cd "$CODE" && podman build -q --build-arg BMB_SANDBOX_STAMP="$STAMP" -t bmb-eval-sandbox:latest \
      -f sandbox/Dockerfile . >/dev/null)
+  # A build interrupted after this point leaves the .tmp behind, and podman save won't
+  # overwrite it ("docker-archive doesn't support modifying existing images"): from
+  # 2026-10-17 every boot failed here and the published image stopped updating.
+  rm -f "$STATE/sandbox-image.tar.tmp"
   podman save -o "$STATE/sandbox-image.tar.tmp" bmb-eval-sandbox:latest
   sync
   tar -tf "$STATE/sandbox-image.tar.tmp" >/dev/null

@@ -39,10 +39,14 @@ head -3` prints the installer.
 GB, and caching on providers' machines means a shared base model is downloaded
 once per provider.
 
-**Updating:** push to the repo, then reboot the VM gracefully:
-`gcloud compute ssh bmb-hub --zone us-central1-a -- sudo reboot`. (Avoid
-`instances reset`, which is a hard power-cycle and can lose recent writes.) On boot the VM
-pulls the code, rebuilds the sandbox image if it changed, and restarts.
+**Updating:** push to the repo, then run `deploy/gcp/hub deploy`. It pulls the code on
+the VM, installs it, rebuilds the sandbox image if it changed and loads the new code into
+memory, all while the running hub keeps serving; then it restarts the hub, which takes about
+a second. Caddy holds requests during that second rather than failing them, and nodes keep
+running their evaluations throughout. Don't reboot the VM to deploy code: a boot repeats all
+of that work with the hub down, minutes on this disk. Reboot only for OS or startup-script
+changes, gracefully (`gcloud compute ssh bmb-hub --zone us-central1-a -- sudo reboot`; avoid
+`instances reset`, a hard power-cycle that can lose recent writes).
 Providers get updates by re-running the install command without arguments;
 their node pauses until they approve the new version.
 

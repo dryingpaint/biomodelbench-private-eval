@@ -1,7 +1,9 @@
 #!/bin/bash
-# Runs as root on every boot of the hub VM (installed by hub-setup.sh).
-# Installs or updates the hub, builds the sandbox image providers download,
-# and runs the hub behind Caddy, which obtains the HTTPS certificate.
+# Runs as root on every boot of the hub VM (installed by hub-setup.sh): system packages,
+# uv and the code, then hub-deploy.sh, which installs the hub, builds the sandbox image
+# providers download, and runs the hub behind Caddy (which obtains the HTTPS certificate).
+# To update the code, don't reboot: `deploy/gcp/hub deploy` runs hub-deploy.sh on the
+# live VM, and the hub is unavailable for about a second, with requests held by Caddy.
 set -euo pipefail
 md() { curl -fsS -H Metadata-Flavor:Google \
   "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1"; }
@@ -28,60 +30,4 @@ if [ -d "$CODE/.git" ]; then as_bmb "git -C $CODE pull -q"; else as_bmb "git clo
 if [ -z "${BMB_STARTUP_REEXEC:-}" ] && ! cmp -s "$0" "$CODE/deploy/gcp/hub-vm-startup.sh"; then
   BMB_STARTUP_REEXEC=1 exec bash "$CODE/deploy/gcp/hub-vm-startup.sh"
 fi
-as_bmb "cd $CODE && ~/.local/bin/uv venv -q --python 3.12 .venv 2>/dev/null || true; \
-        ~/.local/bin/uv pip install -q --python .venv/bin/python -e '.[hub]'"
-as_bmb "mkdir -p $STATE"
-
-# Sandbox image providers download (rebuilt only when its inputs change).
-# Only what runs inside the sandbox: contract checks and the three entry points.
-SANDBOX_FILES="sandbox/Dockerfile sandbox/requirements.txt src/bmb_eval/__init__.py src/bmb_eval/contract.py src/bmb_eval/errors.py src/bmb_eval/sandbox_entry/__init__.py src/bmb_eval/sandbox_entry/predict.py src/bmb_eval/sandbox_entry/validate.py src/bmb_eval/sandbox_entry/score.py"
-STAMP="$(cd "$CODE" && cat $SANDBOX_FILES | sha256sum | cut -c1-16)"
-# Built as root: a boot script has no user login session, which rootless
-# Podman needs. The image is only exported as a file for providers.
-# Published only once complete, flushed to disk and readable, with a checksum
-# providers verify (a reset right after writing once truncated it).
-if [ "$(cat "$STATE/sandbox-image.stamp" 2>/dev/null)" != "$STAMP" ] ||
-   ! sha256sum --status -c "$STATE/sandbox-image.tar.sha256" 2>/dev/null; then
-  rm -f "$STATE/sandbox-image.stamp"
-  (cd "$CODE" && podman build -q --build-arg BMB_SANDBOX_STAMP="$STAMP" -t bmb-eval-sandbox:latest \
-     -f sandbox/Dockerfile . >/dev/null)
-  podman save -o "$STATE/sandbox-image.tar.tmp" bmb-eval-sandbox:latest
-  sync
-  tar -tf "$STATE/sandbox-image.tar.tmp" >/dev/null
-  mv "$STATE/sandbox-image.tar.tmp" "$STATE/sandbox-image.tar"
-  (cd "$STATE" && sha256sum sandbox-image.tar > sandbox-image.tar.sha256)
-  echo "$STAMP" > "$STATE/sandbox-image.stamp"
-  sync
-  chown bmb "$STATE"/sandbox-image.*
-fi
-
-cat > /etc/systemd/system/bmb-hub.service <<UNIT
-[Unit]
-Description=BioModelBench hub
-After=network-online.target
-
-[Service]
-User=bmb
-WorkingDirectory=$CODE
-ExecStart=$CODE/.venv/bin/bmb-hub --state $STATE serve --port 8790 --public-url https://$DOMAIN --bucket $BUCKET --launch-sealed
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-# Model files go straight to Cloud Storage, so the hub only sees small JSON
-# bodies plus the provider downloads it serves (install script, image).
-cat > /etc/caddy/Caddyfile <<CADDY
-$DOMAIN {
-    request_body {
-        max_size 32MB
-    }
-    reverse_proxy 127.0.0.1:8790
-}
-CADDY
-
-systemctl daemon-reload
-systemctl enable --now bmb-hub >/dev/null
-systemctl restart bmb-hub caddy
+exec bash "$CODE/deploy/gcp/hub-deploy.sh"

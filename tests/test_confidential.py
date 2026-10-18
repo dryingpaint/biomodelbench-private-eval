@@ -85,7 +85,7 @@ def test_sealed_node_end_to_end(hub, provider_files, tmp_path, monkeypatch):  # 
     code, _ = store.add_enrollment(_split_task(tmp_path, name="sealed"))
     uploaded = {}
     monkeypatch.setattr(conf, "check_gcloud", lambda project=None: None)
-    monkeypatch.setattr(conf, "setup_provider_cloud", lambda project, digest, sa, gpu: {
+    monkeypatch.setattr(conf, "setup_provider_cloud", lambda project, digest, sa, gpu, region=None: {
         "PROVIDER_PROJECT_NUMBER": "1", "POOL": "bmb-eval", "PROVIDER_ID": "attestation",
         "KEY": "k", "BUCKET": "gs://b"})
     monkeypatch.setattr(conf, "upload_sealed",
@@ -137,7 +137,7 @@ def test_next_bare_code_works_after_a_task_stops_at_bad_data(hub, provider_files
         cli.main(["connect-confidential", first, "--hub", url, "--data", str(tmp_path / "bad.csv"),
                   "--project", "p", "--dir", home, "--yes"])
     uploaded = {}
-    monkeypatch.setattr(conf, "setup_provider_cloud", lambda project, digest, sa, gpu: {
+    monkeypatch.setattr(conf, "setup_provider_cloud", lambda project, digest, sa, gpu, region=None: {
         "PROVIDER_PROJECT_NUMBER": "1", "POOL": "bmb-eval", "PROVIDER_ID": "attestation",
         "KEY": "k", "BUCKET": "gs://b"})
     monkeypatch.setattr(conf, "upload_sealed",

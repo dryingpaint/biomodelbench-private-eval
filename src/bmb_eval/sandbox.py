@@ -325,16 +325,30 @@ class BwrapSandbox:
                          + (sorted(Path("/dev").glob("nvidia*")) if gpus else []))
         bpf = open(self.seccomp, "rb") if self.seccomp else None
         fd = bpf.fileno() if bpf else None
+        done = threading.Event()
+        if gpus:   # no rlimit can cap memory without breaking CUDA: watch it instead
+            threading.Thread(target=self._watch_memory, args=(_bytes(limits.memory), done),
+                             daemon=True).start()
         try:
             return _run(self.cmd(entry=entry, mounts=mounts, env=env, limits=limits, gpus=gpus,
                                  seccomp_fd=fd),
                         timeout_s, stdout_cap, stdin, env={}, on_kill=self.kill_all,
                         preexec=limit, pass_fds=(fd,) if bpf else ())
         finally:
+            done.set()
             self.kill_all()           # nothing a stage started outlives it
             _revoke(granted)
             if bpf:
                 bpf.close()
+
+    def _watch_memory(self, cap: int, done: threading.Event) -> None:
+        """Kill the stage (exit -9: predict_resource_limit) once the sandbox user's
+        anonymous memory passes the limit. GPU memory and shared libraries are
+        file-backed mappings, so they don't count."""
+        while not done.wait(0.05):
+            if sandbox_anon_bytes() > cap:
+                self.kill_all()
+                return
 
     def kill_all(self) -> int:
         return int(subprocess.run(["pkill", "-KILL", "-u", str(SANDBOX_UID)],
@@ -342,6 +356,19 @@ class BwrapSandbox:
 
     def image_id(self) -> str:
         return self._image_id
+
+
+def sandbox_anon_bytes(proc: Path = Path("/proc"), uid: int = SANDBOX_UID) -> int:
+    """Resident anonymous memory (RssAnon) of every process the sandbox user runs."""
+    total = 0
+    for status in proc.glob("[0-9]*/status"):
+        try:
+            fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
+        except OSError:           # the process exited meanwhile
+            continue
+        if fields.get("Uid", "").split()[:1] == [str(uid)] and "RssAnon" in fields:
+            total += int(fields["RssAnon"].split()[0]) << 10
+    return total
 
 
 def _grant(paths: list[Path]) -> list[tuple[Path, int, int]]:

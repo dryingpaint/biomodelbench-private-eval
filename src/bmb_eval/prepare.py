@@ -39,7 +39,16 @@ def read_table(path: Path) -> pd.DataFrame:
         return pd.read_parquet(path)
     if path.suffix not in (".csv", ".tsv", ".txt"):
         raise DataError([f"{path.name}: please provide a .csv, .tsv or .parquet file."])
-    return pd.read_csv(path, sep="\t" if path.suffix in (".tsv", ".txt") else ",")
+    sep = "\t" if path.suffix in (".tsv", ".txt") else ","
+    try:
+        return pd.read_csv(path, sep=sep)
+    except UnicodeDecodeError:
+        # Excel on Windows saves "CSV (Comma delimited)" as cp1252, not UTF-8.
+        try:
+            return pd.read_csv(path, sep=sep, encoding="cp1252")
+        except UnicodeDecodeError:
+            raise DataError([f"{path.name}: please save it as UTF-8 text "
+                             "(in Excel: CSV UTF-8)."]) from None
 
 
 def _json_cells(s: pd.Series) -> pd.Series:

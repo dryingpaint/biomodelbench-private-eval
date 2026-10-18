@@ -342,6 +342,37 @@ def test_connect_explains_bad_file_and_keeps_code(hub, node_dir, provider_files,
     _connect(node_dir, url, code, data)                         # ...and works once fixed
 
 
+def test_bad_value_in_the_test_half_is_found(tmp_path):
+    """A provider's mistake is reported whichever half the split put it in."""
+    import pandas as pd
+    from bmb_eval.config import TaskBinding
+    from bmb_eval.contract import Contract
+    d = scaffold.write_task("assays", tmp_path / "authored",
+                            [("id", "string", False), ("assay", "string", False)],
+                            [("id", "string", False), ("y", "float", False)],
+                            ["id"], "regression", "y")
+    text = (d / "contract.yaml").read_text()
+    (d / "contract.yaml").write_text(text.replace("name: assay, type: string",
+                                                  "name: assay, type: string, allowed: [a, b]"))
+    c = Contract.load(d / "contract.yaml")
+    for half, assays in (("validation", ["a", "b"]), ("test", ["a", "typo"])):
+        (tmp_path / half).mkdir()
+        pd.DataFrame({"id": [f"{half}{i}" for i in range(2)], "assay": assays}).to_parquet(
+            tmp_path / half / "samples.parquet", index=False)
+    pd.DataFrame({"id": ["validation0", "validation1", "test0", "test1"], "y": [1.0, 2, 3, 4]}).to_parquet(
+        tmp_path / "answers.parquet", index=False)
+    t = TaskBinding("assays", d, tmp_path / "validation" / "samples.parquet", tmp_path / "answers.parquet",
+                    c, tmp_path / "validation", None, tmp_path / "test")
+    assert cli.data_problems(t) == ["Column 'assay' in your data file has values that aren't in "
+                                    "the allowed list."]
+
+
+def test_windows_excel_csv_is_read(tmp_path):
+    from bmb_eval.prepare import read_table
+    (tmp_path / "w.csv").write_bytes("id,note\nr1,IC50 in µM at 37 °C\n".encode("cp1252"))
+    assert read_table(tmp_path / "w.csv")["note"][0] == "IC50 in µM at 37 °C"
+
+
 def test_one_file_is_split_and_extra_columns_dropped(connected):
     import pandas as pd
     cfg, *_ = connected

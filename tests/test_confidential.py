@@ -65,6 +65,17 @@ def test_bwrap_sandbox_command(tmp_path):
     assert "/" not in [cmd[i + 1] for i, c in enumerate(cmd) if c == "--ro-bind"]   # never the whole root
 
 
+def test_gpu_stage_memory_is_watched(tmp_path):
+    from bmb_eval.sandbox import sandbox_anon_bytes
+    for pid, uid, anon in (("1", 0, 900000), ("2", 65534, 300000), ("3", 65534, 400000)):
+        (tmp_path / pid).mkdir()
+        (tmp_path / pid / "status").write_text(f"Name:\tpython3\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+                                               f"RssAnon:\t{anon} kB\nRssFile:\t999999 kB\n")
+    (tmp_path / "4").mkdir()
+    (tmp_path / "4" / "status").write_text("Name:\tkthreadd\nUid:\t65534\n")   # kernel thread: no Rss
+    assert sandbox_anon_bytes(tmp_path) == 700000 << 10
+
+
 def test_sealed_node_end_to_end(hub, provider_files, tmp_path, monkeypatch):  # noqa: F811
     """Provider seals (fake cloud) -> sealed node unseals -> agent gets a score."""
     store, url = hub
@@ -106,6 +117,33 @@ def test_sealed_node_end_to_end(hub, provider_files, tmp_path, monkeypatch):  # 
     Worker(cfg).drain()
     res = agent.status(sid)["result"]
     assert res["status"] == "ok" and res["split"] == "validation"
+
+
+def test_next_bare_code_works_after_a_task_stops_at_bad_data(hub, provider_files, tmp_path,  # noqa: F811
+                                                            monkeypatch):
+    """As in a multi-task email: the first command (with the hub) hits a data problem;
+    the next task's command has just the code."""
+    import pandas as pd
+    store, url = hub
+    data, _ = provider_files
+    store.set_setting("confidential", {"image": f"r/sealed@{DIGEST}", "digest": DIGEST,
+                                       "workload_sa": "wl@p", "hardware": "test"})
+    first, _ = store.add_enrollment(_split_task(tmp_path, name="first"))
+    second, _ = store.add_enrollment(_split_task(tmp_path, name="second"))
+    monkeypatch.setattr(conf, "check_gcloud", lambda: None)
+    pd.read_csv(data).drop(columns=["sequence"]).to_csv(tmp_path / "bad.csv", index=False)
+    home = str(tmp_path / "provider")
+    with pytest.raises(SystemExit, match="Fix it"):
+        cli.main(["connect-confidential", first, "--hub", url, "--data", str(tmp_path / "bad.csv"),
+                  "--project", "p", "--dir", home, "--yes"])
+    uploaded = {}
+    monkeypatch.setattr(conf, "setup_provider_cloud", lambda project, digest, sa, gpu: {
+        "PROVIDER_PROJECT_NUMBER": "1", "POOL": "bmb-eval", "PROVIDER_ID": "attestation",
+        "KEY": "k", "BUCKET": "gs://b"})
+    monkeypatch.setattr(conf, "upload_sealed",
+                        lambda project, key, bucket, task, plaintext: uploaded.update({task: plaintext}))
+    cli.main(["connect-confidential", second, "--data", str(data), "--dir", home, "--yes"])
+    assert set(uploaded) == {"second"}
 
 
 def test_hub_confidential_endpoints(hub):  # noqa: F811

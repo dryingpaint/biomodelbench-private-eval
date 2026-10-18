@@ -165,6 +165,14 @@ ATTACKS = [
         predict = baseline
         '''), "predict_resource_limit", container_only=True, limits={"memory": "512m"}),
 
+    Attack("memory_gpu", "allocate past the memory limit in a GPU stage", textwrap.dedent('''\
+        def load_model():
+            hog = []
+            for _ in range(64):
+                hog.append(bytearray(64 << 20))  # 4 GiB total
+        predict = baseline
+        '''), "predict_resource_limit", container_only=True, gpu_only=True, limits={"memory": "512m"}),
+
     Attack("timeout", "run past the time limit", textwrap.dedent('''\
         import time
         def predict(df):

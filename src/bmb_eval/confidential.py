@@ -232,6 +232,11 @@ def cmd_connect_confidential(args) -> None:
         conf = api._req("GET", "/v1/confidential")
     except HubError as e:
         raise SystemExit(f"Couldn't use that connect link: {e}")
+    # Remember the hub and project now, so the next task's bare code works even if
+    # this one stops at a data problem or isn't approved.
+    state.update(hub=hub_url, project=project)
+    state_path.write_text(json.dumps(state, indent=2))
+    os.chmod(state_path, 0o600)
     task = pkg["task"]
     print(f"Connecting to BioModelBench for task '{task}' (sealed: your data stays encrypted)...")
     task_dir = home / "tasks" / task

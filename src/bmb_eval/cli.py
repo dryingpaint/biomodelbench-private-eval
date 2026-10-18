@@ -139,6 +139,9 @@ def data_problems(t) -> list[str]:
             out.append(f"Can't find your data file at {path}.")
             continue
         df = pd.read_parquet(path)
+        if label == "inputs" and t.test_inputs and t.test_inputs.exists():
+            # Split task: check both halves, or a bad value's detection depends on the split.
+            df = pd.concat([df, pd.read_parquet(t.test_inputs)], ignore_index=True)
         frames[label] = df
         bad = check_frame(fields, df, strict_columns=False, key=c.key)
         if not bad:
@@ -154,10 +157,7 @@ def data_problems(t) -> list[str]:
             out.append(f"Column '{col}' in your data file "
                        + REASON_TEXT.get(reason, reason).format(type=ftype) + ".")
     if len(frames) == 2 and not out:
-        inputs_all = frames["inputs"]
-        if t.test_inputs and t.test_inputs.exists():   # split task: both halves together
-            inputs_all = pd.concat([inputs_all, pd.read_parquet(t.test_inputs)], ignore_index=True)
-        ik = set(map(tuple, inputs_all[c.key].astype(str).to_numpy()))
+        ik = set(map(tuple, frames["inputs"][c.key].astype(str).to_numpy()))
         ak = set(map(tuple, frames["answers"][c.key].astype(str).to_numpy()))
         if ik != ak:
             out.append(f"The inputs and answers must list the same IDs: {len(ik - ak)} input "

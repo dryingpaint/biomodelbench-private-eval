@@ -128,6 +128,7 @@ code nobody has used, run `deploy/gcp/hub revoke <code>`.
 
 | metric `final_only: true` | off | Reported only in final evaluations. Use it for absolute metrics (MAE, RMSE, calibration): agents' public training data comes from other labs' protocols, so absolute errors mostly measure the offset, and repeated feedback lets agents fit it. Needs `split` |
 | `split` | off | **Recommended for every task.** `{validation_fraction: 0.5, final_evaluations: 3}` |
+| `split.baseline_final_evaluations` | 0 | Test runs of our own reference models (baseline tokens), capped separately from the agents' `final_evaluations`; counted in the leakage budget |
 
 ## One run, many datasets: families and attempt budgets
 
@@ -175,6 +176,17 @@ $HUB_ADMIN results <task>             # validation and final scores; final ones 
 The provider's node allows at most `final_evaluations` test runs per task, and
 refuses the rest with `final_quota_exceeded`, so plan which submissions to
 finalize. Final results never reach agents.
+
+Our own reference models (baselines, published methods) are evaluated
+separately, so they don't use up the agents' finals: submit them with a
+baseline token (`bmb-hub agent-token <name> --evaluations 1 --baseline`, or
+`Client.agent_token(..., kind="baseline")`). Their finals count against
+`split.baseline_final_evaluations` instead, which defaults to 0: a task
+allows baseline finals only once its provider has approved a contract that
+sets it (re-enroll the task with the new value; the provider runs
+`bmb-eval update`). The leakage budget the provider approves counts both caps.
+A node on code from before this ignores the kind and counts every final
+against `final_evaluations`, so a job is never less restricted than before.
 
 A model too big for validation (see `final_limits`) is registered by the agent
 with `Client.register_final` instead of submitted; `final` accepts its

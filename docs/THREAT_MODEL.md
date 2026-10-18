@@ -59,7 +59,10 @@ Two further points the proposal does not address:
   - Agents are only ever shown, and scored on, the validation rows.
   - BioModelBench requests final evaluations on the test rows
     (`bmb-hub final`). The node runs at most `final_evaluations` of them,
-    enforced on the provider's machine.
+    enforced on the provider's machine. BioModelBench's own reference
+    models have a separate cap, `baseline_final_evaluations` (default 0).
+    A hub that mislabels agents' finals as baselines gets at most both
+    caps together, which is the budget the provider approved.
   - Final scores are visible to BioModelBench only. Only the final score
     counts.
 

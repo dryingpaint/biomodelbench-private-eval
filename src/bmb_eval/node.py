@@ -374,14 +374,22 @@ class Worker:
             return
         t = self.cfg.tasks.get(task)
         split = job.get("split", "validation")
+        # Only "baseline" (BioModelBench's reference models, a baseline token at the hub)
+        # has its own final cap; anything else counts as an agent's, as before kinds existed.
+        kind = "baseline" if job.get("kind") == "baseline" else "agent"
         lim = t.contract.limits_for(split, sealed=self.cfg.sealed) if t else None
         refusal, files = None, []
         if t is None or split not in ("validation", "test"):
             refusal = EvalError("task_unknown")
         elif split == "test" and not (t.contract.split and t.test_inputs_dir):
             refusal = EvalError("no_test_split")
-        elif split == "test" and self.store.count_final(task) >= t.contract.split.final_evaluations:
+        elif split == "test" and self.store.count_final(task, kind) >= (
+                t.contract.split.baseline_final_evaluations if kind == "baseline"
+                else t.contract.split.final_evaluations):
             # Enforced here, not at the hub: even a compromised hub can't run the test set again.
+            # A hub that mislabels jobs gets at most both caps together, which is what the
+            # provider approved (leakage counts both). A node on code from before kinds
+            # ignores the field and counts every final against final_evaluations.
             refusal = EvalError("final_quota_exceeded")
         elif split == "test" and lim.gpus and len(gpus_here()) < lim.gpus:
             # Refused before it counts, so the final can run once GPUs are added.
@@ -407,14 +415,14 @@ class Worker:
         if refusal:
             # Data-independent refusal: answer immediately, never run anything.
             # A refused test job isn't counted as a final evaluation.
-            self.store.add(sid, task, submitter, 0, "test_refused" if split == "test" else split)
+            self.store.add(sid, task, submitter, 0, "test_refused" if split == "test" else split, kind)
             self.store.finish(sid, {"run_id": sid, "task": task, "status": "error",
                                     "error": refusal.public()})
             return
         (self.queue_dir / f"{sid}.json").write_text(json.dumps(
             {"files": files, "bundle_id": job.get("bundle_id"), "split": split}))
-        self.store.add(sid, task, submitter, lim.release_after_s, split)
-        audit.record(self.cfg.state_dir, "job_received", run_id=sid, task=task, split=split,
+        self.store.add(sid, task, submitter, lim.release_after_s, split, kind)
+        audit.record(self.cfg.state_dir, "job_received", run_id=sid, task=task, split=split, kind=kind,
                      submitter=submitter, bundle_id=job.get("bundle_id"),
                      bytes=sum(f["size"] for f in files), downloaded=fetched)
         self.store.start(sid)

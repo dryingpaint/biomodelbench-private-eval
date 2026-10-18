@@ -30,7 +30,7 @@ if ! curl -fsSL "$HUB/bmb-eval.tar.gz" | tar -xz -C "$DIR/app"; then
   echo "Couldn't download from $HUB. This computer needs to reach it over HTTPS." >&2
   exit 1
 fi
-if [ ! -x "$DIR/bin/uv" ] || [ "$("$DIR/bin/uv" --version 2>/dev/null)" != "uv $UV_VERSION" ]; then
+if [ "$("$DIR/bin/uv" --version 2>/dev/null | cut -d' ' -f2)" != "$UV_VERSION" ]; then
   if ! curl -fsSL "$HUB/dl/uv/$UV_VERSION/uv-$UV_TARGET.tar.gz" | tar -xz -C "$DIR/bin" --strip-components 1; then
     echo "Couldn't download uv (the Python installer) from $HUB." >&2
     exit 1

@@ -19,7 +19,7 @@ if [ -n "${BMB_HUB:-}" ]; then
     *) echo "This runs on x86_64 or ARM Linux; this machine is $(uname -m)." >&2; exit 1 ;;
   esac
   mkdir -p bin
-  if [ "$(bin/uv --version 2>/dev/null)" != "uv $UV_VERSION" ] &&
+  if [ "$(bin/uv --version 2>/dev/null | cut -d' ' -f2)" != "$UV_VERSION" ] &&
      ! curl -fsSL "$BMB_HUB/dl/uv/$UV_VERSION/uv-$UV_TARGET.tar.gz" | tar -xz -C bin --strip-components 1; then
     echo "Couldn't download uv (the Python installer) from $BMB_HUB." >&2
     exit 1
@@ -28,8 +28,9 @@ if [ -n "${BMB_HUB:-}" ]; then
   export UV_PYTHON_INSTALL_MIRROR="$BMB_HUB/dl/python" UV_PYTHON_INSTALL_DIR="$PWD/python" \
          UV_CACHE_DIR="$PWD/cache" UV_NATIVE_TLS=1
   if [ -z "${UV_DEFAULT_INDEX:-}" ]; then
-    INDEX="${PIP_INDEX_URL:-$(cat "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf" /etc/pip.conf \
-      /etc/xdg/pip/pip.conf 2>/dev/null | sed -n 's/^[[:space:]]*index-url[[:space:]]*=[[:space:]]*//p' | head -n 1)}"
+    # (no pip.conf is the usual case: cat fails, which pipefail would turn into an exit)
+    INDEX="${PIP_INDEX_URL:-$({ cat "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf" /etc/pip.conf \
+      /etc/xdg/pip/pip.conf 2>/dev/null || true; } | sed -n 's/^[[:space:]]*index-url[[:space:]]*=[[:space:]]*//p' | head -n 1)}"
     if [ -n "$INDEX" ]; then export UV_DEFAULT_INDEX="$INDEX"; fi
   fi
 else

@@ -47,7 +47,10 @@ if [ "$ENGINE" != "local" ] && [ "$(id -u)" != 0 ] && command -v podman >/dev/nu
   printf '[Service]\nDelegate=cpu cpuset io memory pids\n' |
     sudo tee /etc/systemd/system/user@.service.d/delegate.conf >/dev/null
   sudo systemctl daemon-reload
-  sudo systemctl restart "user@$(id -u).service"
+  # Right after installing Podman (its user units), the first restart can fail: retry.
+  sudo systemctl restart "user@$(id -u).service" 2>/dev/null ||
+    { sleep 5; sudo systemctl restart "user@$(id -u).service" 2>/dev/null; } || true
+  sleep 1
   if ! grep -qw cpu "$UCG" 2>/dev/null; then
     echo "Couldn't give the sandbox CPU limits. Log out and back in, then run the same command again." >&2
     exit 1

@@ -44,6 +44,7 @@ PREFIX = "bmb"                    # object prefix in the provider's bucket
 POOL_ID = "bmb-eval"              # workload identity pool in the provider's project
 PROVIDER_ID = "attestation"
 LOCATION = "us-central1"
+MIN_GCLOUD = (450, 0)             # 400 lacks `gcloud storage buckets`; 450 and 500 tested
 TOKEN = "/run/container_launcher/attestation_verifier_claims_token"
 IDLE_EXIT_S = int(os.environ.get("BMB_IDLE_EXIT_S", "1200"))
 
@@ -157,11 +158,28 @@ def _exists(*args: str, project: str) -> bool:
     return False
 
 
-def check_gcloud() -> None:
+def check_gcloud(project: str | None = None) -> None:
     if not shutil.which("gcloud"):
         raise SystemExit("This needs the Google Cloud CLI (gcloud): https://cloud.google.com/sdk/docs/install")
+    r = subprocess.run(["gcloud", "version", "--format=json"], capture_output=True)
+    try:
+        version = json.loads(r.stdout)["Google Cloud SDK"]
+        old = tuple(map(int, version.split(".")[:2])) < MIN_GCLOUD
+    except (ValueError, KeyError, TypeError):
+        version, old = "unknown", False
+    if old:
+        raise SystemExit(f"Your Google Cloud CLI is version {version}; this needs "
+                         f"{MIN_GCLOUD[0]} or newer. Update it (`gcloud components update`, or "
+                         "your package manager) and run the same command again.")
     if subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True).returncode:
         raise SystemExit("Log in to Google Cloud first:  gcloud auth login")
+    if project:     # a mistyped project, or one you can't manage, shows now, not after approving
+        try:
+            _gcloud("services", "list", "--enabled", "--limit", "1",
+                    "--format=value(config.name)", project=project)
+        except GcloudError as e:
+            raise SystemExit(f"Can't use Google Cloud project '{project}'. Check its ID and that "
+                             f"you have the roles in the guide.\n{e}") from None
 
 
 def setup_provider_cloud(project: str, digest: str, workload_sa: str, gpu_preview: bool) -> dict:
@@ -243,7 +261,7 @@ def cmd_connect_confidential(args) -> None:
     project = args.project or state.get("project")
     if not project:
         raise SystemExit("Add --project <your Google Cloud project id>.")
-    check_gcloud()
+    check_gcloud(project)
 
     api = HubAPI(hub_url, state.get("secret"))
     try:

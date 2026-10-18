@@ -1552,3 +1552,18 @@ def test_next_bare_code_works_after_a_connect_stops_at_bad_data(hub, node_dir, p
                   "--yes", "--no-service"])
     except SystemExit as e:
         assert "connect code" not in str(e)
+
+
+def test_sign_all_gives_one_url_per_distinct_file():
+    from bmb_eval.hub import sign_all
+
+    class Blobs:
+        def download(self, agent, sha, size):
+            time.sleep(0.01)
+            return f"https://x/{agent}/{sha}/{size}"
+
+    files = [{"sha256": f"{i:064x}", "size": i} for i in range(200)] + [{"sha256": f"{0:064x}", "size": 0}]
+    t = time.time()
+    urls = sign_all(Blobs(), "a", files)
+    assert len(urls) == 200 and urls[f"{5:064x}"] == f"https://x/a/{5:064x}/5"
+    assert time.time() - t < 1.0                      # concurrent, not 2 s one by one

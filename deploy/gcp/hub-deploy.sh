@@ -23,7 +23,9 @@ STAMP="$(cd "$CODE" && cat $SANDBOX_FILES | sha256sum | cut -c1-16)"
 # Published only once complete, flushed to disk and readable, with a checksum
 # providers verify (a reset right after writing once truncated it).
 if [ "$(cat "$STATE/sandbox-image.stamp" 2>/dev/null)" != "$STAMP" ] ||
-   ! sha256sum --status -c "$STATE/sandbox-image.tar.sha256" 2>/dev/null; then
+   ! (cd "$STATE" && sha256sum --status -c sandbox-image.tar.sha256 2>/dev/null); then
+  # (The checksum file names the image relatively: checked from anywhere else it always
+  # failed, so every boot and deploy rebuilt and re-saved the 6.8 GB image.)
   rm -f "$STATE/sandbox-image.stamp"
   (cd "$CODE" && podman build -q --build-arg BMB_SANDBOX_STAMP="$STAMP" -t bmb-eval-sandbox:latest \
      -f sandbox/Dockerfile . >/dev/null)

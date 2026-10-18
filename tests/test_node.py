@@ -134,6 +134,14 @@ def test_gate_rounds_and_allows_declared_null():
     assert out == {"spearman": None, "pearson": 0.123, "rmse": 1.0}
 
 
+def test_gate_clamps_floating_point_past_a_bound():
+    # sklearn can return a perfect score as 1.0000000000000002; the contract's max is 1.
+    out = gate_metrics(_contract(), b'{"spearman": 1.0000000000000002, "pearson": -1.0000000000000002, "rmse": 1}')
+    assert out["spearman"] == 1.0 and out["pearson"] == -1.0
+    with pytest.raises(EvalError):                     # a real excess still fails
+        gate_metrics(_contract(), b'{"spearman": 1.001, "pearson": 0.1, "rmse": 1}')
+
+
 def test_gate_rejects_nan():
     with pytest.raises(EvalError):
         gate_metrics(_contract(), b'{"spearman": NaN, "pearson": 0.1, "rmse": 1}')

@@ -603,6 +603,9 @@ def from_canonical(contract: Contract, data: bytes, n_rows: int) -> pd.DataFrame
 # Output gate: the last check before anything leaves the node
 # ---------------------------------------------------------------------------
 
+BOUND_EPS = 1e-9   # metric values this close past a declared bound are clamped to it
+
+
 def gate_metrics(contract: Contract, raw: bytes, split: str = "validation") -> dict[str, Any]:
     """Parse scorer output and return the exportable metrics dict.
 
@@ -637,6 +640,12 @@ def gate_metrics(contract: Contract, raw: bytes, split: str = "validation") -> d
             raise violation(f"{name} has type {type(v).__name__}")
         if not math.isfinite(v):
             raise violation(f"{name} not finite")
+        # Floating-point error can land a perfect score a hair past its bound (an AUPRC of
+        # 1.0000000000000002 failed two bacdive_gram finals): within BOUND_EPS it is the bound.
+        if m.max is not None and m.max < v <= m.max + BOUND_EPS:
+            v = m.max
+        if m.min is not None and m.min - BOUND_EPS <= v < m.min:
+            v = m.min
         if m.min is not None and v < m.min or m.max is not None and v > m.max:
             raise violation(f"{name} out of bounds")
         if m.type == "int" and float(v) != int(v):

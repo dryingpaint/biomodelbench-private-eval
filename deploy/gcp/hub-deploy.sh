@@ -91,7 +91,9 @@ systemctl enable bmb-hub caddy >/dev/null
 systemctl restart bmb-hub
 if systemctl is-active -q caddy; then systemctl reload caddy; else systemctl restart caddy; fi
 for i in $(seq 1 60); do
-  curl -fsS -o /dev/null http://127.0.0.1:8790/v1/tasks && { echo "hub is serving the new code"; exit 0; }
+  # Any HTTP answer means it's up (/v1/tasks wants a token: 401 without one).
+  code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8790/v1/tasks || true)"
+  [ "$code" != "000" ] && { echo "hub is serving the new code (HTTP $code)"; exit 0; }
   sleep 1
 done
 echo "the hub didn't answer within 60s after the restart; see: journalctl -u bmb-hub" >&2

@@ -120,6 +120,7 @@ class GCSBlobs:
             credentials, project = google.auth.default()
         self._creds = credentials
         self._request = gauth_requests.Request()
+        self._refresh_lock = threading.Lock()
         self.bucket = storage.Client(project=project, credentials=self._creds).bucket(bucket)
 
     def _name(self, agent: str, sha: str) -> str:
@@ -128,9 +129,11 @@ class GCSBlobs:
     def _sign(self, agent: str, sha: str, method: str, **kw) -> str:
         signer = {}
         if hasattr(self._creds, "service_account_email") and not hasattr(self._creds, "signer"):
-            # Compute Engine credentials sign through the IAM API.
-            if not self._creds.valid:
-                self._creds.refresh(self._request)
+            # Compute Engine credentials sign through the IAM API. Signing runs in parallel
+            # (sign_all): refresh the token under a lock, once.
+            with self._refresh_lock:
+                if not self._creds.valid:
+                    self._creds.refresh(self._request)
             signer = {"service_account_email": self._creds.service_account_email,
                       "access_token": self._creds.token}
         return self.bucket.blob(self._name(agent, sha)).generate_signed_url(
@@ -478,6 +481,22 @@ def render_page(md_text: str, public_url: str) -> bytes:
     return PAGE.format(title=title, body=body).encode()
 
 
+SIGN_THREADS = 32
+
+
+def sign_all(blobs, agent: str, files: list[dict]) -> dict[str, str]:
+    """A download URL per distinct file, signed concurrently. On GCS each signature is an
+    IAM API call (~0.1 s); a 1,482-file bundle took minutes one by one, past the node's 60 s
+    read timeout, so the job was handed out, timed out and requeued over and over."""
+    from concurrent.futures import ThreadPoolExecutor
+    uniq = {f["sha256"]: f for f in files}
+    if len(uniq) <= 4:
+        return {sha: blobs.download(agent, sha, f["size"]) for sha, f in uniq.items()}
+    with ThreadPoolExecutor(min(SIGN_THREADS, len(uniq))) as ex:
+        urls = list(ex.map(lambda f: blobs.download(agent, f["sha256"], f["size"]), uniq.values()))
+    return dict(zip(uniq, urls))
+
+
 def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_bundle_gb: int):
     max_bundle = max_bundle_gb << 30
     tarball = code_tarball(repo_root)
@@ -817,8 +836,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if not row:
                 return self._send(204)
             manifest = json.loads(row[3])
-            downloads = {f["sha256"]: blobs.download(row[2], f["sha256"], f["size"])
-                         for f in manifest["files"]}
+            downloads = sign_all(blobs, row[2], manifest["files"])
             self._send(200, {"submission_id": row[0], "task": row[1], "submitter": row[2],
                              "split": row[4], "kind": row[5],
                              "manifest": manifest, "bundle_id": manifest_id(manifest),

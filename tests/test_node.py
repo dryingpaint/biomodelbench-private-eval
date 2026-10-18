@@ -1310,3 +1310,27 @@ def test_operator_issues_tokens_and_runs_finals_over_the_api(family):
     assert run.tasks()["error"]["code"] == "unauthorized" and Client(url, rotated).tasks()["budget"]
     new_op = store.set_operator()
     assert op.final(sid)["error"]["code"] == "unauthorized" and Client(url, new_op).final(sid)["tasks"]
+
+
+def test_executable_bundle_files_stay_executable(tmp_path):
+    # bacdive_multitrait 20261017T193938-codex-high-hub shipped bin/diamond and failed with
+    # "Permission denied": bundle files were assembled read-only and not executable.
+    import hashlib
+    b = tmp_path / "bundle"
+    (b / "bin").mkdir(parents=True)
+    (b / "predict.py").write_text("def predict(df): return df")
+    (b / "bin" / "tool").write_text("#!/bin/sh\necho ok\n")
+    os.chmod(b / "bin" / "tool", 0o755)
+    m = manifest_for(b)
+    by_path = {f["path"]: f for f in m["files"]}
+    assert by_path["bin/tool"].get("executable") is True and "executable" not in by_path["predict.py"]
+    files = check_manifest(m, 1 << 30)
+    c = BlobCache(tmp_path / "cache")
+    for f in files:
+        data = (b / f["path"]).read_bytes()
+        c.put(f["sha256"], len(data), io.BytesIO(data).read)
+    out = c.assemble(files, tmp_path / "assembled")
+    assert os.access(out / "bin" / "tool", os.X_OK) and not os.access(out / "predict.py", os.X_OK)
+    assert not os.access(c.path(by_path["bin/tool"]["sha256"]), os.X_OK)   # the shared blob is untouched
+    with pytest.raises(EvalError):                                          # only `true` is accepted
+        check_manifest({"files": [{**by_path["predict.py"], "executable": "yes"}]}, 1 << 30)

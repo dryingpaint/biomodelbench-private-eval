@@ -43,13 +43,22 @@ def manifest_for(bundle_dir: Path) -> dict:
             continue
         if p.is_symlink() or not p.is_file():
             raise ValueError(f"{p}: bundles may contain only regular files")
-        files.append({"path": p.relative_to(bundle_dir).as_posix(),
-                      "sha256": file_sha256(p), "size": p.stat().st_size})
+        f = {"path": p.relative_to(bundle_dir).as_posix(),
+             "sha256": file_sha256(p), "size": p.stat().st_size}
+        if p.stat().st_mode & 0o111:
+            f["executable"] = True        # only then: other manifests stay exactly as before
+        files.append(f)
     return {"files": files}
 
 
 def manifest_id(m: dict) -> str:
     return hashlib.sha256(json.dumps(m, sort_keys=True).encode()).hexdigest()
+
+
+# A file entry: path, sha256 and size, plus "executable": true for a program the model runs
+# (a compiled tool such as diamond or hmmsearch shipped in bin/). Without it every bundle
+# file was read-only and not executable, and such models failed with Permission denied.
+FILE_KEYS = {"path", "sha256", "size", "executable"}
 
 
 def check_manifest(m, max_bytes: int) -> list[dict]:
@@ -59,7 +68,8 @@ def check_manifest(m, max_bytes: int) -> list[dict]:
         raise EvalError("bundle_invalid", internal="manifest files")
     seen, total = set(), 0
     for f in files:
-        if not isinstance(f, dict) or set(f) != {"path", "sha256", "size"}:
+        if not isinstance(f, dict) or not {"path", "sha256", "size"} <= set(f) <= FILE_KEYS \
+                or f.get("executable", True) is not True:
             raise EvalError("bundle_invalid", internal="manifest entry")
         p = PurePosixPath(str(f["path"]))
         if p.is_absolute() or ".." in p.parts or not p.parts or str(p) in seen:
@@ -119,6 +129,12 @@ class BlobCache:
         for f in files:
             src, dst = self.path(f["sha256"]), dest / f["path"]
             dst.parent.mkdir(parents=True, exist_ok=True)
+            if f.get("executable"):
+                # Cached blobs are 0444 and shared between bundles: copy, then make the
+                # copy executable, rather than change the mode of the shared file.
+                shutil.copyfile(src, dst)
+                os.chmod(dst, 0o555)
+                continue
             try:
                 os.link(src, dst)
             except OSError:

@@ -175,8 +175,15 @@ error messages.
 
 ### What gets installed
 Podman (container software from your operating system's own package
-repository), the NVIDIA container toolkit on GPU machines, and the evaluator
-itself in `~/bmb-eval`. Nothing else is installed system-wide.
+repository) and, on Debian and Ubuntu, `dbus-user-session`; the NVIDIA
+container toolkit on GPU machines; and the evaluator itself in `~/bmb-eval`.
+Two settings may be changed so that the sandbox's limits work for your user:
+on systems whose systemd doesn't let users limit CPU (Ubuntu 22.04, RHEL and
+Rocky 9), the drop-in `/etc/systemd/system/user@.service.d/delegate.conf`
+(Podman's documented setting); and, if Podman would otherwise use its slow
+`vfs` storage, `~/.config/containers/storage.conf`. Lingering is enabled for
+your user so the evaluator keeps running after you log out. Tested on Ubuntu
+22.04 and 24.04, Debian 12 and Rocky 9 (SELinux enforcing).
 
 ### How models are contained
 Each model runs in a locked-down container with no network access, a

@@ -36,8 +36,10 @@ if [ ! -x "$DIR/bin/uv" ] || [ "$("$DIR/bin/uv" --version 2>/dev/null)" != "uv $
     exit 1
   fi
 fi
+# UV_NATIVE_TLS: trust this computer's certificates (as curl does), so networks that
+# inspect HTTPS with their own certificate authority work.
 export UV_PYTHON_INSTALL_MIRROR="$HUB/dl/python" UV_PYTHON_INSTALL_DIR="$DIR/python" \
-       UV_CACHE_DIR="$DIR/cache"
+       UV_CACHE_DIR="$DIR/cache" UV_NATIVE_TLS=1
 # A PyPI mirror your network uses (pip's setting) works too.
 if [ -z "${UV_DEFAULT_INDEX:-}" ]; then
   INDEX="${PIP_INDEX_URL:-$(cat "$HOME/.config/pip/pip.conf" "$HOME/.pip/pip.conf" \

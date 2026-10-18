@@ -124,6 +124,12 @@ def attestation_condition(digest: str, workload_sa: str, gpu_preview: bool) -> s
 
 # ------------------------------------------------------- provider side
 
+TLS_HELP = ("gcloud couldn't verify Google's HTTPS certificate. If your network inspects HTTPS "
+            "(with your organization's own certificate authority), point gcloud to it:\n"
+            "    gcloud config set core/custom_ca_certs_file /path/to/your-company-ca.pem\n"
+            "then run the same command again.")
+
+
 class GcloudError(SystemExit):
     pass
 
@@ -140,6 +146,8 @@ def _gcloud(*args: str, project: str | None = None, input: bytes | None = None,
         lines = r.stderr.decode(errors="replace").strip().splitlines()
         # gcloud's own "ERROR: (gcloud.x) ..." lines say what went wrong; the rest is detail.
         msg = [ln for ln in lines if ln.startswith("ERROR:")] or lines[-4:]
+        if any(t in ln for ln in lines for t in ("CERTIFICATE_VERIFY_FAILED", "SSLError")):
+            raise GcloudError(TLS_HELP + "\n  " + "\n  ".join(msg)[:400])
         raise GcloudError(f"Google Cloud refused `gcloud {' '.join(args[:3])}`:\n  " + "\n  ".join(msg))
     return r.stdout.decode().strip()
 
@@ -171,13 +179,18 @@ def check_gcloud(project: str | None = None) -> None:
         raise SystemExit(f"Your Google Cloud CLI is version {version}; this needs "
                          f"{MIN_GCLOUD[0]} or newer. Update it (`gcloud components update`, or "
                          "your package manager) and run the same command again.")
-    if subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True).returncode:
+    r = subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True)
+    if r.returncode:
+        if b"CERTIFICATE_VERIFY_FAILED" in r.stderr or b"SSLError" in r.stderr:
+            raise SystemExit(TLS_HELP)
         raise SystemExit("Log in to Google Cloud first:  gcloud auth login")
     if project:     # a mistyped project, or one you can't manage, shows now, not after approving
         try:
             _gcloud("services", "list", "--enabled", "--limit", "1",
                     "--format=value(config.name)", project=project)
         except GcloudError as e:
+            if str(e).startswith(TLS_HELP):
+                raise
             raise SystemExit(f"Can't use Google Cloud project '{project}'. Check its ID and that "
                              f"you have the roles in the guide.\n{e}") from None
 

@@ -84,7 +84,7 @@ def test_sealed_node_end_to_end(hub, provider_files, tmp_path, monkeypatch):  # 
                                        "workload_sa": "wl@p", "hardware": "test"})
     code, _ = store.add_enrollment(_split_task(tmp_path, name="sealed"))
     uploaded = {}
-    monkeypatch.setattr(conf, "check_gcloud", lambda: None)
+    monkeypatch.setattr(conf, "check_gcloud", lambda project=None: None)
     monkeypatch.setattr(conf, "setup_provider_cloud", lambda project, digest, sa, gpu: {
         "PROVIDER_PROJECT_NUMBER": "1", "POOL": "bmb-eval", "PROVIDER_ID": "attestation",
         "KEY": "k", "BUCKET": "gs://b"})
@@ -130,7 +130,7 @@ def test_next_bare_code_works_after_a_task_stops_at_bad_data(hub, provider_files
                                        "workload_sa": "wl@p", "hardware": "test"})
     first, _ = store.add_enrollment(_split_task(tmp_path, name="first"))
     second, _ = store.add_enrollment(_split_task(tmp_path, name="second"))
-    monkeypatch.setattr(conf, "check_gcloud", lambda: None)
+    monkeypatch.setattr(conf, "check_gcloud", lambda project=None: None)
     pd.read_csv(data).drop(columns=["sequence"]).to_csv(tmp_path / "bad.csv", index=False)
     home = str(tmp_path / "provider")
     with pytest.raises(SystemExit, match="Fix it"):

@@ -325,7 +325,7 @@ def test_code_reusable_by_its_own_machine_only(hub, connected, provider_files, t
     code = store.q("SELECT code FROM enrollments", one=True)[0]
     _connect(cfg.path.parent, url, code, provider_files[0])      # same machine: fine (re-run)
     other = _fresh_node(tmp_path / "someone_else")
-    with pytest.raises(SystemExit, match="used by another machine"):
+    with pytest.raises(SystemExit, match="already connected from another"):
         _connect(other, url, code, provider_files[0])
 
 

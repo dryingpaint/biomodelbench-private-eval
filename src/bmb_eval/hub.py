@@ -552,7 +552,9 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 me = store.node(self._bearer()) if self._bearer() else None
                 if e is None or e[2] == "revoked" or (e[2] is not None and e[2] != me):
                     return self._err(404, "code_invalid",
-                                     "This connect code is unknown or used by another machine.")
+                                     "This connect code is unknown or already connected from another "
+                                     "computer. Run the command on that computer, or ask "
+                                     "BioModelBench for a new code.")
                 return self._send(200, {"task": e[0], "files": e[1], "version": e[3]})
             if m := re.fullmatch(r"/v1/blobs/([0-9a-f]{64})", p):
                 return self._blob_get(m.group(1))

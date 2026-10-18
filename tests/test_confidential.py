@@ -362,6 +362,12 @@ def test_hub_passes_through_only_uv_and_python_release_files(hub, monkeypatch): 
                        "uv-x86_64-unknown-linux-musl.tar.gz"]
     assert get("/dl/uv/0.13.1/uv-x86_64-unknown-linux-musl.tar.gz")[0] == 200
     assert len(fetched) == 1                                   # served from the cache
+    # uv asks for Python builds with "+" escaped
+    assert get("/dl/python/20261013/cpython-3.12.15%2B20261013-x86_64-unknown-linux-gnu-"
+               "install_only_stripped.tar.gz")[0] == 200
+    assert fetched[-1].endswith("/20261013/cpython-3.12.15%2B20261013-x86_64-unknown-linux-gnu-"
+                                "install_only_stripped.tar.gz")
     assert get("/dl/other/1/x")[0] in (401, 404)               # only uv and python
     assert get("/dl/uv/../../etc/passwd")[0] in (401, 404)
     assert get("/dl/python/../x")[0] in (401, 404)
+    assert get("/dl/python/%2E%2E/x")[0] in (401, 404)

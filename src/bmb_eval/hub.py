@@ -60,6 +60,13 @@ CREATE TABLE IF NOT EXISTS submissions (
     node_id TEXT, result TEXT, manifest TEXT NOT NULL);
 """
 ONLINE_S = 120          # a node that polled within this window is "online"
+# Release files the provider install needs from GitHub (uv, and the Python uv installs),
+# passed through and cached: providers' networks often allow this hub but not GitHub.
+# Only these two repositories' release assets; uv checks Python downloads' hashes itself.
+DOWNLOADS = {"uv": "https://github.com/astral-sh/uv/releases/download",
+             "python": "https://github.com/astral-sh/python-build-standalone/releases/download"}
+DOWNLOAD_RE = re.compile(r"/dl/(uv|python)/([A-Za-z0-9._+-]{1,40})/([A-Za-z0-9._+-]{1,160})")
+MAX_DOWNLOAD = 512 << 20
 MAX_JSON_BYTES = 16 << 20   # manifests of large bundles can be a few MB
 MAX_HELLO_BYTES = 4 << 20   # a node's hello carries every task's public contract (~2-6 KB each)
 MAX_RESULT_BYTES = 64 << 10
@@ -354,6 +361,33 @@ class HubStore:
         return out
 
 
+def cached_download(cache: Path, kind: str, release: str, name: str) -> Path | None:
+    """A GitHub release file (see DOWNLOADS), fetched once and kept. None if it doesn't exist."""
+    import urllib.error
+    import urllib.request
+    if ".." in (release, name):
+        return None
+    path = cache / kind / release / name
+    if path.is_file():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{name}.{secrets.token_hex(4)}")
+    try:
+        with urllib.request.urlopen(f"{DOWNLOADS[kind]}/{release}/{name}", timeout=60) as r, \
+                tmp.open("wb") as f:
+            n = 0
+            while chunk := r.read(1 << 20):
+                n += len(chunk)
+                if n > MAX_DOWNLOAD:
+                    raise ValueError("too large")
+                f.write(chunk)
+        tmp.replace(path)
+        return path
+    except (urllib.error.URLError, ValueError, OSError):
+        tmp.unlink(missing_ok=True)
+        return None
+
+
 def code_tarball(root: Path) -> bytes | None:
     """The node code providers install, built from this checkout."""
     if not (root / "setup.sh").is_file():
@@ -494,6 +528,10 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 conf = store.setting("confidential")
                 return self._send(200, conf) if conf else self._err(
                     404, "not_found", "Confidential mode isn't set up on this hub.")
+            if m := DOWNLOAD_RE.fullmatch(p):
+                path = cached_download(store.state / "downloads", *m.groups())
+                return (self._send_file(path, "application/octet-stream") if path
+                        else self._err(404, "not_found", "No such release file."))
             if p == "/bmb-eval.tar.gz" and tarball:
                 return self._send(200, body=tarball, ctype="application/gzip")
             if p in pages and pages[p].is_file():

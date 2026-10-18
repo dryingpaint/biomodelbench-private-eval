@@ -31,6 +31,12 @@ hardware, that it runs the exact software you approved, with debugging off.
 - **The Google Cloud CLI (`gcloud`)**, logged in (`gcloud auth login`), on any
   macOS or Linux computer that has your data.
 - **Your data**, as one file or one folder, as described in our email.
+- **Network:** outbound HTTPS to `eval.biomodelbench.org`, Google Cloud
+  (`accounts.google.com`, `*.googleapis.com`) and PyPI (`pypi.org`,
+  `files.pythonhosted.org`), or the PyPI mirror your organization uses (set
+  `PIP_INDEX_URL`, or pip's own setting, and it's used). An HTTPS proxy works:
+  set `HTTPS_PROXY` as usual. Nothing else is needed: the Python and tools it
+  installs come through `eval.biomodelbench.org`.
 
 Run the command from our email:
 

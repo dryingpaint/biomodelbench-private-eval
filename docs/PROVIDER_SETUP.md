@@ -78,8 +78,8 @@ out.
 
 | | |
 |---|---|
-| Cloud KMS key `data` in key ring `bmb` (us-central1) | Wraps the key that encrypts your data. Only you can manage it. |
-| Bucket `gs://<project>-bmb-data` (us-central1) | Your encrypted data, and the evaluator's encrypted records (how many evaluations were used). |
+| Cloud KMS key `data` in key ring `bmb` (us-central1, or your `--region`) | Wraps the key that encrypts your data. Only you can manage it. |
+| Bucket `gs://<project>-bmb-data` (same region) | Your encrypted data, and the evaluator's encrypted records (how many evaluations were used). |
 | Workload identity pool `bmb-eval` | The access rule: the key is released only to the approved software on sealed hardware, in production mode. |
 
 Services enabled: Cloud KMS, Cloud Storage, IAM, Security Token Service.
@@ -94,11 +94,18 @@ Services enabled: Cloud KMS, Cloud Storage, IAM, Security Token Service.
 
 ### If your organization restricts Google Cloud
 
-These organization policies can block the setup: allowed resource locations
-(it uses `us-central1`), allowed workload identity pool providers (it trusts
-`https://confidentialcomputing.googleapis.com/`), and domain-restricted
-sharing. If a step is refused, the command stops and shows Google's message;
-send it to us.
+- **Allowed locations:** the key and encrypted data go in `us-central1`. If
+  your organization allows only some regions, add `--region <one it allows>`
+  (for example `--region europe-west4`); the command says so if needed.
+- **Allowed workload identity pool providers:** the access rule trusts
+  `https://confidentialcomputing.googleapis.com/` (Google Confidential Space).
+  If your organization restricts this list, it needs to allow that issuer.
+- **Restricted services:** it uses Cloud KMS, Cloud Storage, IAM and Security
+  Token Service.
+
+Domain-restricted sharing and Google's secure-by-default policies don't get in
+the way (tested). If a step is refused, the command stops and shows Google's
+message; send it to us.
 
 # Option B: your own machine
 

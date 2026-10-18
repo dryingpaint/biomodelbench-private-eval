@@ -195,22 +195,23 @@ def check_gcloud(project: str | None = None) -> None:
                              f"you have the roles in the guide.\n{e}") from None
 
 
-def setup_provider_cloud(project: str, digest: str, workload_sa: str, gpu_preview: bool) -> dict:
+def setup_provider_cloud(project: str, digest: str, workload_sa: str, gpu_preview: bool,
+                         region: str = LOCATION) -> dict:
     """Key, bucket and attestation rule in the provider's project (idempotent).
     Returns the non-secret pointers the node needs."""
     # First: a new project has none of these on.
     _gcloud("services", "enable", "cloudkms.googleapis.com", "storage.googleapis.com",
             "iam.googleapis.com", "sts.googleapis.com", project=project)
     bucket = f"gs://{project}-bmb-data"
-    key = f"projects/{project}/locations/{LOCATION}/keyRings/bmb/cryptoKeys/data"
-    if not _exists("kms", "keyrings", "describe", "bmb", "--location", LOCATION, project=project):
-        _gcloud("kms", "keyrings", "create", "bmb", "--location", LOCATION, project=project)
-    if not _exists("kms", "keys", "describe", "data", "--keyring", "bmb", "--location", LOCATION,
+    key = f"projects/{project}/locations/{region}/keyRings/bmb/cryptoKeys/data"
+    if not _exists("kms", "keyrings", "describe", "bmb", "--location", region, project=project):
+        _gcloud("kms", "keyrings", "create", "bmb", "--location", region, project=project)
+    if not _exists("kms", "keys", "describe", "data", "--keyring", "bmb", "--location", region,
                    project=project):
-        _gcloud("kms", "keys", "create", "data", "--keyring", "bmb", "--location", LOCATION,
+        _gcloud("kms", "keys", "create", "data", "--keyring", "bmb", "--location", region,
                 "--purpose", "encryption", project=project)
     if not _exists("storage", "buckets", "describe", bucket, project=project):
-        _gcloud("storage", "buckets", "create", bucket, "--location", LOCATION,
+        _gcloud("storage", "buckets", "create", bucket, "--location", region,
                 "--uniform-bucket-level-access", "--public-access-prevention", project=project)
     if not _exists("iam", "workload-identity-pools", "describe", POOL_ID, "--location", "global",
                    project=project):
@@ -235,7 +236,7 @@ def setup_provider_cloud(project: str, digest: str, workload_sa: str, gpu_previe
             project=project)
     # Decrypt the bundle; encrypt + decrypt the node's own state (quotas, final counts).
     _gcloud("kms", "keys", "add-iam-policy-binding", "data", "--keyring", "bmb",
-            "--location", LOCATION, "--member", member,
+            "--location", region, "--member", member,
             "--role", "roles/cloudkms.cryptoKeyEncrypterDecrypter", project=project)
     _gcloud("storage", "buckets", "add-iam-policy-binding", bucket, "--member", member,
             "--role", "roles/storage.objectAdmin", project=project)
@@ -272,6 +273,7 @@ def cmd_connect_confidential(args) -> None:
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     hub_url, code = parse_connect(args.code, args.hub or state.get("hub"))
     project = args.project or state.get("project")
+    region = args.region or state.get("region") or LOCATION
     if not project:
         raise SystemExit("Add --project <your Google Cloud project id>.")
     check_gcloud(project)
@@ -284,7 +286,7 @@ def cmd_connect_confidential(args) -> None:
         raise SystemExit(f"Couldn't use that connect link: {e}")
     # Remember the hub and project now, so the next task's bare code works even if
     # this one stops at a data problem or isn't approved.
-    state.update(hub=hub_url, project=project)
+    state.update(hub=hub_url, project=project, region=region)
     state_path.write_text(json.dumps(state, indent=2))
     os.chmod(state_path, 0o600)
     task = pkg["task"]
@@ -344,8 +346,16 @@ def cmd_connect_confidential(args) -> None:
     os.chmod(state_path, 0o600)
 
     print("  Setting up your key and storage in Google Cloud...")
-    ptr = setup_provider_cloud(project, conf["digest"], conf["workload_sa"],
-                               bool(conf.get("gpu_preview")))
+    try:
+        ptr = setup_provider_cloud(project, conf["digest"], conf["workload_sa"],
+                                   bool(conf.get("gpu_preview")), region)
+    except GcloudError as e:
+        if "constraints/gcp.resourceLocations" in str(e):
+            raise SystemExit(f"Your organization doesn't allow Google Cloud resources in {region}. "
+                             "Run the same command again with a region it allows, for example\n"
+                             "    --region europe-west4      (or europe-west1, asia-northeast1, us-east1 ...)\n"
+                             "Your data stays encrypted in that region; it works the same.") from None
+        raise
     print("  Encrypting on this machine and uploading...")
     node = {"hub": hub_url, "node_id": state["node_id"], "secret": state["secret"], "task": task,
             "package_version": int(pkg.get("version", 1))}
@@ -358,7 +368,7 @@ def cmd_connect_confidential(args) -> None:
     print(f"\n✓ Connected. Task '{task}' is sealed in {ptr['BUCKET']} and goes live on "
           "BioModelBench's sealed machine.")
     print("  Nothing runs on your side. To stop everything at any time, disable your key:\n"
-          f"    gcloud kms keys versions disable 1 --key data --keyring bmb --location {LOCATION} "
+          f"    gcloud kms keys versions disable 1 --key data --keyring bmb --location {region} "
           f"--project {project}")
 
 
@@ -669,6 +679,8 @@ def add_parsers(sub) -> None:
     p.add_argument("code", help="the code from BioModelBench's email")
     p.add_argument("--data", required=True, help="your data file or folder")
     p.add_argument("--project", help="your Google Cloud project id (remembered)")
+    p.add_argument("--region", help=f"where your key and encrypted data are kept (default "
+                                    f"{LOCATION}; remembered)")
     p.add_argument("--dir", default=os.environ.get("BMB_CONFIDENTIAL_DIR", "~/bmb-confidential"))
     p.add_argument("--hub")
     p.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)

@@ -311,6 +311,10 @@ def cmd_connect(args) -> None:
     # A bare code works on a machine that's already connected: use its hub.
     saved_hub = ((yaml.safe_load(cfg_path.read_text()) or {}).get("hub") or {}).get("url") \
         if cfg_path.exists() else None
+    # ...or the hub of an earlier connect here that stopped (bad data, not approved).
+    hub_file = root / "hub_url"
+    if not saved_hub and hub_file.exists():
+        saved_hub = hub_file.read_text().strip() or None
     hub_url, code = parse_connect(args.code, args.hub or saved_hub)
 
     # 1. Fetch the task package. A node that already used this code (re-runs,
@@ -323,6 +327,8 @@ def cmd_connect(args) -> None:
         raise SystemExit(f"Couldn't use that connect link: {e}")
     task = pkg["task"]
     print(f"Connecting to BioModelBench for task '{task}'...")
+    root.mkdir(parents=True, exist_ok=True)
+    hub_file.write_text(hub_url + "\n")
 
     # 2. Node config, sandbox image and task files.
     if not cfg_path.exists():

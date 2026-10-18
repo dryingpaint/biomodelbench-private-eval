@@ -36,6 +36,47 @@ if ! engine_ok; then
   sudo loginctl enable-linger "$(id -un)" 2>/dev/null || true
 fi
 
+# Rootless Podman limits CPU through the user's systemd cgroup, and some systemd defaults
+# (Ubuntu 22.04, RHEL/Rocky 9) don't hand users the CPU controller: every sandbox would
+# fail with "cgroup controller cpu is not available". Delegate it (Podman's documented fix).
+UCG="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+if [ "$ENGINE" != "local" ] && [ "$(id -u)" != 0 ] && command -v podman >/dev/null &&
+   [ -f /sys/fs/cgroup/cgroup.controllers ] && [ -f "$UCG" ] && ! grep -qw cpu "$UCG"; then
+  say "Letting the sandbox limit CPU use (a systemd setting)"
+  sudo mkdir -p /etc/systemd/system/user@.service.d
+  printf '[Service]\nDelegate=cpu cpuset io memory pids\n' |
+    sudo tee /etc/systemd/system/user@.service.d/delegate.conf >/dev/null
+  sudo systemctl daemon-reload
+  sudo systemctl restart "user@$(id -u).service"
+  if ! grep -qw cpu "$UCG" 2>/dev/null; then
+    echo "Couldn't give the sandbox CPU limits. Log out and back in, then run the same command again." >&2
+    exit 1
+  fi
+fi
+
+# Without a storage setting, some rootless Podman versions (Debian 12's 4.3) use "vfs",
+# which copies the whole multi-GB sandbox image for every evaluation (minutes each).
+# Switch to overlay, but only while nothing besides our image is stored.
+if [ "$ENGINE" != "local" ] && [ "$(id -u)" != 0 ] && command -v podman >/dev/null &&
+   [ "$(podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null)" = vfs ]; then
+  if podman images --format '{{.Repository}}' 2>/dev/null | grep -qv 'bmb-eval-sandbox'; then
+    echo "Note: Podman here uses slow \"vfs\" storage, and has other images, so it was left as is." >&2
+    echo "  Evaluations will be slow. To fix it, see https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md" >&2
+  else
+    say "Setting up fast container storage"
+    podman system reset -f >/dev/null 2>&1 || true
+    mkdir -p "$HOME/.config/containers"
+    KV="$(uname -r | cut -d. -f1-2)"
+    if [ "$(printf '%s\n5.13\n' "$KV" | sort -V | head -n 1)" != 5.13 ] && command -v fuse-overlayfs >/dev/null; then
+      MP='mount_program = "'"$(command -v fuse-overlayfs)"'"'      # kernels before 5.13
+    else
+      MP=""
+    fi
+    printf '[storage]\ndriver = "overlay"\n[storage.options.overlay]\n%s\n' "$MP" \
+      > "$HOME/.config/containers/storage.conf"
+  fi
+fi
+
 # GPU machines: let containers use the GPU (NVIDIA container toolkit).
 if [ "$ENGINE" != "local" ] && command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1 &&
    ! command -v nvidia-ctk >/dev/null; then

@@ -1369,3 +1369,29 @@ def test_serial_node_is_unchanged_by_default(connected):
     sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
     w.drain()
     assert not w._jobs and agent.status(sid)["result"]["status"] == "ok"
+
+def test_next_bare_code_works_after_a_connect_stops_at_bad_data(hub, node_dir, provider_files,
+                                                                 tmp_path):
+    """Multi-task email, own machine: the first command (with the hub) hits a data problem;
+    the next task's command has just the code."""
+    import pandas as pd
+    store, url = hub
+    data, task_dir = provider_files
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    first, _ = store.add_enrollment(task_dir)
+    pd.read_csv(data).drop(columns=["sequence"]).to_csv(tmp_path / "bad.csv", index=False)
+    with pytest.raises(SystemExit):
+        cli.main(["--config", str(fresh / "config.yaml"), "connect", first, "--hub", url,
+                  "--data", str(tmp_path / "bad.csv"), "--yes", "--no-service"])
+    second = scaffold.write_task("second", tmp_path / "authored_second",
+                                 [("variant_id", "string", False), ("sequence", "string", False)],
+                                 [("variant_id", "string", False), ("fitness", "float", False)],
+                                 ["variant_id"], "regression", "fitness")
+    code, _ = store.add_enrollment(second)
+    # Must get past parsing the bare code (it would say "doesn't look like a connect code").
+    try:
+        cli.main(["--config", str(fresh / "config.yaml"), "connect", code, "--data", str(data),
+                  "--yes", "--no-service"])
+    except SystemExit as e:
+        assert "connect code" not in str(e)

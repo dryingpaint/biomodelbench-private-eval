@@ -190,6 +190,11 @@ def test_launcher_starts_only_offline_sealed_nodes_with_work(hub, provider_files
     assert [n for n, _ in L.due(store)] == [nid]                  # offline + queued -> launch
     store.set_setting(f"sealed_launch:{nid}", {"at": _t.time()})
     assert L.due(store) == []                                     # cooldown after a launch
+    # It refused work (self-test failed) on this image: not relaunched until a new image.
+    store.set_setting(f"sealed_launch:{nid}", {"at": _t.time() - 3600, "digest": DIGEST})
+    store.q("UPDATE nodes SET status=? WHERE id=?", (json.dumps({"refused": {"reason": "x"}}), nid))
+    assert L.due(store, digest=DIGEST) == []
+    assert [n for n, _ in L.due(store, digest="sha256:" + "cd" * 32)] == [nid]
     body = L.instance_body("bmb-sealed-x", "us-central1-a", "SPOT", "proj",
                            {"image": "img@sha256:1", "workload_sa": "wl@p", "gpu_preview": True}, ptr)
     meta = {i["key"]: i["value"] for i in body["metadata"]["items"]}

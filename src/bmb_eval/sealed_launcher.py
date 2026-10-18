@@ -159,15 +159,20 @@ def reclaim(store, now: float | None = None) -> int:
     return n
 
 
-def due(store, now: float | None = None) -> list[tuple[str, dict]]:
-    """Sealed nodes with queued work that are offline and not launched recently."""
+def due(store, now: float | None = None, digest: str | None = None) -> list[tuple[str, dict]]:
+    """Sealed nodes with queued work that are offline and not launched recently.
+    A node that refused work (e.g. its self-test failed) on the current image
+    isn't relaunched: it would only refuse again, on an H100, every cooldown."""
     now = now or time.time()
     out = []
-    for nid, seen, ptr in store.q("SELECT id, last_seen, confidential FROM nodes WHERE confidential IS NOT NULL"):
+    for nid, seen, ptr, st in store.q("SELECT id, last_seen, confidential, status FROM nodes "
+                                      "WHERE confidential IS NOT NULL"):
         queued = store.q("SELECT COUNT(*) FROM submissions s JOIN node_tasks t ON t.task = s.task "
                          "WHERE t.node_id=? AND s.status='queued'", (nid,), one=True)[0]
         rec = store.setting(f"sealed_launch:{nid}") or {}
         wait = RETRY_S if rec.get("error") else COOLDOWN_S
+        if "refused" in json.loads(st or "{}") and digest and rec.get("digest") == digest:
+            continue
         if queued and (not seen or now - seen > OFFLINE_S) and now - rec.get("at", 0) > wait:
             out.append((nid, json.loads(ptr)))
     return out
@@ -180,13 +185,14 @@ def loop(store, every_s: int = 60) -> threading.Thread:
                 conf = store.setting("confidential")
                 if conf:
                     reclaim(store)
-                for nid, ptr in (due(store) if conf else []):
+                for nid, ptr in (due(store, digest=conf.get("digest")) if conf else []):
                     prev = store.setting(f"sealed_launch:{nid}") or {}
                     store.set_setting(f"sealed_launch:{nid}", {**prev, "at": time.time(), "state": "launching"})
                     # Reuse the place that last worked; after a failure, start after it.
                     start = prev.get("place", 0) + (1 if prev.get("error") else 0)
                     res = launch(nid, ptr, conf, start_at=start)
-                    store.set_setting(f"sealed_launch:{nid}", {"at": time.time(), **res})
+                    store.set_setting(f"sealed_launch:{nid}", {"at": time.time(), **res,
+                                                               "digest": conf.get("digest")})
             except Exception as e:              # never take the hub down
                 store.set_setting("sealed_launch:last_error", {"at": time.time(), "error": repr(e)[:300]})
             time.sleep(every_s)

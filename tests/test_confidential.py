@@ -65,6 +65,17 @@ def test_bwrap_sandbox_command(tmp_path):
     assert "/" not in [cmd[i + 1] for i, c in enumerate(cmd) if c == "--ro-bind"]   # never the whole root
 
 
+def test_gpu_stage_memory_is_watched(tmp_path):
+    from bmb_eval.sandbox import sandbox_anon_bytes
+    for pid, uid, anon in (("1", 0, 900000), ("2", 65534, 300000), ("3", 65534, 400000)):
+        (tmp_path / pid).mkdir()
+        (tmp_path / pid / "status").write_text(f"Name:\tpython3\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n"
+                                               f"RssAnon:\t{anon} kB\nRssFile:\t999999 kB\n")
+    (tmp_path / "4").mkdir()
+    (tmp_path / "4" / "status").write_text("Name:\tkthreadd\nUid:\t65534\n")   # kernel thread: no Rss
+    assert sandbox_anon_bytes(tmp_path) == 700000 << 10
+
+
 def test_sealed_node_end_to_end(hub, provider_files, tmp_path, monkeypatch):  # noqa: F811
     """Provider seals (fake cloud) -> sealed node unseals -> agent gets a score."""
     store, url = hub
@@ -106,6 +117,33 @@ def test_sealed_node_end_to_end(hub, provider_files, tmp_path, monkeypatch):  # 
     Worker(cfg).drain()
     res = agent.status(sid)["result"]
     assert res["status"] == "ok" and res["split"] == "validation"
+
+
+def test_next_bare_code_works_after_a_task_stops_at_bad_data(hub, provider_files, tmp_path,  # noqa: F811
+                                                            monkeypatch):
+    """As in a multi-task email: the first command (with the hub) hits a data problem;
+    the next task's command has just the code."""
+    import pandas as pd
+    store, url = hub
+    data, _ = provider_files
+    store.set_setting("confidential", {"image": f"r/sealed@{DIGEST}", "digest": DIGEST,
+                                       "workload_sa": "wl@p", "hardware": "test"})
+    first, _ = store.add_enrollment(_split_task(tmp_path, name="first"))
+    second, _ = store.add_enrollment(_split_task(tmp_path, name="second"))
+    monkeypatch.setattr(conf, "check_gcloud", lambda: None)
+    pd.read_csv(data).drop(columns=["sequence"]).to_csv(tmp_path / "bad.csv", index=False)
+    home = str(tmp_path / "provider")
+    with pytest.raises(SystemExit, match="Fix it"):
+        cli.main(["connect-confidential", first, "--hub", url, "--data", str(tmp_path / "bad.csv"),
+                  "--project", "p", "--dir", home, "--yes"])
+    uploaded = {}
+    monkeypatch.setattr(conf, "setup_provider_cloud", lambda project, digest, sa, gpu: {
+        "PROVIDER_PROJECT_NUMBER": "1", "POOL": "bmb-eval", "PROVIDER_ID": "attestation",
+        "KEY": "k", "BUCKET": "gs://b"})
+    monkeypatch.setattr(conf, "upload_sealed",
+                        lambda project, key, bucket, task, plaintext: uploaded.update({task: plaintext}))
+    cli.main(["connect-confidential", second, "--data", str(data), "--dir", home, "--yes"])
+    assert set(uploaded) == {"second"}
 
 
 def test_hub_confidential_endpoints(hub):  # noqa: F811
@@ -152,6 +190,11 @@ def test_launcher_starts_only_offline_sealed_nodes_with_work(hub, provider_files
     assert [n for n, _ in L.due(store)] == [nid]                  # offline + queued -> launch
     store.set_setting(f"sealed_launch:{nid}", {"at": _t.time()})
     assert L.due(store) == []                                     # cooldown after a launch
+    # It refused work (self-test failed) on this image: not relaunched until a new image.
+    store.set_setting(f"sealed_launch:{nid}", {"at": _t.time() - 3600, "digest": DIGEST})
+    store.q("UPDATE nodes SET status=? WHERE id=?", (json.dumps({"refused": {"reason": "x"}}), nid))
+    assert L.due(store, digest=DIGEST) == []
+    assert [n for n, _ in L.due(store, digest="sha256:" + "cd" * 32)] == [nid]
     body = L.instance_body("bmb-sealed-x", "us-central1-a", "SPOT", "proj",
                            {"image": "img@sha256:1", "workload_sa": "wl@p", "gpu_preview": True}, ptr)
     meta = {i["key"]: i["value"] for i in body["metadata"]["items"]}
@@ -272,3 +315,25 @@ def test_selftest_skips_a_task_with_no_validation_rows(tmp_path, monkeypatch):
     monkeypatch.setattr("bmb_eval.runner.Runner", lambda *a, **k: pytest.fail("ran attacks"))
     assert cli._selftest(cfg, "empty", verbose=False) == 0
     assert '"skipped": true' in (tmp_path / "audit.jsonl").read_text()
+
+
+def test_exited_sealed_vm_is_deleted_so_its_disk_frees_quota(hub, provider_files, monkeypatch):  # noqa: F811
+    import time as _t
+    from bmb_eval import sealed_launcher as L
+    from bmb_eval.node import HubAPI
+    store, url = hub
+    _, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    nid = HubAPI(url).activate(code, "sealed-test")["node_id"]
+    store.q("UPDATE nodes SET confidential=?, last_seen=? WHERE id=?",
+            (json.dumps({"BUCKET": "gs://b"}), _t.time() - 3600, nid))
+    store.set_setting(f"sealed_launch:{nid}", {"at": _t.time() - 3600, "zone": "z1"})
+    status = {"value": "RUNNING"}
+    calls = []
+    monkeypatch.setattr(L, "_call", lambda m, u, b=None: calls.append(m) or
+                        ({"status": status["value"]} if m == "GET" else {"status": "DONE"}))
+    monkeypatch.setattr(L, "_wait", lambda op, timeout=300: op)
+    assert L.remove_stopped(store, project="p") == 0 and "DELETE" not in calls   # still running
+    status["value"] = "TERMINATED"
+    assert L.remove_stopped(store, project="p") == 1 and calls[-1] == "DELETE"
+    assert L.remove_stopped(store, project="p") == 0                              # done once

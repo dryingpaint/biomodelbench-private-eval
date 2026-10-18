@@ -1,15 +1,108 @@
 # Connecting your data to BioModelBench
 
+BioModelBench scores AI-trained models on your data and sends back only the
+scores. There are two ways to connect; our email says which commands to run
+for each:
+
+- **Option A: no machine to run (recommended).** Your data is encrypted on
+  your computer with a key in your own Google Cloud project, and only our
+  sealed evaluation machine can open it.
+- **Option B: your own machine.** Models are sent to a Linux machine of
+  yours, which scores them where your data already is.
+
+# Option A: sealed evaluation (no machine to run)
+
+The evaluation runs on Google Confidential Computing hardware (Intel TDX and an
+NVIDIA H100 in confidential mode). The machine is sealed: nobody outside it,
+including BioModelBench and Google, can read its memory or log into it. Your
+key in your Google Cloud project is released only to a machine that proves, in
+hardware, that it runs the exact software you approved, with debugging off.
+
+## What you need
+
+- **A Google Cloud project you own**, with billing enabled. It holds one
+  encryption key and one storage bucket (a few cents a month). A new, empty
+  project is fine and keeps things separate.
+- **Permission in that project** to enable services, create a Cloud KMS key,
+  a storage bucket and a workload identity pool, and grant access to them.
+  The project's Owner has all of these. Otherwise ask for these roles:
+  Service Usage Admin, Cloud KMS Admin, Storage Admin, Workload Identity Pool
+  Admin.
+- **The Google Cloud CLI (`gcloud`)**, logged in (`gcloud auth login`), on any
+  macOS or Linux computer that has your data.
+- **Your data**, as one file or one folder, as described in our email.
+
+Run the command from our email:
+
+```bash
+curl -fsSL https://<hub address>/confidential.sh | sh -s -- YOUR-CODE --data /path/to/your/data --project YOUR-GCP-PROJECT
+```
+
+It installs the tool in `~/bmb-confidential`, checks your data, and splits it
+on your computer into a validation half and a held-out test half. It then shows
+what you're agreeing to (as in Option B below), plus the exact software your
+key will open for and the public source commit it was built from. Type `y` to
+create the key, bucket and access rule in your project, encrypt everything on
+your computer, and upload only the encrypted copy. Nothing keeps running on
+your side.
+
+With several tasks, our email lists one command per task. The first installs
+the tool; the others reuse it and your project:
+
+```bash
+~/bmb-confidential/.venv/bin/bmb-eval connect-confidential NEXT-CODE --data /path/to/next/file
+```
+
+### Checking the software
+
+```bash
+curl -fsSL https://<hub address>/verify-image.sh | sh
+```
+
+This checks Google Cloud Build's signature on the build record of the approved
+software, and that it was built from the published source commit. It prints a
+link to that exact code, including the parts that let only the agreed scores
+out.
+
+### What gets created in your project
+
+| | |
+|---|---|
+| Cloud KMS key `data` in key ring `bmb` (us-central1) | Wraps the key that encrypts your data. Only you can manage it. |
+| Bucket `gs://<project>-bmb-data` (us-central1) | Your encrypted data, and the evaluator's encrypted records (how many evaluations were used). |
+| Workload identity pool `bmb-eval` | The access rule: the key is released only to the approved software on sealed hardware, in production mode. |
+
+Services enabled: Cloud KMS, Cloud Storage, IAM, Security Token Service.
+
+### Stopping, changing data, and updates
+
+- **Stop everything at any time:** disable your key. The sealed machine can
+  then no longer open your data. (The command is printed when you connect.)
+- **New or corrected data:** run the same command again with the new file.
+- **A task change or new software from BioModelBench:** we'll ask you to run
+  your command again, so that you review and approve the change.
+
+### If your organization restricts Google Cloud
+
+These organization policies can block the setup: allowed resource locations
+(it uses `us-central1`), allowed workload identity pool providers (it trusts
+`https://confidentialcomputing.googleapis.com/`), and domain-restricted
+sharing. If a step is refused, the command stops and shows Google's message;
+send it to us.
+
+# Option B: your own machine
+
 BioModelBench sends AI-trained models to your machine. Your machine scores
 them on your data and sends back only the scores. Your data never leaves.
 
 ## What you need
 
-- **A Linux machine that stays on**, with two 80 GB NVIDIA GPUs (A100 or
-  H100), 24 CPUs, 256 GB RAM and 500 GB free disk. Most of the time it runs
-  small models on CPUs; the GPUs are for the final evaluations, which run the
-  largest models. If you don't have a suitable machine, talk to us and we'll
-  help you set one up.
+- **A Linux machine that stays on**, of the size our email gives for your
+  tasks (for example, two 80 GB NVIDIA GPUs, 24 CPUs, 256 GB RAM and 500 GB
+  free disk for tasks whose final evaluations run the largest models). Most of
+  the time it runs small models on CPUs. The install checks the machine and
+  says if anything is missing. If you don't have a suitable machine, talk to
+  us and we'll help you set one up, or use Option A.
 - **The data you described to us**, as one file or one folder, in whatever
   format it's already in.
 
@@ -101,3 +194,28 @@ For an additional layer of isolation, install [gVisor](https://gvisor.dev)
 (enabling its `nvproxy` option on GPU machines) and set `sandbox.runtime: runsc`
 in `~/bmb-eval/config.yaml`. Then run `~/bmb-eval/bmb-eval selftest` and
 `~/bmb-eval/bmb-eval approve`.
+
+# FAQ
+
+**What leaves, with either option?** Only the agreed scores, rounded, or an
+error code from a fixed list. Never your data, the model's predictions or its
+logs. The approval screen shows the worst case: how much a model built to
+extract data could learn across all evaluations.
+
+**Who decides which half of my data is the test set?** Your computer (Option
+A) or machine (Option B) splits it at random when you connect, with a secret
+seed. Nobody, including BioModelBench, knows which row is where. Agents are
+scored only on the validation half; the test half is used at most a few times,
+at the end, and only BioModelBench sees those scores.
+
+**What file formats work?** CSV (including Excel's "CSV" and "CSV UTF-8"),
+TSV or Parquet; for a folder of files, as described in our email. Excel
+workbooks (`.xlsx`): save as CSV first.
+
+**The command found a problem with my file.** It says what to fix (for
+example, a missing column, an empty value or a value not in the allowed list).
+Fix it and run the same command again; your code keeps working.
+
+**Can I try it on a test file first?** Yes: stop at the approval screen
+(answer `n`), and nothing is created or shared. If you approved a test file
+by mistake, run the same command again with your real file; it replaces it.

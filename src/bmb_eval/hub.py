@@ -215,6 +215,20 @@ class HubStore:
         row = self.q("SELECT name FROM agents WHERE token_sha256=?", (_h(token),), one=True)
         return row[0] if row else None
 
+    def operator_status(self, recent: int = 50) -> dict:
+        """Nodes, the submission queue by task/split/status, and the latest submissions."""
+        nodes = []
+        for nid, name, seen, acc in self.q("SELECT id, name, last_seen, accepting FROM nodes"):
+            nodes.append({"id": nid, "name": name, "last_seen": seen, "accepting": bool(acc),
+                          "tasks": [r[0] for r in self.q("SELECT task FROM node_tasks WHERE node_id=?", (nid,))]})
+        subs = [{"task": t, "split": sp, "status": st, "n": n, "oldest_created": oc}
+                for t, sp, st, n, oc in self.q("SELECT task, split, status, COUNT(*), MIN(created) "
+                                                "FROM submissions GROUP BY 1, 2, 3")]
+        rec = [{"id": i, "task": t, "split": sp, "status": st, "agent": a, "created": c}
+               for i, t, sp, st, a, c in self.q("SELECT id, task, split, status, agent, created FROM submissions "
+                                                "ORDER BY created DESC LIMIT ?", (recent,))]
+        return {"now": time.time(), "nodes": nodes, "submissions": subs, "recent": rec}
+
     def is_operator(self, token: str) -> bool:
         op = self.setting("operator")
         return bool(token) and op is not None and op["token_sha256"] == _h(token)
@@ -685,6 +699,9 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                                      'send "rotate": true to replace it.')
                 return self._send(200, {"name": name, "kind": kind,
                                         "token": store.add_agent(name, evals, kind)})
+            if method == "GET" and p == "/v1/operator/status":
+                # Read-only: what `bmb-hub status` prints, for the ops page.
+                return self._send(200, store.operator_status())
             if m := re.fullmatch(r"/v1/operator/submissions/([\w-]{1,128})/final", p):
                 if method == "GET":
                     view = store.final_view(m.group(1))

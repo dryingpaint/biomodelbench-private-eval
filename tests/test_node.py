@@ -1439,6 +1439,11 @@ def test_operator_issues_tokens_and_runs_finals_over_the_api(family):
                        {"name": "x", "evaluations": 1, "kind": bad})["error"]["code"] == "bad_request"
     tok = op.agent_token("run-1", 2)
     assert tok["kind"] == "agent" and store.agent_kind("run-1") == "agent"
+    # Read-only status for the ops page: operator only.
+    assert agent._req("GET", "/v1/operator/status")["error"]["code"] == "unauthorized"
+    st = op._req("GET", "/v1/operator/status")
+    assert {"nodes", "submissions", "recent", "now"} <= set(st)
+    assert all({"id", "name", "last_seen", "accepting", "tasks"} <= set(n) for n in st["nodes"])
     run = Client(url, tok["token"])
     assert run.tasks()["budget"] == {"evaluations": 2, "used": 0}
     assert op.agent_token("run-1", 2)["error"]["code"] == "name_taken"   # a live token isn't cut off

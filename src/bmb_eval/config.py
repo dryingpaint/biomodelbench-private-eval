@@ -41,6 +41,9 @@ class Config:
     infra_failure_threshold: int
     retain_bundles: bool
     cache_gb: int      # model-file cache size before least-recently-used files go
+    # Evaluations run at once (each admitted only when its contract's CPUs, memory and GPUs
+    # fit what is free). 1 (the default) runs them one at a time, as nodes always have.
+    max_parallel: int
     hub: dict          # {url, node_id, secret} once connected; {} before
     blob_dir: Path | None = None   # model-file cache; default state_dir/blobs
     tasks: dict[str, TaskBinding] = field(default_factory=dict)
@@ -72,6 +75,7 @@ class Config:
             infra_failure_threshold=int(al.get("infra_failure_threshold", 3)),
             retain_bundles=bool(raw.get("retain_bundles", False)),
             cache_gb=int(raw.get("cache_gb", 300)),
+            max_parallel=max(1, int(raw.get("max_parallel", 1))),
             hub=dict(raw.get("hub") or {}),
             blob_dir=rel(raw["blob_dir"]) if raw.get("blob_dir") else None,
             raw=raw,

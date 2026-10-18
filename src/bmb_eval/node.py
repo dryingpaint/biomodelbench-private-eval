@@ -8,7 +8,9 @@ gated payload, and only once its release time has passed.
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -113,6 +115,22 @@ class HubAPI:
         self._req("POST", f"/v1/node/results/{sid}", payload)
 
 
+def mem_bytes(spec: str | int) -> int:
+    """A contract's memory limit ("24g", "512m") in bytes."""
+    s = str(spec).strip().lower()
+    units = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30, "t": 1 << 40}
+    return int(float(s[:-1]) * units[s[-1]]) if s and s[-1] in units else int(float(s or 0))
+
+
+def machine_capacity() -> tuple[float, int, int]:
+    """This machine's CPUs, memory (bytes) and GPUs."""
+    try:
+        mem = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        mem = 0
+    return float(os.cpu_count() or 1), int(mem), len(gpus_here())
+
+
 def paused_path(cfg: Config):
     return cfg.state_dir / "PAUSED"
 
@@ -147,6 +165,10 @@ class Worker:
         self._hello_rejected: str | None = None
         self._stale_alerted = False
         self.status: dict | None = None   # set by the sealed node: reported to the hub
+        # Evaluations in flight (max_parallel > 1): sid -> (thread, cpus, memory bytes, gpus).
+        self._jobs: dict[str, tuple[threading.Thread, float, int, int]] = {}
+        self.parallel = 1 if cfg.sealed else cfg.max_parallel
+        self.capacity = machine_capacity()
 
     # ------------------------------------------------------------- gates
 
@@ -213,10 +235,13 @@ class Worker:
                 audit.record(self.cfg.state_dir, "result_dropped", run_id=sid, error=str(e)[:200])
             self.store.mark_posted(sid)
             did = True
+        did = self._reap() or did
+        if not self._room_for_any():
+            return did
         # Finish anything interrupted by a restart before taking new work.
         local = self.store.next_queued()
         if local:
-            self._run(*local)
+            self._dispatch(*local, self._need(local[0], local[1]))
             return True
         if not accepting:
             return did
@@ -225,6 +250,68 @@ class Worker:
             self._take(job)
             return True
         return did
+
+    # ------------------------------------------------------ parallel jobs
+
+    def _need(self, sid: str, task: str) -> tuple[float, int, int]:
+        """The CPUs, memory (bytes) and GPUs a job's contract allows it."""
+        t = self.cfg.tasks.get(task)
+        try:
+            split = json.loads((self.queue_dir / f"{sid}.json").read_text()).get("split", "validation")
+        except (OSError, ValueError):
+            split = "validation"
+        if t is None:
+            return (1.0, 0, 0)
+        lim = t.contract.limits_for(split, sealed=self.cfg.sealed)
+        return (float(lim.cpus), mem_bytes(lim.memory), int(lim.gpus))
+
+    def _free(self) -> tuple[float, int, int]:
+        cpus, mem, gpus = self.capacity
+        for _, c, m, g in self._jobs.values():
+            cpus, mem, gpus = cpus - c, mem - m, gpus - g
+        return cpus, mem, gpus
+
+    def _fits(self, need: tuple[float, int, int]) -> bool:
+        if not self._jobs:
+            return True              # always run one job, whatever this machine is
+        c, m, g = self._free()
+        gpu_busy = any(j[3] for j in self._jobs.values())
+        # The sandbox gives a GPU job every GPU, so GPU jobs never share.
+        return need[0] <= c and need[1] <= m and (not need[2] or (not gpu_busy and need[2] <= g))
+
+    def _room_for_any(self) -> bool:
+        """Whether a job of any connected task could start now: taken from the hub only
+        then, so a job never waits here for resources once it is ours."""
+        if self.parallel <= 1 or not self._jobs:
+            return not self._jobs
+        if len(self._jobs) >= self.parallel:
+            return False
+        needs = [self._need("", tid) for tid in self.cfg.tasks] or [(1.0, 0, 0)]
+        return self._fits(tuple(max(n[i] for n in needs) for i in range(3)))
+
+    def _dispatch(self, sid: str, task: str, submitter: str, need: tuple[float, int, int]) -> None:
+        if self.parallel <= 1:
+            self._run(sid, task, submitter)
+            self.cache.evict(self.cfg.cache_gb << 30)
+            return
+        th = threading.Thread(target=self._run, args=(sid, task, submitter), daemon=True,
+                              name=f"eval-{sid}")
+        self._jobs[sid] = (th, *need)
+        th.start()
+
+    def _reap(self) -> bool:
+        done = [sid for sid, j in self._jobs.items() if not j[0].is_alive()]
+        for sid in done:
+            self._jobs.pop(sid)
+        if done and not self._jobs:
+            # Evict only when nothing runs: a job assembling its bundle needs its files cached.
+            self.cache.evict(self.cfg.cache_gb << 30)
+        return bool(done)
+
+    def wait_jobs(self, timeout: float | None = None) -> None:
+        for th, *_ in list(self._jobs.values()):
+            th.join(timeout)
+        self._reap()
 
     def _note_updates(self, versions: dict) -> None:
         """BioModelBench changed a task: tell the provider (once per version).
@@ -274,8 +361,10 @@ class Worker:
         deadline = time.time() + max_s
         self.store.requeue_running()
         while time.time() < deadline:
-            if not self.step() and not self.store.released_unposted():
+            if not self.step() and not self.store.released_unposted() and not self._jobs:
                 break
+            if self._jobs:
+                self.wait_jobs(timeout=0.05)
 
     # -------------------------------------------------------------- jobs
 
@@ -329,7 +418,7 @@ class Worker:
                      submitter=submitter, bundle_id=job.get("bundle_id"),
                      bytes=sum(f["size"] for f in files), downloaded=fetched)
         self.store.start(sid)
-        self._run(sid, task, submitter)
+        self._dispatch(sid, task, submitter, (float(lim.cpus), mem_bytes(lim.memory), int(lim.gpus)))
 
     def _run(self, sid: str, task: str, submitter: str) -> None:
         path = self.queue_dir / f"{sid}.json"
@@ -352,4 +441,3 @@ class Worker:
             result = {"run_id": sid, "status": "error", "error": EvalError("infra_error").public()}
         self.store.finish(sid, result)
         path.unlink(missing_ok=True)
-        self.cache.evict(self.cfg.cache_gb << 30)

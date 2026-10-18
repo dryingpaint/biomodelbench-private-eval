@@ -337,3 +337,31 @@ def test_exited_sealed_vm_is_deleted_so_its_disk_frees_quota(hub, provider_files
     status["value"] = "TERMINATED"
     assert L.remove_stopped(store, project="p") == 1 and calls[-1] == "DELETE"
     assert L.remove_stopped(store, project="p") == 0                              # done once
+
+
+def test_hub_passes_through_only_uv_and_python_release_files(hub, monkeypatch):  # noqa: F811
+    import io as _io
+    import urllib.request
+    store, url = hub
+    fetched = []
+
+    def fake_urlopen(u, timeout=60):
+        fetched.append(u)
+        return _io.BytesIO(b"release bytes")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)    # stands in for GitHub
+
+    def get(path):
+        import http.client
+        from urllib.parse import urlsplit
+        c = http.client.HTTPConnection(urlsplit(url).hostname, urlsplit(url).port)
+        c.request("GET", path)
+        r = c.getresponse()
+        return r.status, r.read()
+    assert get("/dl/uv/0.13.1/uv-x86_64-unknown-linux-musl.tar.gz") == (200, b"release bytes")
+    assert fetched == ["https://github.com/astral-sh/uv/releases/download/0.13.1/"
+                       "uv-x86_64-unknown-linux-musl.tar.gz"]
+    assert get("/dl/uv/0.13.1/uv-x86_64-unknown-linux-musl.tar.gz")[0] == 200
+    assert len(fetched) == 1                                   # served from the cache
+    assert get("/dl/other/1/x")[0] in (401, 404)               # only uv and python
+    assert get("/dl/uv/../../etc/passwd")[0] in (401, 404)
+    assert get("/dl/python/../x")[0] in (401, 404)

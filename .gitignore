@@ -12,3 +12,6 @@ state/
 private_data/
 approved.lock.json
 hub_state/
+bin/
+python/
+cache/

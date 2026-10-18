@@ -141,8 +141,12 @@ def container_cmd(engine: str, image: str, runtime: str | None, *, name: str, en
     if gpus:
         # Podman uses CDI device names; Docker the NVIDIA runtime hook.
         cmd += (["--device", "nvidia.com/gpu=all"] if engine == "podman" else ["--gpus", "all"])
+    # SELinux (RHEL, Rocky, Alma, Fedora): mounted files need the container label or the
+    # sandbox can't read them. "z" (shared) rather than "Z": inputs can be hard links to the
+    # provider's own files, which other programs of theirs may still need to read.
+    opts = "ro,z" if Path("/sys/fs/selinux/enforce").exists() else "ro"
     for m in mounts:
-        cmd += ["-v", f"{m.host.resolve()}:{m.container}:ro", "-e", f"{m.env}={m.container}"]
+        cmd += ["-v", f"{m.host.resolve()}:{m.container}:{opts}", "-e", f"{m.env}={m.container}"]
     for k, v in env.items():
         cmd += ["-e", f"{k}={v}"]
     cmd += [image, "python", "-m", f"bmb_eval.sandbox_entry.{entry}"]

@@ -78,8 +78,14 @@ $DOMAIN {
     }
 }
 CADDY
-caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile.new >/dev/null
-mv /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile
+caddy_changed=0
+if ! cmp -s /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile; then
+  caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile.new >/dev/null
+  mv /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile
+  caddy_changed=1
+else
+  rm -f /etc/caddy/Caddyfile.new
+fi
 
 # Warm the page cache with the new code before the swap. The VM's standard persistent disk
 # reads the venv's thousands of files slowly: on 2026-10-17 a restart right after an
@@ -88,10 +94,12 @@ mv /etc/caddy/Caddyfile.new /etc/caddy/Caddyfile
 as_bmb "cd $CODE && time .venv/bin/python -c 'import bmb_eval.hub, bmb_eval.sealed_launcher'" 2>&1 | grep real || true
 
 systemctl enable bmb-hub caddy >/dev/null
-# Everything above ran with the old hub still serving. Now swap: restart the hub, and
-# reload Caddy's config in place (a reload drops no connections).
+# Everything above ran with the old hub still serving. Now swap: restart the hub (Caddy
+# holds requests meanwhile). Caddy itself is reloaded only when its config changed: a
+# reload can drop a request that arrives mid-swap (one did, in testing).
 systemctl restart bmb-hub
-if systemctl is-active -q caddy; then systemctl reload caddy; else systemctl restart caddy; fi
+if ! systemctl is-active -q caddy; then systemctl restart caddy
+elif [ "$caddy_changed" = 1 ]; then systemctl reload caddy; fi
 for i in $(seq 1 60); do
   # Any HTTP answer means it's up (/v1/tasks wants a token: 401 without one).
   code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8790/v1/tasks || true)"

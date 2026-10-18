@@ -26,8 +26,8 @@ hardware, that it runs the exact software you approved, with debugging off.
 - **Permission in that project** to enable services, create a Cloud KMS key,
   a storage bucket and a workload identity pool, and grant access to them.
   The project's Owner has all of these. Otherwise ask for these roles:
-  Service Usage Admin, Cloud KMS Admin, Storage Admin, Workload Identity Pool
-  Admin.
+  Service Usage Admin, Cloud KMS Admin, Cloud KMS CryptoKey Encrypter, Storage
+  Admin, Workload Identity Pool Admin.
 - **The Google Cloud CLI (`gcloud`)**, logged in (`gcloud auth login`), on any
   macOS or Linux computer that has your data.
 - **Your data**, as one file or one folder, as described in our email.

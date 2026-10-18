@@ -130,16 +130,31 @@ class GcloudError(SystemExit):
 def _gcloud(*args: str, project: str | None = None, input: bytes | None = None,
             check: bool = True) -> str:
     cmd = ["gcloud", *args, "--quiet", *(["--project", project] if project else [])]
-    r = subprocess.run(cmd, input=input, capture_output=True)
+    for _ in range(18):          # a service enabled moments ago takes a minute or two to work
+        r = subprocess.run(cmd, input=input, capture_output=True)
+        if r.returncode == 0 or not _just_enabled(r.stderr):
+            break
+        time.sleep(10)
     if check and r.returncode != 0:
-        msg = r.stderr.decode(errors="replace").strip().splitlines()
-        raise GcloudError("Google Cloud said:\n  " + "\n  ".join(msg[-4:]))
+        lines = r.stderr.decode(errors="replace").strip().splitlines()
+        # gcloud's own "ERROR: (gcloud.x) ..." lines say what went wrong; the rest is detail.
+        msg = [ln for ln in lines if ln.startswith("ERROR:")] or lines[-4:]
+        raise GcloudError(f"Google Cloud refused `gcloud {' '.join(args[:3])}`:\n  " + "\n  ".join(msg))
     return r.stdout.decode().strip()
 
 
+def _just_enabled(stderr: bytes) -> bool:
+    return any(m in stderr for m in (b"SERVICE_DISABLED", b"has not been used in project",
+                                     b"it is disabled"))
+
+
 def _exists(*args: str, project: str) -> bool:
-    return subprocess.run(["gcloud", *args, "--quiet", "--project", project],
-                          capture_output=True).returncode == 0
+    for _ in range(18):
+        r = subprocess.run(["gcloud", *args, "--quiet", "--project", project], capture_output=True)
+        if r.returncode == 0 or not _just_enabled(r.stderr):
+            return r.returncode == 0
+        time.sleep(10)
+    return False
 
 
 def check_gcloud() -> None:
@@ -152,13 +167,11 @@ def check_gcloud() -> None:
 def setup_provider_cloud(project: str, digest: str, workload_sa: str, gpu_preview: bool) -> dict:
     """Key, bucket and attestation rule in the provider's project (idempotent).
     Returns the non-secret pointers the node needs."""
-    num = _gcloud("projects", "describe", project, "--format=value(projectNumber)")
-    bucket = f"gs://{project}-bmb-data"
-    key = f"projects/{project}/locations/{LOCATION}/keyRings/bmb/cryptoKeys/data"
-    member = (f"principalSet://iam.googleapis.com/projects/{num}/locations/global/"
-              f"workloadIdentityPools/{POOL_ID}/*")
+    # First: a new project has none of these on.
     _gcloud("services", "enable", "cloudkms.googleapis.com", "storage.googleapis.com",
             "iam.googleapis.com", "sts.googleapis.com", project=project)
+    bucket = f"gs://{project}-bmb-data"
+    key = f"projects/{project}/locations/{LOCATION}/keyRings/bmb/cryptoKeys/data"
     if not _exists("kms", "keyrings", "describe", "bmb", "--location", LOCATION, project=project):
         _gcloud("kms", "keyrings", "create", "bmb", "--location", LOCATION, project=project)
     if not _exists("kms", "keys", "describe", "data", "--keyring", "bmb", "--location", LOCATION,
@@ -172,6 +185,12 @@ def setup_provider_cloud(project: str, digest: str, workload_sa: str, gpu_previe
                    project=project):
         _gcloud("iam", "workload-identity-pools", "create", POOL_ID, "--location", "global",
                 "--display-name", "BioModelBench evaluation", project=project)
+    # The pool's name carries the project number ("projects/<number>/locations/..."), so
+    # `projects describe` (another API and another role) isn't needed.
+    pool = _gcloud("iam", "workload-identity-pools", "describe", POOL_ID, "--location", "global",
+                   "--format=value(name)", project=project)
+    num = pool.split("/")[1]
+    member = f"principalSet://iam.googleapis.com/{pool}/*"
     verb = ("update-oidc" if _exists("iam", "workload-identity-pools", "providers", "describe",
                                      PROVIDER_ID, "--location", "global",
                                      "--workload-identity-pool", POOL_ID, project=project)

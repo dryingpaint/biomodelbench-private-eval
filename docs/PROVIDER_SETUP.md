@@ -36,7 +36,10 @@ hardware, that it runs the exact software you approved, with debugging off.
   (`accounts.google.com`, `*.googleapis.com`) and PyPI (`pypi.org`,
   `files.pythonhosted.org`), or the PyPI mirror your organization uses (set
   `PIP_INDEX_URL`, or pip's own setting, and it's used). An HTTPS proxy works:
-  set `HTTPS_PROXY` as usual. Nothing else is needed: the Python and tools it
+  set `HTTPS_PROXY` as usual. If your network inspects HTTPS with its own
+  certificate authority, this computer must trust it (it already does if your
+  browser works), and gcloud needs it too:
+  `gcloud config set core/custom_ca_certs_file /path/to/your-company-ca.pem`. Nothing else is needed: the Python and tools it
   installs come through `eval.biomodelbench.org`.
 
 Run the command from our email:

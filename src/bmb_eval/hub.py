@@ -35,6 +35,7 @@ import sqlite3
 import tarfile
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -373,7 +374,8 @@ def cached_download(cache: Path, kind: str, release: str, name: str) -> Path | N
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{name}.{secrets.token_hex(4)}")
     try:
-        with urllib.request.urlopen(f"{DOWNLOADS[kind]}/{release}/{name}", timeout=60) as r, \
+        url = f"{DOWNLOADS[kind]}/{urllib.parse.quote(release)}/{urllib.parse.quote(name)}"
+        with urllib.request.urlopen(url, timeout=60) as r, \
                 tmp.open("wb") as f:
             n = 0
             while chunk := r.read(1 << 20):
@@ -528,7 +530,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 conf = store.setting("confidential")
                 return self._send(200, conf) if conf else self._err(
                     404, "not_found", "Confidential mode isn't set up on this hub.")
-            if m := DOWNLOAD_RE.fullmatch(p):
+            if p.startswith("/dl/") and (m := DOWNLOAD_RE.fullmatch(urllib.parse.unquote(p))):
                 path = cached_download(store.state / "downloads", *m.groups())
                 return (self._send_file(path, "application/octet-stream") if path
                         else self._err(404, "not_found", "No such release file."))

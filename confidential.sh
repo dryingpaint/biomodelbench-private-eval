@@ -45,7 +45,10 @@ if [ -z "${UV_DEFAULT_INDEX:-}" ]; then
     sed -n 's/^[[:space:]]*index-url[[:space:]]*=[[:space:]]*//p' | head -n 1)}"
   if [ -n "$INDEX" ]; then export UV_DEFAULT_INDEX="$INDEX"; fi
 fi
-[ -x "$DIR/.venv/bin/python" ] || "$DIR/bin/uv" venv -q --python 3.12 "$DIR/.venv"
+if [ ! -x "$DIR/.venv/bin/python" ] && ! "$DIR/bin/uv" venv -q --python 3.12 "$DIR/.venv"; then
+  echo "Couldn't install Python 3.12 (downloaded through $HUB)." >&2
+  exit 1
+fi
 if ! VIRTUAL_ENV="$DIR/.venv" "$DIR/bin/uv" pip install -q "$DIR/app[seal]"; then
   echo "Couldn't download Python packages from ${UV_DEFAULT_INDEX:-PyPI (pypi.org, files.pythonhosted.org)}." >&2
   echo "If your network uses a PyPI mirror, run: export PIP_INDEX_URL=<its URL>, then the same command again." >&2

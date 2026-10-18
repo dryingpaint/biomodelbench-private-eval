@@ -1334,3 +1334,38 @@ def test_executable_bundle_files_stay_executable(tmp_path):
     assert not os.access(c.path(by_path["bin/tool"]["sha256"]), os.X_OK)   # the shared blob is untouched
     with pytest.raises(EvalError):                                          # only `true` is accepted
         check_manifest({"files": [{**by_path["predict.py"], "executable": "yes"}]}, 1 << 30)
+
+
+def test_parallel_node_runs_jobs_side_by_side_within_capacity(connected):
+    # max_parallel > 1: jobs run in threads while the loop keeps checking in; each starts
+    # only when its contract's CPUs, memory and GPUs fit what's free.
+    cfg, store, url, agent = connected
+    cfg.max_parallel = 4
+    w = Worker(cfg)
+    lim = cfg.tasks["binding"].contract.limits
+    w.capacity = (lim.cpus * 2, 1 << 50, 0)                 # room for exactly two at once
+    running, peak, lock = [0], [0], threading.Lock()
+
+    def evaluate(task, bundle, run_id, submitter, bundle_id=None, split="validation"):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        time.sleep(0.3)
+        with lock:
+            running[0] -= 1
+        return {"run_id": run_id, "status": "ok", "metrics": {"spearman": 0.9}}
+
+    w.runner.evaluate = evaluate
+    sids = [agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"] for _ in range(4)]
+    w.drain(max_s=30)
+    assert peak[0] == 2                                      # never more than fits
+    assert all(agent.status(s)["result"]["status"] == "ok" for s in sids)
+
+
+def test_serial_node_is_unchanged_by_default(connected):
+    cfg, store, url, agent = connected
+    assert cfg.max_parallel == 1
+    w = Worker(cfg)
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain()
+    assert not w._jobs and agent.status(sid)["result"]["status"] == "ok"

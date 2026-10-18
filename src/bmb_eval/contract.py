@@ -27,7 +27,11 @@ populations). Answers may then be just the key column.
 on their machine, into a validation set (the only one scored during the
 benchmark) and a test set (scored only for final evaluations BioModelBench
 requests, at most `final_evaluations` times, enforced by the node):
-`split: {validation_fraction: 0.5, final_evaluations: 3}`. A fixed split (e.g.
+`split: {validation_fraction: 0.5, final_evaluations: 3}`. That cap is for
+agents' models: one final per agent run. BioModelBench's own reference models
+(baselines, published methods) are evaluated separately, under
+`baseline_final_evaluations` (default 0: none until the provider approves a
+contract that allows them). A fixed split (e.g.
 a published test set) uses `split: {by_column: <answers column>}`, whose value
 is `validation` or `test` per row. Add `group_by: <input
 column>` (e.g. smiles) to keep all rows of a group in the same half, so one
@@ -182,11 +186,25 @@ class Split:
     """Validation/test split of the private rows (see module docstring)."""
     validation_fraction: float | None = None
     final_evaluations: int = 3
+    # Finals of BioModelBench's reference models (baseline tokens), counted
+    # separately on the node. 0 = none: an existing contract never allows more.
+    baseline_final_evaluations: int = 0
     group_by: str | None = None   # input column; rows sharing it stay in one half
     # Fixed split instead of a random one: an answers column whose value is
     # "validation" or "test" per row (e.g. a published test set). Never shown
     # to the model.
     by_column: str | None = None
+
+    @property
+    def total_finals(self) -> int:
+        """Every test-set evaluation the node may ever run: agents' and baselines'."""
+        return self.final_evaluations + self.baseline_final_evaluations
+
+    def describe_finals(self) -> str:
+        """'at most 3 final evaluations' (+ the baselines', when allowed), for summaries."""
+        n, b = self.final_evaluations, self.baseline_final_evaluations
+        return (f"at most {n} final evaluations of agents' models"
+                + (f" and {b} of BioModelBench's reference models ({n + b} in total)" if b else ""))
 
 
 @dataclass
@@ -295,6 +313,8 @@ class Contract:
                 raise ValueError("split: give validation_fraction in (0, 1), or by_column")
             if sp.final_evaluations < 1:
                 raise ValueError("split: final_evaluations must be >= 1")
+            if type(sp.baseline_final_evaluations) is not int or sp.baseline_final_evaluations < 0:
+                raise ValueError("split: baseline_final_evaluations must be an integer >= 0")
         if self.split and self.split.group_by and self.split.group_by not in input_names:
             raise ValueError(f"split.group_by {self.split.group_by!r} is not an input column")
         if self.final_limits:
@@ -355,6 +375,9 @@ class Contract:
             out["data"] = {"include": self.data.include}
         if self.split:
             out["split"] = dict(self.split.__dict__)
+            if not self.split.baseline_final_evaluations:
+                # Omitted when unused: the public contract stays as it was for tasks without it.
+                del out["split"]["baseline_final_evaluations"]
         return out
 
     def limits_for(self, split: str, sealed: bool = False) -> Limits:

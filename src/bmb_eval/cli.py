@@ -281,7 +281,7 @@ def _summary(c, n_rows: int) -> str:
     b = leakage.budget(c)
     lim = c.limits
     total = f", {lim.submissions_total} in total" if lim.submissions_total else ""
-    n_all = (lim.submissions_total or 0) + (c.split.final_evaluations if c.split else 0)
+    n_all = (lim.submissions_total or 0) + (c.split.total_finals if c.split else 0)
     worst = (f"at most ~{_kb(b.lifetime)} of information about your data, "
              f"across all {n_all} evaluations"
              if b.lifetime else f"at most ~{b.per_submission:.0f} bits per evaluation")
@@ -295,10 +295,10 @@ def _summary(c, n_rows: int) -> str:
         f"{c.decimals} decimals",
         f"  Worst case:          a model built to extract data could learn {worst}",
         *([(f"  Held-out test set:   rows marked 'validation' in '{c.split.by_column}' are scored "
-            f"during the benchmark; 'test' rows only for final evaluations (at most "
-            f"{c.split.final_evaluations})") if c.split.by_column else
+            f"during the benchmark; 'test' rows only for final evaluations "
+            f"({c.split.describe_finals()})") if c.split.by_column else
            (f"  Held-out test set:   {c.split.validation_fraction:.0%} of rows scored during the "
-            f"benchmark; the rest only for final evaluations (at most {c.split.final_evaluations})")]
+            f"benchmark; the rest only for final evaluations ({c.split.describe_finals()})")]
           if c.split else []),
     ])
 

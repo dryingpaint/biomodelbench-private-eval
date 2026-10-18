@@ -101,11 +101,16 @@ class Client:
     # Operator token (bmbo_…) only, for automated runs. Like every call here, these
     # return the hub's JSON, {"error": ...} included.
 
-    def agent_token(self, name: str, evaluations: int, rotate: bool = False) -> dict:
-        """Issue one attempt's agent token with an evaluation budget: {name, token}. An
-        existing name is refused unless rotate=True."""
-        return self._req("POST", "/v1/operator/agent-tokens",
-                         {"name": name, "evaluations": evaluations, "rotate": rotate})
+    def agent_token(self, name: str, evaluations: int, rotate: bool = False,
+                    kind: str = "agent") -> dict:
+        """Issue one attempt's agent token with an evaluation budget: {name, kind, token}. An
+        existing name is refused unless rotate=True. kind="baseline" is for BioModelBench's
+        own reference models: their final evaluations count against the task's
+        baseline_final_evaluations instead of the agents' final_evaluations."""
+        body = {"name": name, "evaluations": evaluations, "rotate": rotate}
+        if kind != "agent":
+            body["kind"] = kind     # an agent token's request is the same as before kinds
+        return self._req("POST", "/v1/operator/agent-tokens", body)
 
     def request_final(self, submission_id: str, again: bool = False) -> dict:
         """Final (test set) evaluations of a submission, one per dataset: {finals: [ids]}.

@@ -664,7 +664,8 @@ def score(df):
 """
 
 
-def _split_task(tmp_path, final_evaluations=2, name="split_task", limits="", final_limits=""):
+def _split_task(tmp_path, final_evaluations=2, name="split_task", limits="", final_limits="",
+                baseline_final_evaluations=None):
     d = scaffold.write_task(
         name, tmp_path / "authored_split",
         [("variant_id", "string", False), ("sequence", "string", False)],
@@ -677,7 +678,9 @@ def _split_task(tmp_path, final_evaluations=2, name="split_task", limits="", fin
             "  - {name: spearman, type: float, nullable: true, min: -1, max: 1}\n"
             "  - {name: n, type: int, min: 0, max: 100000}\n"
             "headline: spearman\n\n"
-            f"split: {{validation_fraction: 0.5, final_evaluations: {final_evaluations}}}\n\n"
+            f"split: {{validation_fraction: 0.5, final_evaluations: {final_evaluations}"
+            + (f", baseline_final_evaluations: {baseline_final_evaluations}"
+               if baseline_final_evaluations is not None else "") + "}\n\n"
             + (f"final_limits: {{{final_limits}}}\n\n" if final_limits else "")
             + text[end:])
     if limits:
@@ -752,6 +755,104 @@ def test_node_enforces_final_cap_and_refusals_dont_count(hub, node_dir, provider
     assert w.store.count_final("capped") == 1
 
 
+def _final_results(store, fids):
+    return {f: json.loads(store.q("SELECT result FROM submissions WHERE id=?", (f,), one=True)[0])
+            for f in fids}
+
+
+def test_baseline_finals_have_their_own_cap(hub, node_dir, provider_files, tmp_path):
+    """One test evaluation per agent run; our baselines are evaluated separately and
+    don't use up the agents' finals (nor can agents use the baselines')."""
+    store, url = hub
+    data, _ = provider_files
+    code, _ = store.add_enrollment(_split_task(tmp_path, final_evaluations=1, name="sep",
+                                               baseline_final_evaluations=2))
+    cfg = _connect(node_dir, url, code, data)
+    op = Client(url, store.set_operator())
+    tok = op.agent_token("ref:score", 1, kind="baseline")
+    assert tok["kind"] == "baseline"
+    agent, base = Client(url, store.add_agent("run-a")), Client(url, tok["token"])
+    a_sid = agent.submit_async("sep", EXAMPLE_BUNDLE)["submission_id"]
+    b_sid = base.submit_async("sep", EXAMPLE_BUNDLE)["submission_id"]
+    assert store.q("SELECT kind FROM submissions WHERE id=?", (b_sid,), one=True)[0] == "baseline"
+    w = Worker(cfg)
+    w.drain()
+    b = [store.request_final(b_sid) for _ in range(3)]
+    a = [store.request_final(a_sid) for _ in range(2)]
+    w.drain()
+    res = _final_results(store, a + b)
+    assert res[a[0]]["status"] == "ok" and res[a[1]]["error"]["code"] == "final_quota_exceeded"
+    assert res[b[0]]["status"] == res[b[1]]["status"] == "ok"      # baselines ran first, agent's still ran
+    assert res[b[2]]["error"]["code"] == "final_quota_exceeded"
+    assert w.store.count_final("sep") == 1 and w.store.count_final("sep", "baseline") == 2
+    assert {r[0] for r in w.store.db.execute(
+        "SELECT kind FROM submissions WHERE id IN (?, ?)", (b[0], b[1]))} == {"baseline"}
+
+
+def test_baseline_finals_default_to_none(hub, node_dir, provider_files, tmp_path):
+    """A contract without baseline_final_evaluations allows exactly what it did before:
+    agents' finals up to final_evaluations, and no baseline finals at all."""
+    store, url = hub
+    data, _ = provider_files
+    d = _split_task(tmp_path, final_evaluations=1, name="dflt")
+    c = Contract.load(d / "contract.yaml")
+    assert c.split.baseline_final_evaluations == 0 and c.split.total_finals == 1
+    assert "baseline_final_evaluations" not in c.public()["split"]   # public contract unchanged
+    code, _ = store.add_enrollment(d)
+    cfg = _connect(node_dir, url, code, data)
+    agent = Client(url, store.add_agent("run-d"))
+    base = Client(url, store.add_agent("ref-d", 1, kind="baseline"))
+    a_sid = agent.submit_async("dflt", EXAMPLE_BUNDLE)["submission_id"]
+    b_sid = base.submit_async("dflt", EXAMPLE_BUNDLE)["submission_id"]
+    w = Worker(cfg)
+    w.drain()
+    bf, af, af2 = store.request_final(b_sid), store.request_final(a_sid), store.request_final(a_sid)
+    w.drain()
+    res = _final_results(store, [bf, af, af2])
+    assert res[bf]["error"]["code"] == "final_quota_exceeded"
+    assert res[af]["status"] == "ok" and res[af2]["error"]["code"] == "final_quota_exceeded"
+    assert w.store.count_final("dflt") == 1 and w.store.count_final("dflt", "baseline") == 0
+
+
+def test_unknown_kind_counts_as_an_agents_final(hub, node_dir, provider_files, tmp_path):
+    store, url = hub
+    data, _ = provider_files
+    code, _ = store.add_enrollment(_split_task(tmp_path, final_evaluations=1, name="unk",
+                                               baseline_final_evaluations=5))
+    cfg = _connect(node_dir, url, code, data)
+    agent = Client(url, store.add_agent("run-u"))
+    sid = agent.submit_async("unk", EXAMPLE_BUNDLE)["submission_id"]
+    w = Worker(cfg)
+    w.drain()
+    f1, f2 = store.request_final(sid), store.request_final(sid)
+    store.q("UPDATE submissions SET kind='sota' WHERE id IN (?, ?)", (f1, f2))
+    w.drain()
+    res = _final_results(store, [f1, f2])
+    assert res[f1]["status"] == "ok" and res[f2]["error"]["code"] == "final_quota_exceeded"
+    assert w.store.count_final("unk") == 1 and w.store.count_final("unk", "baseline") == 0
+
+
+def test_baseline_final_evaluations_validated_and_counted(tmp_path):
+    import dataclasses
+    raw = yaml.safe_load((_split_task(tmp_path, final_evaluations=2) / "contract.yaml").read_text())
+    for bad in (-1, "2", 1.5, True):
+        raw["split"]["baseline_final_evaluations"] = bad
+        with pytest.raises(ValueError, match="baseline_final_evaluations"):
+            Contract.from_dict(raw)
+    raw["split"]["baseline_final_evaluations"] = 3
+    c = Contract.from_dict(raw)
+    assert c.split.total_finals == 5
+    assert Contract.from_dict(c.public(), public=True).split.baseline_final_evaluations == 3
+    without = dataclasses.replace(c, split=dataclasses.replace(c.split, baseline_final_evaluations=0))
+    b, b0 = leakage.budget(c), leakage.budget(without)
+    assert b.lifetime - b0.lifetime == pytest.approx(3 * b.per_final)
+    assert "3 of BioModelBench's reference models (5 in total)" in leakage.describe(c)
+    summary = cli._summary(c, 500)
+    assert "at most 2 final evaluations of agents' models and 3 of BioModelBench's" in summary
+    assert "across all 205 evaluations" in summary
+    assert "reference models" not in cli._summary(without, 500)
+
+
 def test_final_on_task_without_split_is_refused(connected):
     cfg, store, url, agent = connected
     sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
@@ -797,6 +898,44 @@ def test_existing_databases_gain_split_column(tmp_path):
     hdb.commit()
     hdb.close()
     assert "split" in {r[1] for r in hub_mod.HubStore(h).db.execute("PRAGMA table_info(submissions)")}
+
+
+def test_existing_databases_gain_kind_columns(tmp_path):
+    """Nodes and hubs from before baseline finals: every existing final is an agent's."""
+    import sqlite3
+    from bmb_eval.store import Store
+    db = sqlite3.connect(tmp_path / "node.db")
+    db.execute("CREATE TABLE submissions (id TEXT PRIMARY KEY, task TEXT NOT NULL, submitter TEXT NOT NULL, "
+               "day TEXT NOT NULL, status TEXT NOT NULL, created REAL NOT NULL, release_at REAL NOT NULL, "
+               "finished REAL, result TEXT, posted INTEGER NOT NULL DEFAULT 0, "
+               "split TEXT NOT NULL DEFAULT 'validation')")
+    db.execute("INSERT INTO submissions VALUES ('f', 't', 'a', '2026-01-01', 'done', 0, 0, 0, '{}', 1, 'test')")
+    db.commit()
+    db.close()
+    s = Store(tmp_path)
+    assert s.count_final("t") == 1 and s.count_final("t", "baseline") == 0
+    s.add("b", "t", "ref", 0, "test", "baseline")
+    assert s.count_final("t") == 1 and s.count_final("t", "baseline") == 1
+    h = tmp_path / "hub"
+    h.mkdir()
+    hdb = sqlite3.connect(h / "hub.db")
+    hdb.execute("CREATE TABLE agents (name TEXT PRIMARY KEY, token_sha256 TEXT NOT NULL, eval_budget INTEGER)")
+    hdb.execute("INSERT INTO agents VALUES ('old-run', 'x', 3)")
+    hdb.execute("CREATE TABLE submissions (id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL, "
+                "created REAL NOT NULL, status TEXT NOT NULL, node_id TEXT, result TEXT, manifest TEXT NOT NULL, "
+                "split TEXT NOT NULL DEFAULT 'validation', group_id TEXT)")
+    hdb.execute("INSERT INTO submissions VALUES ('s', 't', 'old-run', 0, 'done', NULL, NULL, '{}', "
+                "'validation', NULL)")
+    hdb.commit()
+    hdb.close()
+    hs = hub_mod.HubStore(h)
+    assert hs.agent_kind("old-run") == "agent"
+    assert hs.q("SELECT kind FROM submissions WHERE id='s'", one=True)[0] == "agent"
+    assert hs.q("SELECT kind FROM submissions WHERE id=?", (hs.request_final("s"),), one=True)[0] == "agent"
+    hs.add_agent("ref", 1, kind="baseline")
+    assert hs.agent_kind("ref") == "baseline"
+    with pytest.raises(ValueError):
+        hs.add_agent("x", 1, kind="sota")
 
 
 def test_group_split_keeps_each_molecule_in_one_half(tmp_path):
@@ -1295,7 +1434,12 @@ def test_operator_issues_tokens_and_runs_finals_over_the_api(family):
     for bad in (-1, None, 1.5, True):
         assert op._req("POST", "/v1/operator/agent-tokens",
                        {"name": "x", "evaluations": bad})["error"]["code"] == "bad_request"
-    run = Client(url, op.agent_token("run-1", 2)["token"])
+    for bad in ("sota", "", None, 1):
+        assert op._req("POST", "/v1/operator/agent-tokens",
+                       {"name": "x", "evaluations": 1, "kind": bad})["error"]["code"] == "bad_request"
+    tok = op.agent_token("run-1", 2)
+    assert tok["kind"] == "agent" and store.agent_kind("run-1") == "agent"
+    run = Client(url, tok["token"])
     assert run.tasks()["budget"] == {"evaluations": 2, "used": 0}
     assert op.agent_token("run-1", 2)["error"]["code"] == "name_taken"   # a live token isn't cut off
     sid = run.register_final("fitness", EXAMPLE_BUNDLE)["submission_id"]

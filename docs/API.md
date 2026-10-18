@@ -160,7 +160,7 @@ or `false`. When it's `false`, `metrics` repeats your previous best.
 
 | Endpoint | Body or response |
 |---|---|
-| `POST /v1/operator/agent-tokens` | `{"name": "<attempt>", "evaluations": <int >= 0>, "rotate"?: true}`. Returns `{"name", "token"}`. An existing name is refused (`409 name_taken`) unless `rotate` |
+| `POST /v1/operator/agent-tokens` | `{"name": "<attempt>", "evaluations": <int >= 0>, "rotate"?: true, "kind"?: "agent" \| "baseline"}`. Returns `{"name", "kind", "token"}`. An existing name is refused (`409 name_taken`) unless `rotate`. A `"baseline"` token is for BioModelBench's own reference models: its submissions' finals count against the task's `baseline_final_evaluations`, not the agents' `final_evaluations` |
 | `POST /v1/operator/submissions/<id>/final` | `{}` or `{"again": true}`. Queues final (test set) evaluations of a committed or registered submission, one per dataset, and returns `{"finals": ["<id>", …]}`. Idempotent: a dataset that already has a final keeps it unless `again` (each dataset allows only `final_evaluations`) |
 | `GET /v1/operator/submissions/<id>/final` | The latest final evaluation of each dataset, in the family-submission shape: `{"submission_id", "tasks", "status", "result"?}` with `result.datasets` and `result.combined` once every dataset is done |
 
@@ -169,7 +169,7 @@ or `false`. When it's `false`, `metrics` repeats your previous best.
 | Endpoint | Body or response |
 |---|---|
 | `POST /v1/node/hello` | `{"tasks": {"<task>": <public contract>}, "accepting": true, "held": ["<submission id>", …]}`, sent every minute. `held` lists jobs the node still holds; the hub re-queues any others assigned to it |
-| `GET /v1/node/next` | `204` if there's no work, else `{"submission_id", "task", "submitter", "split", "manifest", "bundle_id", "downloads": {"<sha256>": {"url", "headers", "auth"}}}`. `split` is `"validation"` or `"test"`; the node refuses test jobs beyond the contract's `final_evaluations` |
+| `GET /v1/node/next` | `204` if there's no work, else `{"submission_id", "task", "submitter", "split", "kind", "manifest", "bundle_id", "downloads": {"<sha256>": {"url", "headers", "auth"}}}`. `split` is `"validation"` or `"test"`; `kind` is `"agent"` or `"baseline"`. The node refuses agents' test jobs beyond the contract's `final_evaluations` and baselines' beyond its `baseline_final_evaluations` (default 0). Any other kind counts as an agent's |
 | `POST /v1/node/results/<id>` | The payload shown above as `result`, at most 64 KB |
 
 ## Enrollment (used by `bmb-eval connect`)

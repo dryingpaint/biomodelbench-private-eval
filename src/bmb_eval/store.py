@@ -41,16 +41,20 @@ class Store:
         if "split" not in cols:   # nodes installed before held-out test sets
             self.db.execute("ALTER TABLE submissions ADD COLUMN split TEXT NOT NULL DEFAULT 'validation'")
             self.db.commit()
+        if "kind" not in cols:    # nodes installed before baseline finals: every job was an agent's
+            self.db.execute("ALTER TABLE submissions ADD COLUMN kind TEXT NOT NULL DEFAULT 'agent'")
+            self.db.commit()
         self.lock = threading.Lock()
 
     def add(self, sid: str, task: str, submitter: str, release_after_s: int,
-            split: str = "validation") -> None:
+            split: str = "validation", kind: str = "agent") -> None:
         now = time.time()
         with self.lock, self.db:
             self.db.execute(
                 "INSERT OR IGNORE INTO submissions (id, task, submitter, day, status, created, "
-                "release_at, finished, result, posted, split) VALUES (?,?,?,?,?,?,?,?,?,0,?)",
-                (sid, task, submitter, _day(), "queued", now, now + release_after_s, None, None, split))
+                "release_at, finished, result, posted, split, kind) VALUES (?,?,?,?,?,?,?,?,?,0,?,?)",
+                (sid, task, submitter, _day(), "queued", now, now + release_after_s, None, None, split,
+                 kind))
 
     def count_today(self, submitter: str, task: str) -> int:
         with self.lock:
@@ -64,11 +68,14 @@ class Store:
                 "SELECT COUNT(*) FROM submissions WHERE task=? AND split='validation'",
                 (task,)).fetchone()[0]
 
-    def count_final(self, task: str) -> int:
-        """Final (test set) evaluations run or accepted for this task, ever."""
+    def count_final(self, task: str, kind: str = "agent") -> int:
+        """Final (test set) evaluations run or accepted for this task, ever, of one
+        kind: "baseline" (BioModelBench's reference models) or "agent" (everything
+        else, including rows from before kinds existed)."""
+        op = "=" if kind == "baseline" else "!="
         with self.lock:
             return self.db.execute(
-                "SELECT COUNT(*) FROM submissions WHERE task=? AND split='test'",
+                f"SELECT COUNT(*) FROM submissions WHERE task=? AND split='test' AND kind {op} 'baseline'",
                 (task,)).fetchone()[0]
 
     def next_queued(self) -> tuple[str, str, str] | None:

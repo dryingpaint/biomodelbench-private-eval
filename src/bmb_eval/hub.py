@@ -73,6 +73,7 @@ MAX_HELLO_BYTES = 4 << 20   # a node's hello carries every task's public contrac
 MAX_RESULT_BYTES = 64 << 10
 URL_TTL = datetime.timedelta(hours=24)
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
+AGENT_KINDS = ("agent", "baseline")
 
 
 def _h(s: str) -> str:
@@ -186,7 +187,11 @@ class HubStore:
                                  ("submissions", "group_id", "TEXT"),
                                  ("agents", "eval_budget", "INTEGER"),
                                  ("nodes", "confidential", "TEXT"),
-                                 ("nodes", "status", "TEXT")]:
+                                 ("nodes", "status", "TEXT"),
+                                 # "baseline": BioModelBench's reference models, whose finals
+                                 # count against the contract's baseline_final_evaluations.
+                                 ("agents", "kind", "TEXT NOT NULL DEFAULT 'agent'"),
+                                 ("submissions", "kind", "TEXT NOT NULL DEFAULT 'agent'")]:
             if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         self.db.commit()
@@ -236,7 +241,7 @@ class HubStore:
         """Queue a final (test set) evaluation of an existing submission's model.
         Admin only. The provider's node decides whether it may run (its cap). With
         again=False, an existing final is returned instead of spending another."""
-        row = self.q("SELECT task, agent, manifest FROM submissions WHERE id=? AND split='validation' "
+        row = self.q("SELECT task, agent, manifest, kind FROM submissions WHERE id=? AND split='validation' "
                      "AND status NOT IN ('uploading', 'uploading_final')", (sid,), one=True)
         if not row:
             raise KeyError(f"no committed submission {sid}")
@@ -244,8 +249,10 @@ class HubStore:
         if done and not again:
             return done[-1]
         fid = f"{sid}-final{len(done) + 1}"
-        self.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, manifest, split) "
-               "VALUES (?,?,?,?, 'queued', NULL, NULL, ?, 'test')", (fid, row[0], row[1], time.time(), row[2]))
+        # The final keeps its submission's kind: a baseline's counts against the baseline cap.
+        self.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, manifest, split, "
+               "kind) VALUES (?,?,?,?, 'queued', NULL, NULL, ?, 'test', ?)",
+               (fid, row[0], row[1], time.time(), row[2], row[3]))
         return fid
 
     def request_finals(self, sid: str, again: bool = True) -> list[str]:
@@ -255,13 +262,22 @@ class HubStore:
                                          "AND split='validation' ORDER BY task", (sid,))]
         return [self.request_final(c, again) for c in (children or [sid])]
 
-    def add_agent(self, name: str, evaluations: int | None = None) -> str:
+    def add_agent(self, name: str, evaluations: int | None = None, kind: str = "agent") -> str:
         """Token for one attempt. `evaluations` caps its submissions across all
-        tasks and families (a family submission counts once); None = no cap."""
+        tasks and families (a family submission counts once); None = no cap.
+        kind="baseline" (operator only) is for BioModelBench's own reference
+        models: their submissions, and so their finals, are marked as baselines,
+        which providers' nodes cap separately (split.baseline_final_evaluations)."""
+        if kind not in AGENT_KINDS:
+            raise ValueError(f"kind must be one of {AGENT_KINDS}")
         token = "bmba_" + secrets.token_urlsafe(32)
-        self.q("INSERT OR REPLACE INTO agents (name, token_sha256, eval_budget) VALUES (?,?,?)",
-               (name, _h(token), evaluations))
+        self.q("INSERT OR REPLACE INTO agents (name, token_sha256, eval_budget, kind) VALUES (?,?,?,?)",
+               (name, _h(token), evaluations, kind))
         return token
+
+    def agent_kind(self, agent: str) -> str:
+        row = self.q("SELECT kind FROM agents WHERE name=?", (agent,), one=True)
+        return row[0] if row else "agent"
 
     def budget(self, agent: str) -> tuple[int | None, int]:
         """(evaluation budget, evaluations used) for an attempt."""
@@ -657,15 +673,18 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 # or silently cut off a running attempt.
                 try:
                     name, evals = str(body["name"])[:128], body["evaluations"]
-                    if not name or type(evals) is not int or evals < 0:
+                    kind = body.get("kind", "agent")
+                    if not name or type(evals) is not int or evals < 0 or kind not in AGENT_KINDS:
                         raise ValueError
                 except (ValueError, KeyError, TypeError):
                     return self._err(400, "bad_request",
-                                     'Body must be {"name": str, "evaluations": int >= 0, "rotate"?: bool}.')
+                                     'Body must be {"name": str, "evaluations": int >= 0, "rotate"?: bool, '
+                                     '"kind"?: "agent" | "baseline"}.')
                 if store.q("SELECT 1 FROM agents WHERE name=?", (name,), one=True) and not body.get("rotate"):
                     return self._err(409, "name_taken", f"An agent token named {name!r} exists; "
                                      'send "rotate": true to replace it.')
-                return self._send(200, {"name": name, "token": store.add_agent(name, evals)})
+                return self._send(200, {"name": name, "kind": kind,
+                                        "token": store.add_agent(name, evals, kind)})
             if m := re.fullmatch(r"/v1/operator/submissions/([\w-]{1,128})/final", p):
                 if method == "GET":
                     view = store.final_view(m.group(1))
@@ -709,13 +728,14 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if not final and not self._budget_left(agent):
                 return
             sid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(4)
+            kind = store.agent_kind(agent)
             for task in tasks:
                 # A family submission is one row per dataset, sharing a group id.
                 rid, gid = (f"{sid}-{task}", sid) if fam else (sid, None)
                 store.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, "
-                        "manifest, group_id) VALUES (?,?,?,?, ?, NULL, NULL, ?, ?)",
+                        "manifest, group_id, kind) VALUES (?,?,?,?, ?, NULL, NULL, ?, ?, ?)",
                         (rid, task, agent, time.time(), "uploading_final" if final else "uploading",
-                         json.dumps(manifest), gid))
+                         json.dumps(manifest), gid, kind))
             uploads, seen = [], set()
             for f in files:
                 if f["sha256"] in seen or blobs.has(agent, f["sha256"], f["size"]):
@@ -770,7 +790,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._err(404, "not_found", "No such endpoint.")
             with store.lock, store.db:
                 row = store.db.execute(
-                    "SELECT s.id, s.task, s.agent, s.manifest, s.split FROM submissions s JOIN node_tasks t "
+                    "SELECT s.id, s.task, s.agent, s.manifest, s.split, s.kind FROM submissions s "
+                    "JOIN node_tasks t "
                     "ON t.task = s.task WHERE t.node_id=? AND s.status='queued' "
                     "ORDER BY s.created LIMIT 1", (node,)).fetchone()
                 if row:
@@ -782,7 +803,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             downloads = {f["sha256"]: blobs.download(row[2], f["sha256"], f["size"])
                          for f in manifest["files"]}
             self._send(200, {"submission_id": row[0], "task": row[1], "submitter": row[2],
-                             "split": row[4],
+                             "split": row[4], "kind": row[5],
                              "manifest": manifest, "bundle_id": manifest_id(manifest),
                              "downloads": downloads})
 
@@ -922,6 +943,9 @@ def main(argv=None) -> None:
     p = sub.add_parser("agent-token", help="create or rotate an agent token (one per attempt)")
     p.add_argument("name")
     p.add_argument("--evaluations", type=int, help="evaluation budget for this attempt, across all datasets")
+    p.add_argument("--baseline", action="store_true",
+                   help="a token for BioModelBench's own reference model: its finals count against "
+                        "the task's baseline_final_evaluations, not the agents' final_evaluations")
 
     p = sub.add_parser("family", help="group tasks so one submission is scored on all of them")
     p.add_argument("action", choices=["set", "list"])
@@ -1016,7 +1040,7 @@ def main(argv=None) -> None:
     elif args.cmd == "operator-token":
         print(store.set_operator())
     elif args.cmd == "agent-token":
-        print(store.add_agent(args.name, args.evaluations))
+        print(store.add_agent(args.name, args.evaluations, "baseline" if args.baseline else "agent"))
     elif args.cmd == "family":
         if args.action == "set":
             if not args.name or not args.tasks:

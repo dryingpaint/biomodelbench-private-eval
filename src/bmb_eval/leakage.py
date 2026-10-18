@@ -82,7 +82,7 @@ def budget(c: Contract) -> Budget:
         per_submission=per,
         per_final=per_final,
         per_day_per_submitter=per * lim.submissions_per_day,
-        lifetime=(per * lim.submissions_total + per_final * (c.split.final_evaluations if c.split else 0)
+        lifetime=(per * lim.submissions_total + per_final * (c.split.total_finals if c.split else 0)
                   if lim.submissions_total else None),
         notes=notes,
     )
@@ -107,6 +107,6 @@ def describe(c: Contract) -> str:
         part = (f"fixed by '{c.split.by_column}'" if c.split.by_column
                 else f"{c.split.validation_fraction:.0%} validation")
         lines.append(f"  split     {part} (validation scored during the benchmark), "
-                     f"rest test (at most {c.split.final_evaluations} final evaluations)")
+                     f"rest test ({c.split.describe_finals()})")
     lines += [f"  ! {n}" for n in b.notes]
     return "\n".join(lines)

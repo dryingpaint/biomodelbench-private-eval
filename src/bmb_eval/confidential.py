@@ -227,13 +227,24 @@ def setup_provider_cloud(project: str, digest: str, workload_sa: str, gpu_previe
                                      PROVIDER_ID, "--location", "global",
                                      "--workload-identity-pool", POOL_ID, project=project)
             else "create-oidc")
-    _gcloud("iam", "workload-identity-pools", "providers", verb, PROVIDER_ID,
-            "--location", "global", "--workload-identity-pool", POOL_ID,
-            "--issuer-uri", "https://confidentialcomputing.googleapis.com/",
-            "--allowed-audiences", "https://sts.googleapis.com",
-            "--attribute-mapping", "google.subject=assertion.sub",
-            "--attribute-condition", attestation_condition(digest, workload_sa, gpu_preview),
-            project=project)
+    try:
+        _gcloud("iam", "workload-identity-pools", "providers", verb, PROVIDER_ID,
+                "--location", "global", "--workload-identity-pool", POOL_ID,
+                "--issuer-uri", "https://confidentialcomputing.googleapis.com/",
+                "--allowed-audiences", "https://sts.googleapis.com",
+                "--attribute-mapping", "google.subject=assertion.sub",
+                "--attribute-condition", attestation_condition(digest, workload_sa, gpu_preview),
+                project=project)
+    except GcloudError as e:
+        # Google says only "Precondition check failed" when an organization policy
+        # restricts which identity providers may be trusted.
+        if "FAILED_PRECONDITION" in str(e) or "workloadIdentityPoolProviders" in str(e):
+            raise GcloudError(
+                f"{e}\n\nYour organization probably limits which identity providers projects may "
+                "trust (the organization policy iam.workloadIdentityPoolProviders). Ask your Google "
+                f"Cloud administrator to allow https://confidentialcomputing.googleapis.com/ (Google "
+                f"Confidential Space) for project {project}, then run the same command again.") from None
+        raise
     # Decrypt the bundle; encrypt + decrypt the node's own state (quotas, final counts).
     _gcloud("kms", "keys", "add-iam-policy-binding", "data", "--keyring", "bmb",
             "--location", region, "--member", member,

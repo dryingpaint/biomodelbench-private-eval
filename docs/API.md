@@ -161,7 +161,7 @@ or `false`. When it's `false`, `metrics` repeats your previous best.
 | Endpoint | Body or response |
 |---|---|
 | `POST /v1/operator/agent-tokens` | `{"name": "<attempt>", "evaluations": <int >= 0>, "rotate"?: true, "kind"?: "agent" \| "baseline"}`. Returns `{"name", "kind", "token"}`. An existing name is refused (`409 name_taken`) unless `rotate`. A `"baseline"` token is for BioModelBench's own reference models: its submissions' finals count against the task's `baseline_final_evaluations`, not the agents' `final_evaluations` |
-| `POST /v1/operator/submissions/<id>/final` | `{}`. Queues final (test set) evaluations of a committed or registered submission, one per dataset, and returns `{"finals": ["<id>", …]}`. A model is evaluated on the test set once: a dataset that already has a final keeps it, unless the node refused it without running (e.g. `no_test_split`). The node caps each task at `final_evaluations` |
+| `POST /v1/operator/submissions/<id>/final` | `{}` or `{"again": true}`. Queues final (test set) evaluations of a committed or registered submission, one per dataset, and returns `{"finals": ["<id>", …]}`. Idempotent: a dataset that already has a final keeps it unless `again` (each dataset allows only `final_evaluations`) |
 | `GET /v1/operator/submissions/<id>/final` | The latest final evaluation of each dataset, in the family-submission shape: `{"submission_id", "tasks", "status", "result"?}` with `result.datasets` and `result.combined` once every dataset is done |
 
 ## Provider node endpoints (used by `bmb-eval`; listed for reviewers)

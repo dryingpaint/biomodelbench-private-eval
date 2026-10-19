@@ -112,11 +112,11 @@ class Client:
             body["kind"] = kind     # an agent token's request is the same as before kinds
         return self._req("POST", "/v1/operator/agent-tokens", body)
 
-    def request_final(self, submission_id: str) -> dict:
+    def request_final(self, submission_id: str, again: bool = False) -> dict:
         """Final (test set) evaluations of a submission, one per dataset: {finals: [ids]}.
-        Idempotent: a model is evaluated on the test set once, so a dataset that already
-        has a final keeps it (unless the node refused it without running)."""
-        return self._req("POST", f"/v1/operator/submissions/{submission_id}/final", {})
+        Idempotent: a dataset that already has one keeps it unless again=True, since each
+        dataset allows only a few."""
+        return self._req("POST", f"/v1/operator/submissions/{submission_id}/final", {"again": again})
 
     def final(self, submission_id: str) -> dict:
         """The latest final evaluations of a submission: {status, tasks, result}, where

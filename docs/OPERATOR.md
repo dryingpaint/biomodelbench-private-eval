@@ -184,7 +184,7 @@ With `split` in the contract:
   nominates, then read the results:
 
 ```bash
-$HUB_ADMIN final <submission_id>      # queues the model's one test-set run (repeating it returns the same)
+$HUB_ADMIN final <submission_id>      # queues a test-set run of that model
 $HUB_ADMIN results <task>             # validation and final scores; final ones are visible only here
 ```
 

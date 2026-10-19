@@ -246,16 +246,15 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
     return failed
 
 
-def _kb(bits: float) -> str:
-    b = bits / 8
-    return f"{b:,.0f} bytes" if b < 1000 else f"{b / 1000:.1f} KB"
+def _round(n: float) -> int:
+    return max(1, int(round(n, -1) if n >= 100 else round(n)))
 
 
 def _rows(n: float, n_rows: int) -> str:
     """'about 120 of your 7,343 rows (1.6%)', capped at all of them."""
     if n >= n_rows:
         return f"all {n_rows:,} rows"
-    n = max(1, round(n, -1) if n >= 100 else round(n))
+    n = _round(n)
     return f"about {n:,.0f} of your {n_rows:,} rows ({n / n_rows:.1%})"
 
 
@@ -310,8 +309,9 @@ def _summary(c, n_rows: int) -> str:
         hidden = describe_hidden(c)
         worst = (f"recover the {hidden} values of {_rows(rows, n_rows)}, across all "
                  f"{n_all} evaluations (estimate, at about 3 significant digits per value)")
-    elif b.lifetime:
-        worst = f"learn at most ~{_kb(b.lifetime)} of information about your data, across all {n_all} evaluations"
+    elif b.lifetime and (n := leakage.values_recoverable(b.lifetime)) is not None:
+        worst = (f"recover about {_round(n):,} of the hidden measured values in your data, across "
+                 f"all {n_all} evaluations (estimate, at about 3 significant digits per value)")
     else:
         worst = f"learn at most ~{b.per_submission:.0f} bits per evaluation"
     return "\n".join([

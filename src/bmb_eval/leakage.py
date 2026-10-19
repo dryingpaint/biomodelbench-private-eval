@@ -119,6 +119,12 @@ def rows_recoverable(c: Contract, bits: float) -> float | None:
     return bits / per if per and not math.isinf(bits) else None
 
 
+def values_recoverable(bits: float) -> float | None:
+    """Worst-case estimate when answers aren't per-row columns (private files): how
+    many measured numbers, at about 3 significant digits, `bits` could pin down."""
+    return None if math.isinf(bits) else bits / VALUE_BITS
+
+
 def describe(c: Contract) -> str:
     b = budget(c)
     lines = [
@@ -137,6 +143,8 @@ def describe(c: Contract) -> str:
     if b.lifetime is not None and (n := rows_recoverable(c, b.lifetime)) is not None:
         lines.append(f"  ≈ the hidden values of ~{n:,.0f} rows, worst case "
                      f"({bits_per_row(c):.0f} bits per row)")
+    elif b.lifetime is not None and (n := values_recoverable(b.lifetime)) is not None:
+        lines.append(f"  ≈ ~{n:,.0f} hidden numbers at ~3 significant digits, worst case")
     if c.split:
         part = (f"fixed by '{c.split.by_column}'" if c.split.by_column
                 else f"{c.split.validation_fraction:.0%} validation")

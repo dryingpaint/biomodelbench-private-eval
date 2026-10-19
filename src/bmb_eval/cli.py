@@ -6,6 +6,7 @@ Everything else is for troubleshooting, operators, or agents.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import platform
@@ -15,12 +16,13 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
-from . import approval, audit, leakage, scaffold
+from . import approval, audit, leakage, progress, scaffold
 from .config import save_yaml
 from .sandbox import ENGINES, detect_engine, gpus_here, make as make_sandbox, sandbox_stamp, stale_image_message
 
@@ -91,25 +93,33 @@ def cmd_build_image(args) -> None:
             with urllib.request.urlopen(args.from_url + ".sha256", timeout=60) as r:
                 want = r.read().decode().split()[0]
             with tempfile.NamedTemporaryFile(suffix=".tar", dir=Path.home()) as f:
-                print("downloading the sandbox image (several GB)...")
                 h = hashlib.sha256()
                 with urllib.request.urlopen(args.from_url, timeout=600) as r:
+                    total = int(r.headers.get("Content-Length") or 0)
+                    t0 = progress.step(
+                        "Downloading the sandbox image models run in"
+                        + (f" ({progress.human_bytes(total)})" if total else ""),
+                        progress.transfer_estimate(total) if total else "a few minutes")
+                    bar = progress.Bar("Sandbox image", total)
                     while chunk := r.read(8 << 20):
                         h.update(chunk)
                         f.write(chunk)
+                        bar.update(len(chunk))
+                    bar.close()
                 f.flush()
                 if h.hexdigest() != want:
                     raise ValueError("checksum mismatch")
+                print(f"  Loading it into {engine} (a minute or two)...", flush=True)
                 subprocess.run([engine, "load", "-i", f.name], check=True, capture_output=True)
-            print("sandbox image ready")
+            progress.done(t0, "Sandbox image ready")
             return
         except Exception as e:
             print(f"prebuilt image unavailable ({type(e).__name__}: {e}); building locally instead")
     root = _repo_root()
-    print("building the sandbox image (a few minutes the first time)...")
+    t0 = progress.step("Building the sandbox image models run in", "5-15 minutes the first time")
     subprocess.run([engine, "build", "-q", "--build-arg", f"BMB_SANDBOX_STAMP={sandbox_stamp(root)}",
                     "-t", IMAGE, "-f", str(root / "sandbox" / "Dockerfile"), str(root)], check=True)
-    print("sandbox image ready")
+    progress.done(t0, "Sandbox image ready")
 
 
 # ----------------------------------------------------------------- connect
@@ -205,6 +215,7 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
     runner = Runner(cfg, send_alerts=False)
     local = cfg.backend == "local"
     failed = 0
+    runs = []
     for a in ATTACKS:
         limits = a.limits
         if a.gpu_only:
@@ -218,6 +229,8 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
             if verbose:
                 print(f"  SKIP  {a.name:14s} {a.what} (local backend has no isolation)")
             continue
+        runs.append((a, limits))
+    for i, (a, limits) in enumerate(runs, 1):
         p = runner.evaluate(task, bundle_bytes(a), submitter="selftest", limits_override=limits)
         got = "ok" if p["status"] == "ok" else p["error"]["code"]
         leaked = first_row in json.dumps(p)
@@ -226,7 +239,9 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
         if verbose or not ok:
             why = "" if ok else f"  expected {a.expect}, got {got}" + (
                 ", PRIVATE DATA IN PAYLOAD" if leaked else "")
-            print(f"  {'PASS' if ok else 'FAIL'}  {a.name:14s} {a.what}{why}")
+            print(f"\r  {'PASS' if ok else 'FAIL'}  {a.name:14s} {a.what}{why}\033[K")
+        if not verbose:
+            progress.counter("Attacks blocked so far", i - failed, len(runs))
     audit.record(cfg.state_dir, "selftest", task=task, backend=cfg.backend, failed=failed)
     return failed
 
@@ -234,6 +249,14 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
 def _kb(bits: float) -> str:
     b = bits / 8
     return f"{b:,.0f} bytes" if b < 1000 else f"{b / 1000:.1f} KB"
+
+
+def _rows(n: float, n_rows: int) -> str:
+    """'about 120 of your 7,343 rows (1.6%)', capped at all of them."""
+    if n >= n_rows:
+        return f"all {n_rows:,} rows"
+    n = max(1, round(n, -1) if n >= 100 else round(n))
+    return f"about {n:,.0f} of your {n_rows:,} rows ({n / n_rows:.1%})"
 
 
 def hardware_problems(lim, root: Path) -> list[str]:
@@ -282,9 +305,15 @@ def _summary(c, n_rows: int) -> str:
     lim = c.limits
     total = f", {lim.submissions_total} in total" if lim.submissions_total else ""
     n_all = (lim.submissions_total or 0) + (c.split.total_finals if c.split else 0)
-    worst = (f"at most ~{_kb(b.lifetime)} of information about your data, "
-             f"across all {n_all} evaluations"
-             if b.lifetime else f"at most ~{b.per_submission:.0f} bits per evaluation")
+    rows = leakage.rows_recoverable(c, b.lifetime) if b.lifetime else None
+    if rows is not None:
+        hidden = describe_hidden(c)
+        worst = (f"recover the {hidden} values of {_rows(rows, n_rows)}, across all "
+                 f"{n_all} evaluations (estimate, at about 3 significant digits per value)")
+    elif b.lifetime:
+        worst = f"learn at most ~{_kb(b.lifetime)} of information about your data, across all {n_all} evaluations"
+    else:
+        worst = f"learn at most ~{b.per_submission:.0f} bits per evaluation"
     return "\n".join([
         f"  Task:                {c.title}",
         f"  Rows:                {n_rows:,}",
@@ -293,7 +322,8 @@ def _summary(c, n_rows: int) -> str:
         f"  Evaluations:         at most {lim.submissions_per_day}/day per agent{total}",
         f"  What leaves:         only scores ({', '.join(m.name for m in c.metrics)}), "
         f"{c.decimals} decimals",
-        f"  Worst case:          a model built to extract data could learn {worst}",
+        textwrap.fill(f"a model built to extract data could {worst}", width=92,
+                      initial_indent="  Worst case:          ", subsequent_indent=" " * 23),
         *([(f"  Held-out test set:   rows marked 'validation' in '{c.split.by_column}' are scored "
             f"during the benchmark; 'test' rows only for final evaluations "
             f"({c.split.describe_finals()})") if c.split.by_column else
@@ -303,7 +333,68 @@ def _summary(c, n_rows: int) -> str:
     ])
 
 
+
+def write_task_files(files: dict, task_dir: Path) -> None:
+    """Write a task package from the hub into task_dir: text files, or
+    {"base64": ...} for binary ones, keyed by path relative to the task folder."""
+    for name, body in files.items():
+        parts = PurePosixPath(name).parts
+        if not parts or name.startswith("/") or "\\" in name or any(p.startswith(".") for p in parts):
+            raise SystemExit(f"unexpected file in task package: {name!r}")
+        out = task_dir.joinpath(*parts)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(body, dict):
+            out.write_bytes(base64.b64decode(body["base64"]))
+        else:
+            out.write_text(body)
+
+
+class SetupSteps:
+    """Which step a connect command is on. If it fails, BioModelBench is told the
+    step and a fixed reason (never data, paths or error text) so we can help."""
+
+    # Leaving these steps through an exit means this, unless a raise site says otherwise.
+    EXIT_REASON = {"data_check": "data_problem", "review": "declined",
+                   "hardware_check": "machine_not_ready", "selftest": "selftest_failed",
+                   "gcloud_check": "gcloud_not_ready", "fetch_task": "hub_error",
+                   "activate": "hub_error", "notify": "hub_error"}
+
+    def __init__(self):
+        self.step, self.reason, self.hub, self.code = "start", None, None, None
+
+    def at(self, step: str) -> None:
+        self.step, self.reason = step, None
+
+    def failed(self, e: BaseException) -> None:
+        if not (self.hub and self.code) or (isinstance(e, SystemExit) and e.code in (None, 0)):
+            return
+        detail = ""
+        if self.reason:
+            reason = self.reason
+        elif isinstance(e, KeyboardInterrupt):
+            reason = "interrupted"
+        elif "HTTPS certificate" in str(e):
+            reason = "tls"
+        elif type(e).__name__ == "GcloudError":
+            reason = "gcloud_refused"
+        elif isinstance(e, SystemExit):
+            reason = self.EXIT_REASON.get(self.step, "stopped")
+        else:
+            reason, detail = "crashed", type(e).__name__
+        from .node import HubAPI
+        HubAPI(self.hub).report_setup(self.code, self.step, reason, detail)
+
+
 def cmd_connect(args) -> None:
+    steps = SetupSteps()
+    try:
+        _connect(args, steps)
+    except BaseException as e:
+        steps.failed(e)
+        raise
+
+
+def _connect(args, steps: SetupSteps) -> None:
     from .config import Config
     from .node import HubAPI, HubError, parse_connect
     cfg_path = Path(args.config).resolve()
@@ -316,11 +407,13 @@ def cmd_connect(args) -> None:
     if not saved_hub and hub_file.exists():
         saved_hub = hub_file.read_text().strip() or None
     hub_url, code = parse_connect(args.code, args.hub or saved_hub)
+    steps.hub, steps.code = hub_url, code
 
     # 1. Fetch the task package. A node that already used this code (re-runs,
     #    updates) identifies itself, so the code keeps working for it.
     existing = (yaml.safe_load(cfg_path.read_text()) or {}) if cfg_path.exists() else {}
     secret = (existing.get("hub") or {}).get("secret")
+    steps.at("fetch_task")
     try:
         pkg = HubAPI(hub_url, secret).enrollment(code)
     except HubError as e:
@@ -334,6 +427,7 @@ def cmd_connect(args) -> None:
     if not cfg_path.exists():
         cmd_init(argparse.Namespace(config=str(cfg_path), engine="auto", force=False))
     cfg = Config.load(cfg_path)
+    steps.at("sandbox_image")
     if cfg.backend in ENGINES and (make_sandbox(cfg).image_id() == "missing" or stale_image_message(cfg)):
         cmd_build_image(argparse.Namespace(config=str(cfg_path), from_url=f"{hub_url}/sandbox-image.tar"))
     if stale := stale_image_message(cfg):
@@ -341,15 +435,16 @@ def cmd_connect(args) -> None:
                          "wait a few minutes and run the same command again.")
     task_dir = root / "tasks" / task
     task_dir.mkdir(parents=True, exist_ok=True)
-    for name, text in pkg["files"].items():
-        if "/" in name or name.startswith("."):
-            raise SystemExit("unexpected file in task package")
-        (task_dir / name).write_text(text)
+    write_task_files(pkg["files"], task_dir)
 
     # 3. Their data (one table or a folder), split locally into what the model
     #    sees and the answers.
     from .contract import Contract
     from .prepare import DataError, apply_split, prepare
+    steps.at("data_check")
+    data_bytes = progress.size_of(_user_path(args.data)) if _user_path(args.data).exists() else 0
+    t0 = progress.step(f"Checking your data ({progress.human_bytes(data_bytes)}) and preparing it "
+                       "on this machine", progress.transfer_estimate(data_bytes, mb_per_s=25))
     try:
         contract = Contract.load(task_dir / "contract.yaml")
         inputs_dir, answers, n_rows = prepare(contract, _user_path(args.data),
@@ -370,13 +465,14 @@ def cmd_connect(args) -> None:
         for p in e.problems:
             print(f"  • {p}")
         raise SystemExit("\nFix it and run the same command again.")
-    print(f"✓ Your data looks good ({n_rows:,} rows)")
+    progress.done(t0, f"Your data looks good ({n_rows:,} rows)")
     if split_counts:
         how = (f"by the '{contract.split.by_column}' column" if contract.split.by_column
                else "at random on this machine")
         print(f"✓ Split {how}: {split_counts[0]:,} validation rows (scored during "
               f"the benchmark), {split_counts[1]:,} test rows (held out for final evaluations)")
 
+    steps.at("hardware_check")
     if problems := hardware_problems(cfg.tasks[task].contract.limits, root):
         print("\nThis machine isn't quite ready for this task:")
         for p in problems:
@@ -391,19 +487,24 @@ def cmd_connect(args) -> None:
         print(f"  {note}")
 
     # 4. Prove the sandbox holds on this machine, with this data.
-    print("  Testing this machine's security (about a minute)...")
+    steps.at("selftest")
+    t0 = progress.step("Testing this machine's security: running known attacks against the sandbox",
+                       "1-3 minutes")
     if _selftest(cfg, task, verbose=False):
         raise SystemExit("\nThe security self-test failed, so nothing was started. "
                          "Please send the lines above to BioModelBench.")
-    print("✓ Security self-test passed")
+    progress.done(t0, "Security self-test passed")
 
     # 5. Informed approval.
+    steps.at("review")
+    progress.step("Your review: what you're agreeing to")
     print("\n" + _summary(cfg.tasks[task].contract, n_rows) + "\n")
     if not args.yes and _ask("Approve and start? [y/N] ") not in ("y", "yes"):
             raise SystemExit("Not started. Nothing was shared. "
                              "Run the same command again whenever you're ready.")
 
     # 6. Lock, activate, run.
+    steps.at("activate")
     fp = approval.approve(cfg)
     audit.record(cfg.state_dir, "approved", fingerprint=fp)
     api = HubAPI(hub_url, (cfg.hub or {}).get("secret"))
@@ -428,6 +529,9 @@ def cmd_connect(args) -> None:
     if pending.pop(task, None) is not None:
         updates_path(Config.load(cfg_path)).write_text(json.dumps(pending))
 
+    steps.at("start_service")
+    if not args.no_service:
+        progress.step("Starting the evaluator in the background", "a few seconds")
     started = not args.no_service and _install_service(Config.load(cfg_path))
     print(f"\n✓ Connected. Task '{task}' is live.")
     if started:

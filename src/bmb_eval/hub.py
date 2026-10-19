@@ -25,6 +25,7 @@ deploy/gcp/ and docs/OPERATOR.md. Admin commands: `bmb-hub --help`.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import hashlib
 import io
@@ -59,8 +60,21 @@ CREATE TABLE IF NOT EXISTS submissions (
     id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL, created REAL NOT NULL,
     status TEXT NOT NULL,          -- uploading | queued | assigned | done
     node_id TEXT, result TEXT, manifest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS setup_reports (   -- a provider's connect command that failed
+    code TEXT NOT NULL, step TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL,
+    at REAL NOT NULL);
 """
 ONLINE_S = 120          # a node that polled within this window is "online"
+STALL_S = 3600          # a code used this long ago whose setup never finished is "stalled"
+# What a failed connect may report: its step and a fixed reason, plus an exception's
+# class name for unexpected errors. Never data, paths or error text.
+SETUP_STEPS = {"start", "gcloud_check", "fetch_task", "sandbox_image", "data_check",
+               "hardware_check", "selftest", "review", "activate", "cloud_setup", "upload",
+               "notify", "start_service"}
+SETUP_REASONS = {"data_problem", "declined", "machine_not_ready", "selftest_failed",
+                 "gcloud_not_ready", "gcloud_refused", "region_blocked", "tls", "hub_error",
+                 "interrupted", "stopped", "crashed"}
+SETUP_DETAIL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
 # Release files the provider install needs from GitHub (uv, and the Python uv installs),
 # passed through and cached: providers' networks often allow this hub but not GitHub.
 # Only these two repositories' release assets; uv checks Python downloads' hashes itself.
@@ -71,6 +85,7 @@ MAX_DOWNLOAD = 512 << 20
 MAX_JSON_BYTES = 16 << 20   # manifests of large bundles can be a few MB
 MAX_HELLO_BYTES = 4 << 20   # a node's hello carries every task's public contract (~2-6 KB each)
 MAX_RESULT_BYTES = 64 << 10
+MAX_PACKAGE_BYTES = 16 << 20   # a task folder: contract, scorer, labels, small reference files
 URL_TTL = datetime.timedelta(hours=24)
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
 AGENT_KINDS = ("agent", "baseline")
@@ -186,6 +201,7 @@ class HubStore:
         self.db.executescript(SCHEMA)
         # Columns added after the first release; older hub.db files gain them here.
         for table, col, decl in [("enrollments", "version", "INTEGER NOT NULL DEFAULT 1"),
+                                 ("enrollments", "activated", "REAL"),
                                  ("submissions", "split", "TEXT NOT NULL DEFAULT 'validation'"),
                                  ("submissions", "group_id", "TEXT"),
                                  ("agents", "eval_budget", "INTEGER"),
@@ -230,7 +246,8 @@ class HubStore:
         rec = [{"id": i, "task": t, "split": sp, "status": st, "agent": a, "created": c}
                for i, t, sp, st, a, c in self.q("SELECT id, task, split, status, agent, created FROM submissions "
                                                 "ORDER BY created DESC LIMIT ?", (recent,))]
-        return {"now": time.time(), "nodes": nodes, "submissions": subs, "recent": rec}
+        return {"now": time.time(), "nodes": nodes, "submissions": subs, "recent": rec,
+                "setup_problems": self.setup_problems()}
 
     def is_operator(self, token: str) -> bool:
         op = self.setting("operator")
@@ -337,8 +354,9 @@ class HubStore:
         return row[0] if row else None
 
     def add_enrollment(self, task_dir: Path) -> tuple[str, Contract]:
-        """Package a task: contract, scorer, and any small text files it uses
-        (e.g. a gene-panel labels file). Example bundles are not shipped.
+        """Package a task folder: contract, scorer, and any other files it uses, in
+        subfolders too (e.g. a gene-panel labels file, a reference .npy). Example
+        bundles are not shipped.
 
         A task keeps one code: enrolling an existing task id again updates its
         package (version + 1) behind the same code. A connected provider's node
@@ -357,9 +375,26 @@ class HubStore:
         return code, c
 
     @staticmethod
-    def package_files(task_dir: Path) -> dict[str, str]:
-        return {p.name: p.read_text() for p in sorted(task_dir.iterdir())
-                if p.is_file() and p.suffix in (".yaml", ".py", ".txt", ".json", ".csv", ".tsv")}
+    def package_files(task_dir: Path) -> dict[str, str | dict]:
+        """Every file in the task folder, subfolders included, keyed by its path
+        relative to the folder. Text files as text; anything else (.npy, .parquet,
+        ...) as {"base64": ...}. Hidden files, caches and the example bundle/ are left out."""
+        files, total = {}, 0
+        for p in sorted(task_dir.rglob("*")):
+            rel = p.relative_to(task_dir)
+            if (not p.is_file() or rel.parts[0] == "bundle" or "__pycache__" in rel.parts
+                    or any(part.startswith(".") for part in rel.parts)):
+                continue
+            raw = p.read_bytes()
+            total += len(raw)
+            if total > MAX_PACKAGE_BYTES:
+                raise ValueError(f"The task folder {task_dir} holds more than {MAX_PACKAGE_BYTES >> 20} MB "
+                                 "of files; task packages are for contracts, scorers and small reference files.")
+            try:
+                files[rel.as_posix()] = raw.decode()
+            except UnicodeDecodeError:
+                files[rel.as_posix()] = {"base64": base64.b64encode(raw).decode()}
+        return files
 
     def enrollment(self, code: str) -> tuple[str, dict, str | None, int] | None:
         row = self.q("SELECT task, files, used_by, version FROM enrollments WHERE code=?", (code,), one=True)
@@ -390,8 +425,48 @@ class HubStore:
         if owner and owner[0] != node_id:
             raise KeyError("task is already served by another node")
         self.q("INSERT OR REPLACE INTO node_tasks VALUES (?,?,NULL)", (task, node_id))
-        self.q("UPDATE enrollments SET used_by=? WHERE code=?", (node_id, code))
+        self.q("UPDATE enrollments SET used_by=?, activated=COALESCE(activated, ?) WHERE code=?",
+               (node_id, time.time(), code))
         out["node_id"] = node_id
+        return out
+
+    # ------------------------------------------------------- setup problems
+
+    def report_setup(self, code: str, step: str, reason: str, detail: str = "") -> str:
+        """Record a provider's failed connect. Returns the task id. Raises KeyError
+        for an unknown or revoked code, ValueError for anything off the fixed lists."""
+        e = self.enrollment(code)
+        if e is None or e[2] == "revoked":
+            raise KeyError("code unknown")
+        if step not in SETUP_STEPS or reason not in SETUP_REASONS or (
+                detail and not SETUP_DETAIL_RE.fullmatch(detail)):
+            raise ValueError("step, reason or detail not recognized")
+        self.q("INSERT INTO setup_reports VALUES (?,?,?,?,?)", (code, step, reason, detail, time.time()))
+        # A code's reports are capped, so a leaked code can't fill the disk.
+        self.q("DELETE FROM setup_reports WHERE code=? AND rowid NOT IN (SELECT rowid FROM "
+               "setup_reports WHERE code=? ORDER BY at DESC LIMIT 20)", (code, code))
+        return e[0]
+
+    def setup_problems(self, now: float | None = None) -> list[dict]:
+        """Setups that need a look: each code's latest failure report (last 7 days),
+        and codes used over STALL_S ago whose machine never finished connecting
+        (no upload for a sealed one, never polled for a provider's own machine)."""
+        now = now or time.time()
+        out = []
+        for code, task, step, reason, detail, at, used, seen, sealed in self.q(
+                "SELECT r.code, e.task, r.step, r.reason, r.detail, MAX(r.at), e.used_by, n.last_seen, "
+                "n.confidential FROM setup_reports r JOIN enrollments e ON e.code = r.code "
+                "LEFT JOIN nodes n ON n.id = e.used_by WHERE r.at > ? GROUP BY r.code", (now - 7 * 86400,)):
+            done = bool(seen or sealed)
+            out.append({"kind": "failed", "code": code, "task": task, "step": step, "reason": reason,
+                        "detail": detail, "at": at, "resolved": done})
+        reported = {p["code"] for p in out}
+        for code, task, at in self.q(
+                "SELECT e.code, e.task, COALESCE(e.activated, n.created) FROM enrollments e "
+                "JOIN nodes n ON n.id = e.used_by WHERE n.last_seen IS NULL AND n.confidential IS NULL "
+                "AND COALESCE(e.activated, n.created) < ?", (now - STALL_S,)):
+            if code not in reported:
+                out.append({"kind": "stalled", "code": code, "task": task, "at": at})
         return out
 
 
@@ -522,6 +597,67 @@ def sign_all(blobs, agent: str, files: list[dict]) -> dict[str, str]:
     with ThreadPoolExecutor(min(SIGN_THREADS, len(uniq))) as ex:
         urls = list(ex.map(lambda f: blobs.download(agent, f["sha256"], f["size"]), uniq.values()))
     return dict(zip(uniq, urls))
+
+
+# ------------------------------------------------------------ operator alerts
+
+SETUP_STEP_TEXT = {
+    "start": "starting", "gcloud_check": "checking the Google Cloud CLI",
+    "fetch_task": "fetching the task", "sandbox_image": "getting the sandbox image",
+    "data_check": "checking their data", "hardware_check": "checking the machine",
+    "selftest": "the security self-test", "review": "the approval screen",
+    "activate": "activating the code", "cloud_setup": "setting up their Google Cloud key and storage",
+    "upload": "encrypting and uploading", "notify": "telling the hub about the upload",
+    "start_service": "starting the background service"}
+
+
+def alert(store: HubStore, text: str) -> None:
+    """Post to BioModelBench's alert webhook (`bmb-hub alerts --webhook URL`), if set.
+    Slack-compatible ({"text": ...}); Teams and most incident tools accept it too."""
+    print(f"[bmb-hub alert] {text}", flush=True)
+    url = (store.setting("alerts") or {}).get("webhook")
+    if not url:
+        return
+    import urllib.request
+    req = urllib.request.Request(url, data=json.dumps({"text": f"[bmb-hub] {text}"}).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        print(f"[bmb-hub alert] webhook failed: {type(e).__name__}", flush=True)
+
+
+def alert_setup_failure(store: HubStore, code: str, task: str, step: str, reason: str,
+                        detail: str) -> None:
+    text = (f"setup failed for task {task} (code {code}) at {SETUP_STEP_TEXT.get(step, step)}: "
+            f"{reason}" + (f" ({detail})" if detail else ""))
+    threading.Thread(target=alert, args=(store, text), daemon=True).start()
+
+
+def check_stalled(store: HubStore, now: float | None = None) -> None:
+    """Alert once per code whose setup was started but never finished (STALL_S)."""
+    now = now or time.time()
+    seen = store.setting("stall_alerted") or {}
+    for prob in store.setup_problems(now):
+        if prob["kind"] == "stalled" and prob["code"] not in seen:
+            alert(store, f"setup for task {prob['task']} (code {prob['code']}) was started "
+                         f"{int((now - prob['at']) // 60)} min ago and never finished; "
+                         "the provider may need help")
+            seen[prob["code"]] = now
+    store.set_setting("stall_alerted", seen)
+
+
+def watch_stalled(store: HubStore, every_s: int = 300) -> threading.Thread:
+    def run():
+        while True:
+            try:
+                check_stalled(store)
+            except Exception as e:
+                print(f"[bmb-hub] stall check failed: {type(e).__name__}: {e}", flush=True)
+            time.sleep(every_s)
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
 
 
 def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_bundle_gb: int):
@@ -693,6 +829,19 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
 
         def do_POST(self):
             p, _ = self._path()
+            if m := re.fullmatch(r"/v1/enroll/([A-Z0-9-]{14})/report", p):
+                # A provider's connect failed: which step, and a reason from a fixed list.
+                try:
+                    body = self._json_body(MAX_RESULT_BYTES)
+                    task = store.report_setup(m.group(1), str(body.get("step", "")),
+                                              str(body.get("reason", "")), str(body.get("detail", "")))
+                except KeyError:
+                    return self._err(404, "not_found", "Unknown code.")
+                except ValueError as e:
+                    return self._err(400, "invalid", str(e))
+                alert_setup_failure(store, m.group(1), task, body["step"], body["reason"],
+                                    str(body.get("detail", "")))
+                return self._send(204, None)
             if m := re.fullmatch(r"/v1/enroll/([A-Z0-9-]{14})", p):
                 try:
                     body = self._json_body()
@@ -984,12 +1133,19 @@ def main(argv=None) -> None:
     p.add_argument("--key", required=True, nargs="+")
     p.add_argument("--kind", default="regression", choices=["regression", "classification"])
     p.add_argument("--tasks-dir", default="tasks")
+    p.add_argument("--split", type=float, metavar="FRACTION",
+                   help="hold out a test set, scoring this fraction of rows during the benchmark "
+                        "(e.g. 0.5); off by default")
 
     p = sub.add_parser("enroll", help="make a connect code for a task; prints the provider email")
     p.add_argument("task_dir")
     p.add_argument("--public-url", required=True)
     p.add_argument("--replace", action="store_true",
                    help="replace an existing task's package even though it differs")
+
+    p = sub.add_parser("alerts", help="where operator alerts go (failed or stalled provider setups)")
+    p.add_argument("--webhook", help="Slack-compatible incoming webhook URL ('' to turn off)")
+    p.add_argument("--test", action="store_true", help="send a test alert")
 
     p = sub.add_parser("revoke", help="cancel an unused connect code")
     p.add_argument("code")
@@ -1039,7 +1195,7 @@ def main(argv=None) -> None:
         tname, ttype, tnull = scaffold.parse_columns(args.target)[0]
         keys = [c for c in inputs if c[0] in args.key]
         d = scaffold.write_task(args.task, Path(args.tasks_dir), inputs, keys + [(tname, ttype, tnull)],
-                                args.key, args.kind, tname)
+                                args.key, args.kind, tname, split=args.split)
         print(f"wrote {d}/contract.yaml and score.py: fill in descriptions, then `bmb-hub enroll {d}`")
         return
 
@@ -1052,6 +1208,7 @@ def main(argv=None) -> None:
         if args.launch_sealed:
             from .sealed_launcher import loop
             loop(store)
+        watch_stalled(store)
         print(f"bmb-hub on http://{args.host}:{args.port} (public: {url}; "
               f"model files: {'gs://' + args.bucket if args.bucket else 'hub disk'})")
         try:
@@ -1060,11 +1217,14 @@ def main(argv=None) -> None:
             pass
     elif args.cmd == "enroll":
         task_id = Contract.load(Path(args.task_dir) / "contract.yaml").id
+        try:
+            new = store.package_files(Path(args.task_dir))
+        except ValueError as e:
+            raise SystemExit(str(e))
         existing = store.code_for(task_id)
         used = existing and store.enrollment(existing)[2]
         if existing:
             _, old, _, old_version = store.enrollment(existing)
-            new = store.package_files(Path(args.task_dir))
             if new == old:
                 print(f"Task {task_id} is already enrolled with this exact package (version "
                       f"{old_version}); nothing changed. The code stays {existing}.")
@@ -1087,6 +1247,13 @@ def main(argv=None) -> None:
                   f"The provider's machine will show an update; they review and approve it with:\n"
                   f"    ~/bmb-eval/bmb-eval update\n"
                   f"Until then it keeps evaluating with the version they approved.")
+    elif args.cmd == "alerts":
+        if args.webhook is not None:
+            store.set_setting("alerts", {"webhook": args.webhook} if args.webhook else {})
+        url = (store.setting("alerts") or {}).get("webhook")
+        print(f"alerts go to {url[:40] + '...' if url else 'nowhere (set --webhook URL)'}")
+        if args.test:
+            alert(store, "test alert from bmb-hub alerts --test")
     elif args.cmd == "revoke":
         with store.lock, store.db:
             n = store.db.execute("UPDATE enrollments SET used_by='revoked' WHERE code=? AND used_by IS NULL",
@@ -1143,6 +1310,16 @@ def main(argv=None) -> None:
         for task, split, status, n in store.q(
                 "SELECT task, split, status, COUNT(*) FROM submissions GROUP BY 1, 2, 3"):
             print(f"task {task}: {split} {status} {n}")
+        for prob in store.setup_problems(now):
+            when = time.strftime('%m-%d %H:%M', time.gmtime(prob["at"]))
+            if prob["kind"] == "failed":
+                print(f"setup {prob['task']} ({prob['code']}): failed {when} at "
+                      f"{SETUP_STEP_TEXT.get(prob['step'], prob['step'])}: {prob['reason']}"
+                      + (f" ({prob['detail']})" if prob["detail"] else "")
+                      + (" [since completed]" if prob["resolved"] else ""))
+            else:
+                print(f"setup {prob['task']} ({prob['code']}): STALLED, code used {when} "
+                      "but setup never finished")
     elif args.cmd == "final":
         for fid in store.request_finals(args.submission_id):
             print(f"queued final evaluation {fid}")

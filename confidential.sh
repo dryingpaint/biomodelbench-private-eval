@@ -23,7 +23,16 @@ case "$(uname -s)-$(uname -m)" in
   Linux-aarch64|Linux-arm64) UV_TARGET=aarch64-unknown-linux-musl ;;
   *) echo "This runs on macOS or Linux (x86_64 or ARM); this computer is $(uname -s) $(uname -m)." >&2; exit 1 ;;
 esac
-say "Downloading the BioModelBench tool to $DIR"
+cat <<'EOF'
+Connecting your data to BioModelBench (sealed). What happens, and how long each part usually takes:
+  1. Install the BioModelBench tool and Python               1-2 minutes
+  2. Check your data and prepare it on this computer          seconds to a few minutes, by data size
+  3. Show you exactly what's shared, and ask you to approve
+  4. Set up your key and storage in Google Cloud              1-2 minutes the first time
+  5. Encrypt your data on this computer and upload it         about a minute per 500 MB
+Nothing is uploaded until you approve in step 3.
+EOF
+say "Installing the BioModelBench tool to $DIR (usually 1-2 minutes)"
 mkdir -p "$DIR/app" "$DIR/bin"
 chmod 700 "$DIR"
 if ! curl -fsSL "$HUB/bmb-eval.tar.gz" | tar -xz -C "$DIR/app"; then

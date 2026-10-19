@@ -176,7 +176,8 @@ or `false`. When it's `false`, `metrics` repeats your previous best.
 
 | Endpoint | Body or response |
 |---|---|
-| `GET /v1/enroll/<code>` | `{"task": "<id>", "files": {"contract.yaml": "…", "score.py": "…"}}`. Doesn't use up the code |
+| `GET /v1/enroll/<code>` | `{"task": "<id>", "files": {"contract.yaml": "…", "score.py": "…", "refs/table.npy": {"base64": "…"}}}`: the task folder by relative path, binary files base64-encoded. Doesn't use up the code |
+| `POST /v1/enroll/<code>/report` | A failed connect: `{"step", "reason", "detail"?}`, each from a fixed list (`SETUP_STEPS`, `SETUP_REASONS` in `hub.py`; `detail` is only an exception class name). `204`; `400` for anything else, `404` for an unknown code. At most 20 kept per code. Alerts the operators |
 | `POST /v1/enroll/<code>` | `{"name": "<node name>"}`, plus a bearer node secret if the node already has one. Returns `{"task", "node_id", "secret"?}` and uses up the code |
 
 ## Public

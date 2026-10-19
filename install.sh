@@ -9,10 +9,24 @@ HUB="${BMB_HUB:-__BMB_HUB__}"
 DIR="${BMB_DIR:-$HOME/bmb-eval}"
 ENGINE="${BMB_ENGINE:-auto}"     # tests only: "local" skips the sandbox engine
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+START="$(date +%s)"
 
 if [ "$ENGINE" != "local" ] && [ "$(uname -s)" != "Linux" ]; then
   echo "This needs a Linux machine. See $HUB/guide for how to get one." >&2
   exit 1
+fi
+
+if [ $# -gt 0 ]; then
+  cat <<'EOF'
+Connecting this machine to BioModelBench. What happens, and how long each part usually takes:
+  1. Install the sandbox software (Podman), if needed      1-3 minutes, asks for your password once
+  2. Install the evaluator and its Python packages          1-2 minutes
+  3. Download the sandbox image models run in (a few GB)    2-10 minutes, depending on your connection
+  4. Check your data and prepare it on this machine         seconds to a few minutes, by data size
+  5. Test this machine's security                           1-3 minutes
+  6. Show you exactly what's shared, and ask you to approve
+Nothing is shared until you approve in step 6.
+EOF
 fi
 
 engine_ok() {
@@ -21,7 +35,7 @@ engine_ok() {
   { command -v docker >/dev/null && docker info >/dev/null 2>&1; }
 }
 if ! engine_ok; then
-  say "Installing Podman, the sandbox software (asks for your password once)"
+  say "Installing Podman, the sandbox software (usually 1-3 minutes; asks for your password once)"
   if command -v apt-get >/dev/null; then
     # dbus-user-session: rootless Podman applies limits through the user's systemd, which
     # it reaches over the user's D-Bus (Debian's cloud images don't have it).
@@ -130,7 +144,7 @@ if command -v nvidia-ctk >/dev/null; then
   fi
 fi
 
-say "Downloading the evaluator to $DIR"
+say "Downloading the evaluator to $DIR (a few seconds)"
 mkdir -p "$DIR"
 curl -fsSL "$HUB/bmb-eval.tar.gz" | tar -xz -C "$DIR"
 
@@ -140,6 +154,7 @@ if [ $# -gt 0 ]; then
   BMB_HUB="$HUB" BMB_ENGINE="$ENGINE" BMB_SKIP_SELFTEST=1 ./setup.sh
   say "Connecting"
   BMB_HUB="$HUB" BMB_CALLER_CWD="$CALLER_CWD" ./bmb-eval connect "$@"
+  echo "  (whole setup took $(( ($(date +%s) - START) / 60 )) min)"
 else
   BMB_HUB="$HUB" BMB_ENGINE="$ENGINE" ./setup.sh
 fi

@@ -61,8 +61,8 @@ including BioModelBench and Google, can read its memory or log into it. Your
 key in your Google Cloud project is released only to a machine that proves, in
 hardware, that it runs the exact software you approved, with debugging off.
 
-The command installs the tool in `~/bmb-confidential` and splits your data on
-your computer into a validation half and a held-out test half. Its approval
+The command installs the tool in `~/bmb-confidential` and checks your data on
+your computer (and, if the task holds out a test set, splits it there). Its approval
 screen shows the same terms as Option B's, plus the exact software your key
 will open for and the public source commit it was built from. When you type
 `y`, it creates the key, bucket and access rule in your project, encrypts
@@ -141,21 +141,29 @@ Run the command from our email on that machine:
 curl -fsSL https://<hub address>/install.sh | sh -s -- YOUR-CODE --data /path/to/your/data
 ```
 
-It takes about 15 minutes and may ask for your password once. It installs
-what's needed (including GPU support if the machine has an NVIDIA GPU), checks
-your data, tests its own security, and then shows you exactly what you're
-agreeing to:
+It takes about 15 minutes and may ask for your password once. It starts by
+listing its steps and how long each usually takes, then shows each step as it
+runs (with a progress bar for the sandbox download). It installs what's needed
+(including GPU support if the machine has an NVIDIA GPU), checks your data,
+tests its own security, and then shows you exactly what you're agreeing to:
 
 ```
-✓ Your data looks good (4,812 rows)
-✓ Security self-test passed
+==> Checking your data (2.1 MB) and preparing it on this machine  (usually under a minute)
+✓ Your data looks good (4,812 rows)  (took 2s)
+
+==> Testing this machine's security: running known attacks against the sandbox  (usually 1-3 minutes)
+  Attacks blocked so far: 14 of 14
+✓ Security self-test passed  (took 1m 12s)
+
+==> Your review: what you're agreeing to
 
   The model will see:  variant_id, sequence
-  Never shared:        kd
+  Never shared:        fitness
   Evaluations:         at most 20/day per agent, 200 in total
   What leaves:         only scores (spearman, pearson, rmse), 3 decimals
-  Worst case:          a model built to extract data could learn at most
-                       ~1.2 KB of information about your data, across all 200 evaluations
+  Worst case:          a model built to extract data could recover the fitness values of
+                       about 940 of your 4,812 rows (19.5%), across all 200 evaluations
+                       (estimate, at about 3 significant digits per value)
 
 Approve and start? [y/N]
 ```
@@ -235,10 +243,14 @@ in `~/bmb-eval/config.yaml`. Then run `~/bmb-eval/bmb-eval selftest` and
 
 **What leaves, with either option?** Only the agreed scores, rounded, or an
 error code from a fixed list. Never your data, the model's predictions or its
-logs. The approval screen shows the worst case: how much a model built to
-extract data could learn across all evaluations.
+logs. If the setup command itself fails, it tells BioModelBench only which step
+failed and a reason from a fixed list (such as "Google Cloud refused a step"),
+so we can help; never your data, file names or the error text. The approval screen shows the worst case: an estimate of how many of
+your rows' hidden values a model built to extract data could recover across
+all evaluations. Honest models reveal far less.
 
-**Who decides which half of my data is the test set?** Your computer (Option
+**Who decides which half of my data is the test set?** Most tasks don't
+split your data; when one does, the approval screen says so. Your computer (Option
 A) or machine (Option B) splits it at random when you connect, with a secret
 seed. Nobody, including BioModelBench, knows which row is where. Agents are
 scored only on the validation half; the test half is used at most a few times,

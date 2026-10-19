@@ -88,6 +88,37 @@ def budget(c: Contract) -> Budget:
     )
 
 
+# Recovering a measured number to about 3 significant digits (1 part in 1,000) takes ~10 bits.
+VALUE_BITS = math.log2(1000)
+
+
+def _field_bits(f) -> float:
+    if f.type == "bool":
+        return 1.0
+    if f.allowed:
+        return math.log2(max(2, len(f.allowed)))
+    if f.type == "int" and f.min is not None and f.max is not None:
+        return math.log2(f.max - f.min + 1) or 1.0
+    if f.type == "vector":
+        return f.length * VALUE_BITS
+    if f.type == "list":
+        return f.max_items * len(f.items) * VALUE_BITS
+    return VALUE_BITS        # float, or a string label
+
+
+def bits_per_row(c: Contract) -> float | None:
+    """Bits needed to recover one sample's hidden answer values. None when the
+    answers live in private files rather than per-row columns."""
+    total = sum(_field_bits(f) for f in c.answers if f.name not in c.key)
+    return total or None
+
+
+def rows_recoverable(c: Contract, bits: float) -> float | None:
+    """Worst-case estimate: how many samples' hidden answers `bits` could pin down."""
+    per = bits_per_row(c)
+    return bits / per if per and not math.isinf(bits) else None
+
+
 def describe(c: Contract) -> str:
     b = budget(c)
     lines = [
@@ -103,6 +134,9 @@ def describe(c: Contract) -> str:
         "  lifetime  " + (f"{b.lifetime:.0f} bits ({c.limits.submissions_total} submissions)"
                           if b.lifetime is not None else "unbounded (set limits.submissions_total)"),
     ]
+    if b.lifetime is not None and (n := rows_recoverable(c, b.lifetime)) is not None:
+        lines.append(f"  ≈ the hidden values of ~{n:,.0f} rows, worst case "
+                     f"({bits_per_row(c):.0f} bits per row)")
     if c.split:
         part = (f"fixed by '{c.split.by_column}'" if c.split.by_column
                 else f"{c.split.validation_fraction:.0%} validation")

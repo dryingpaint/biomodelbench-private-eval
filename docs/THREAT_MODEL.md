@@ -53,7 +53,7 @@ Two further points the proposal does not address:
 - **Adaptive overfitting.** Even an honest agent that evaluates many times
   against one private set will overfit to it, and its score will be
   optimistic. The first Capable test showed this: the agent ran ablations
-  against the private set. Set `split` in the contract:
+  against the private set. The optional `split` in the contract (off by default) addresses this:
   - The provider's node randomly splits the rows, with a secret seed, into
     validation and test sets.
   - Agents are only ever shown, and scored on, the validation rows.
@@ -81,6 +81,13 @@ bits per submission and about 9,300 bits over the lifetime**. That is roughly
 1.2 KB: enough for about a hundred short sequences, or the labels of a few
 thousand rows at one bit each. Honest submissions reveal far less. This is
 the limit for a hostile one.
+
+Providers see this bound as rows, not bits: `leakage.rows_recoverable` divides
+the lifetime bits by the bits needed to recover one row's hidden answers
+(about 10 per number, for 3 significant digits; 1 per yes/no;
+log2(choices) per category). For the example task that is about 940 rows'
+values. Tasks whose answers live in private files fall back to an amount of
+information (KB).
 
 How to shrink it, from most to least effective:
 
@@ -164,7 +171,7 @@ what the provider agrees to: here, `bmb-eval check` plus quotas. Next upgrades,
 in order:
 
 1. Make gVisor mandatory.
-2. Use `split` (a held-out test set) on every task.
+2. Turn on `split` (a held-out test set, off by default) for tasks with many evaluations.
 3. Add an ONNX-only tier.
 4. Make the hub's scorer and contract delivery verifiable (signed task packages).
 5. Sign results with the node's key so BioModelBench can verify their origin.

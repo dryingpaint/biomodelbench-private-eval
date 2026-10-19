@@ -12,35 +12,20 @@ for each:
 
 # Option A: sealed evaluation (no machine to run)
 
-The evaluation runs on Google Confidential Computing hardware (Intel TDX and an
-NVIDIA H100 in confidential mode). The machine is sealed: nobody outside it,
-including BioModelBench and Google, can read its memory or log into it. Your
-key in your Google Cloud project is released only to a machine that proves, in
-hardware, that it runs the exact software you approved, with debugging off.
+Your data is encrypted with a key that only you control, and only our sealed
+evaluation machine can open it. Nobody else can read it, including
+BioModelBench.
 
 ## What you need
 
-- **A Google Cloud project you own**, with billing enabled. It holds one
-  encryption key and one storage bucket (a few cents a month). A new, empty
-  project is fine and keeps things separate.
-- **Permission in that project** to enable services, create a Cloud KMS key,
-  a storage bucket and a workload identity pool, and grant access to them.
-  The project's Owner has all of these. Otherwise ask for these roles:
-  Service Usage Admin, Cloud KMS Admin, Cloud KMS CryptoKey Encrypter, Storage
-  Admin, Workload Identity Pool Admin.
-- **The Google Cloud CLI (`gcloud`)**, version 450 or newer, logged in
-  (`gcloud auth login`), on any macOS or Linux computer (Intel or ARM) that has
-  your data. Windows: use WSL.
+- **A Google Cloud project** with billing enabled, where you're an Owner (or
+  have the roles under "Technical details" below). A new, empty project is
+  fine; the cost is a few cents a month.
+- **The Google Cloud CLI (`gcloud`)**, logged in (`gcloud auth login`), on a
+  Mac or Linux computer that has your data. On Windows, use WSL.
 - **Your data**, as one file or one folder, as described in our email.
-- **Network:** outbound HTTPS to `eval.biomodelbench.org`, Google Cloud
-  (`accounts.google.com`, `*.googleapis.com`) and PyPI (`pypi.org`,
-  `files.pythonhosted.org`), or the PyPI mirror your organization uses (set
-  `PIP_INDEX_URL`, or pip's own setting, and it's used). An HTTPS proxy works:
-  set `HTTPS_PROXY` as usual. If your network inspects HTTPS with its own
-  certificate authority, this computer must trust it (it already does if your
-  browser works), and gcloud needs it too:
-  `gcloud config set core/custom_ca_certs_file /path/to/your-company-ca.pem`. Nothing else is needed: the Python and tools it
-  installs come through `eval.biomodelbench.org`.
+
+The command sets up everything else in your project for you.
 
 Run the command from our email:
 
@@ -48,13 +33,9 @@ Run the command from our email:
 curl -fsSL https://<hub address>/confidential.sh | sh -s -- YOUR-CODE --data /path/to/your/data --project YOUR-GCP-PROJECT
 ```
 
-It installs the tool in `~/bmb-confidential`, checks your data, and splits it
-on your computer into a validation half and a held-out test half. It then shows
-what you're agreeing to (as in Option B below), plus the exact software your
-key will open for and the public source commit it was built from. Type `y` to
-create the key, bucket and access rule in your project, encrypt everything on
-your computer, and upload only the encrypted copy. Nothing keeps running on
-your side.
+It checks your data and shows you exactly what you're agreeing to. Type `y`
+and it encrypts your data on your computer and uploads only the encrypted copy.
+Nothing keeps running on your side.
 
 With several tasks, our email lists one command per task. The first installs
 the tool; the others reuse it and your project:
@@ -62,6 +43,30 @@ the tool; the others reuse it and your project:
 ```bash
 ~/bmb-confidential/.venv/bin/bmb-eval connect-confidential NEXT-CODE --data /path/to/next/file
 ```
+
+## Stopping, changing data, and updates
+
+- **Stop everything at any time:** disable your key. The sealed machine can
+  then no longer open your data. (The command is printed when you connect.)
+- **New or corrected data:** run the same command again with the new file.
+- **A task change or new software from BioModelBench:** we'll ask you to run
+  your command again, so that you review and approve the change.
+
+## Technical details
+
+### How it works
+The evaluation runs on Google Confidential Computing hardware (Intel TDX and an
+NVIDIA H100 in confidential mode). The machine is sealed: nobody outside it,
+including BioModelBench and Google, can read its memory or log into it. Your
+key in your Google Cloud project is released only to a machine that proves, in
+hardware, that it runs the exact software you approved, with debugging off.
+
+The command installs the tool in `~/bmb-confidential` and splits your data on
+your computer into a validation half and a held-out test half. Its approval
+screen shows the same terms as Option B's, plus the exact software your key
+will open for and the public source commit it was built from. When you type
+`y`, it creates the key, bucket and access rule in your project, encrypts
+everything on your computer, and uploads only the encrypted copy.
 
 ### Checking the software
 
@@ -74,6 +79,21 @@ software, and that it was built from the published source commit. It prints a
 link to that exact code, including the parts that let only the agreed scores
 out.
 
+### Permissions
+The project's Owner has everything needed. Otherwise, ask for these roles:
+Service Usage Admin, Cloud KMS Admin, Cloud KMS CryptoKey Encrypter, Storage
+Admin, Workload Identity Pool Admin. `gcloud` must be version 450 or newer.
+
+### Network
+The computer needs outbound HTTPS to `eval.biomodelbench.org`, Google Cloud
+(`accounts.google.com`, `*.googleapis.com`) and PyPI (`pypi.org`,
+`files.pythonhosted.org`), or your organization's PyPI mirror (set
+`PIP_INDEX_URL`, or pip's own setting). An HTTPS proxy works: set
+`HTTPS_PROXY` as usual. If your network inspects HTTPS with its own
+certificate authority, this computer must trust it (it already does if your
+browser works), and gcloud needs it too:
+`gcloud config set core/custom_ca_certs_file /path/to/your-company-ca.pem`.
+
 ### What gets created in your project
 
 | | |
@@ -83,14 +103,6 @@ out.
 | Workload identity pool `bmb-eval` | The access rule: the key is released only to the approved software on sealed hardware, in production mode. |
 
 Services enabled: Cloud KMS, Cloud Storage, IAM, Security Token Service.
-
-### Stopping, changing data, and updates
-
-- **Stop everything at any time:** disable your key. The sealed machine can
-  then no longer open your data. (The command is printed when you connect.)
-- **New or corrected data:** run the same command again with the new file.
-- **A task change or new software from BioModelBench:** we'll ask you to run
-  your command again, so that you review and approve the change.
 
 ### If your organization restricts Google Cloud
 

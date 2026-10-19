@@ -64,6 +64,7 @@ deploy/gcp/hub family set admet admet_ism admet_labx      # group datasets for o
 deploy/gcp/hub final <submission_id>                      # held-out test runs (every dataset, for a family)
 deploy/gcp/hub results <task or family>                   # all scores, including finals
 deploy/gcp/hub revoke <code>                              # cancel an unused connect code
+deploy/gcp/hub retire <task> [--yes]                      # remove a task (dry run without --yes; backs up hub.db)
 deploy/gcp/hub status                                     # nodes, tasks, queue, codes, setup problems
 deploy/gcp/hub alerts --webhook https://hooks.slack.com/… # where setup alerts go (--test to try it)
 ```
@@ -121,7 +122,10 @@ again:
   version they approved.
 
 The hub can't change a provider's task without that approval. To retire a
-code nobody has used, run `deploy/gcp/hub revoke <code>`.
+code nobody has used, run `deploy/gcp/hub revoke <code>`. To remove a task
+altogether (its code, node binding, unfinished submissions and family
+membership; finished results stay), run `deploy/gcp/hub retire <task>` to see
+what would go, then again with `--yes`.
 
 ## Settings worth deciding per task
 

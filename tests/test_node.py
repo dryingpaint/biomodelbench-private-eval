@@ -209,9 +209,10 @@ def test_leakage_stated_as_rows_of_hidden_values():
     # A yes/no answer costs one bit per row, so many more rows are exposed.
     c2 = dataclasses.replace(c, answers=[c.answers[0], dataclasses.replace(c.answers[1], type="bool")])
     assert leakage.rows_recoverable(c2, b.lifetime) == pytest.approx(b.lifetime)
-    # Answers kept in private files: no per-row estimate, falls back to an amount of information.
+    # Answers kept in private files: no per-row estimate, so it counts measured values instead.
     c3 = dataclasses.replace(c, answers=[c.answers[0]])
-    assert leakage.rows_recoverable(c3, b.lifetime) is None and "KB" in cli._summary(c3, 100)
+    assert leakage.rows_recoverable(c3, b.lifetime) is None
+    assert "hidden measured values in your data" in " ".join(cli._summary(c3, 100).split())
 
 
 def test_new_task_has_no_split_unless_asked(tmp_path):
@@ -1739,3 +1740,81 @@ def test_used_code_whose_setup_never_finished_is_stalled(hub, provider_files, mo
     hub_mod.check_stalled(store, later)
     hub_mod.check_stalled(store, later + 600)                     # alerts once per code
     assert len(alerts) == 1 and "never finished" in alerts[0]
+
+
+def test_reactivating_a_stalled_code_restarts_the_clock_and_rearms_the_alert(hub, provider_files):
+    from bmb_eval.node import HubAPI
+    store, url = hub
+    _, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    creds = HubAPI(url).activate(code, "sealed-p")
+    first = store.q("SELECT activated FROM enrollments WHERE code=?", (code,), one=True)[0]
+    alerts = []
+    import bmb_eval.hub as H
+    orig, H.alert = H.alert, lambda store, text: alerts.append(text)
+    try:
+        H.check_stalled(store, first + hub_mod.STALL_S + 60)
+        assert len(alerts) == 1
+        time.sleep(0.01)
+        HubAPI(url, creds["secret"]).activate(code, "sealed-p")       # the provider re-runs
+        second = store.q("SELECT activated FROM enrollments WHERE code=?", (code,), one=True)[0]
+        assert second > first
+        assert store.setup_problems(second + 60) == []                # a fresh attempt isn't stalled
+        H.check_stalled(store, second + hub_mod.STALL_S + 60)
+        assert len(alerts) == 2                                       # the second stall is alerted too
+    finally:
+        H.alert = orig
+
+
+def test_retire_removes_a_task_but_keeps_results(connected, tmp_path, capsys):
+    cfg, store, url, agent = connected
+    w = Worker(cfg)
+    done = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain()
+    pending = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    store.set_family("fam", ["binding", "other"])
+    code = store.code_for("binding")
+    dry = store.retire("binding")
+    assert dry["codes"] == 1 and dry["unfinished submissions"] == 1 and dry["nodes left serving nothing"] == 1
+    assert store.code_for("binding") == code                          # dry run changed nothing
+    store.retire("binding", apply=True)
+    assert store.code_for("binding") is None and store.enrollment(code) is None
+    assert store.q("SELECT COUNT(*) FROM node_tasks WHERE task='binding'", one=True)[0] == 0
+    assert store.q("SELECT status FROM submissions WHERE id=?", (done,), one=True)[0] == "done"
+    assert store.q("SELECT 1 FROM submissions WHERE id=?", (pending,), one=True) is None
+    assert store.families() == {"fam": ["other"]}
+    assert store.q("SELECT COUNT(*) FROM nodes", one=True)[0] == 0
+    assert list(store.state.glob("hub.db.bak-*-retire-binding"))      # backed up first
+
+
+def test_enroll_tells_sealed_providers_to_rerun_their_command(hub, provider_files, capsys):
+    from bmb_eval.node import HubAPI
+    store, url = hub
+    _, task_dir = provider_files
+    state = str(store.state)
+    hub_mod.main(["--state", state, "enroll", str(task_dir), "--public-url", url])
+    code = store.code_for("binding")
+    HubAPI(url).activate(code, "sealed-myproject")
+    (task_dir / "contract.yaml").write_text((task_dir / "contract.yaml").read_text()
+                                            .replace('description: ""', 'description: "v2"'))
+    capsys.readouterr()
+    hub_mod.main(["--state", state, "enroll", str(task_dir), "--public-url", url, "--replace"])
+    out = capsys.readouterr().out
+    assert "run their original command again" in out and "bmb-eval update" not in out
+
+
+def test_old_clients_get_an_update_message_for_folder_packages(hub, provider_files):
+    import urllib.error
+    import urllib.request
+    from bmb_eval.node import HubAPI
+    store, url = hub
+    _, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    assert json.loads(urllib.request.urlopen(f"{url}/v1/enroll/{code}").read())["task"] == "binding"
+    (task_dir / "refs").mkdir()
+    (task_dir / "refs" / "panel.txt").write_text("A\n")
+    store.add_enrollment(task_dir)
+    with pytest.raises(urllib.error.HTTPError) as e:                  # an old client: no format=2
+        urllib.request.urlopen(f"{url}/v1/enroll/{code}")
+    assert e.value.code == 409 and "install command" in json.loads(e.value.read())["error"]["message"]
+    assert "refs/panel.txt" in HubAPI(url).enrollment(code)["files"]   # a current client

@@ -425,10 +425,62 @@ class HubStore:
         if owner and owner[0] != node_id:
             raise KeyError("task is already served by another node")
         self.q("INSERT OR REPLACE INTO node_tasks VALUES (?,?,NULL)", (task, node_id))
-        self.q("UPDATE enrollments SET used_by=?, activated=COALESCE(activated, ?) WHERE code=?",
-               (node_id, time.time(), code))
+        # Each activation (a provider re-running their command) restarts the stall clock
+        # and re-arms the stall alert, so a second stalled attempt is reported too.
+        self.q("UPDATE enrollments SET used_by=?, activated=? WHERE code=?", (node_id, time.time(), code))
+        alerted = self.setting("stall_alerted") or {}
+        if alerted.pop(code, None) is not None:
+            self.set_setting("stall_alerted", alerted)
         out["node_id"] = node_id
         return out
+
+    def retire(self, task: str, apply: bool = False) -> dict[str, int]:
+        """Remove a task from the hub: its codes, its node binding, unfinished
+        submissions, family membership, setup reports, and any node left serving
+        nothing. Finished results stay as history. Dry run unless `apply`; with it,
+        hub.db is backed up first. Returns how many of each would go (or went)."""
+        codes = [r[0] for r in self.q("SELECT code FROM enrollments WHERE task=?", (task,))]
+        nodes = [r[0] for r in self.q("SELECT node_id FROM node_tasks WHERE task=?", (task,))]
+        orphans = [n for n in nodes if self.q("SELECT COUNT(*) FROM node_tasks WHERE node_id=? AND task<>?",
+                                              (n, task), one=True)[0] == 0]
+        marks = ",".join("?" * len(codes)) or "NULL"
+        counts = {
+            "codes": len(codes),
+            "node bindings": len(nodes),
+            "unfinished submissions": self.q("SELECT COUNT(*) FROM submissions WHERE task=? AND status<>'done'",
+                                             (task,), one=True)[0],
+            "families": sum(task in t for t in self.families().values()),
+            "setup reports": self.q(f"SELECT COUNT(*) FROM setup_reports WHERE code IN ({marks})", codes,
+                                    one=True)[0],
+            "nodes left serving nothing": len(orphans),
+        }
+        if not apply:
+            return counts
+        backup = sqlite3.connect(self.state / f"hub.db.bak-{time.strftime('%Y%m%d-%H%M%S')}-retire-{task}")
+        with self.lock:
+            self.db.backup(backup)
+        backup.close()
+        with self.lock, self.db:
+            self.db.execute(f"DELETE FROM setup_reports WHERE code IN ({marks})", codes)
+            self.db.execute("DELETE FROM enrollments WHERE task=?", (task,))
+            self.db.execute("DELETE FROM node_tasks WHERE task=?", (task,))
+            self.db.execute("DELETE FROM submissions WHERE task=? AND status<>'done'", (task,))
+        for name, tasks in self.families().items():
+            if task in tasks:
+                self.set_family(name, [t for t in tasks if t != task])
+        alerted = self.setting("stall_alerted") or {}
+        if set(alerted) & set(codes):
+            self.set_setting("stall_alerted", {c: t for c, t in alerted.items() if c not in codes})
+        for n in orphans:
+            self.q("DELETE FROM nodes WHERE id=?", (n,))
+            self.q("DELETE FROM settings WHERE key=?", (f"sealed_launch:{n}",))
+        return counts
+
+    def is_sealed(self, node_id: str) -> bool:
+        """A sealed (confidential) node: it has bucket pointers, or was named by
+        connect-confidential (which names it sealed-<project>) before uploading."""
+        row = self.q("SELECT name, confidential FROM nodes WHERE id=?", (node_id,), one=True)
+        return bool(row and (row[1] or row[0].startswith("sealed-")))
 
     # ------------------------------------------------------- setup problems
 
@@ -599,6 +651,11 @@ def sign_all(blobs, agent: str, files: list[dict]) -> dict[str, str]:
     return dict(zip(uniq, urls))
 
 
+def flat_package(files: dict) -> bool:
+    """True when a task package is only top-level text files (what old clients read)."""
+    return all("/" not in name and isinstance(body, str) for name, body in files.items())
+
+
 # ------------------------------------------------------------ operator alerts
 
 SETUP_STEP_TEXT = {
@@ -767,6 +824,12 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                                      "This connect code is unknown or already connected from another "
                                      "computer. Run the command on that computer, or ask "
                                      "BioModelBench for a new code.")
+                if qs.get("format") != "2" and not flat_package(e[1]):
+                    # Clients before task folders write each file as top-level text.
+                    return self._err(409, "client_outdated",
+                                     "This task needs a newer BioModelBench tool. Run the install "
+                                     "command from our email again (it updates the tool), then this "
+                                     "command.")
                 return self._send(200, {"task": e[0], "files": e[1], "version": e[3]})
             if m := re.fullmatch(r"/v1/blobs/([0-9a-f]{64})", p):
                 return self._blob_get(m.group(1))
@@ -1147,6 +1210,10 @@ def main(argv=None) -> None:
     p.add_argument("--webhook", help="Slack-compatible incoming webhook URL ('' to turn off)")
     p.add_argument("--test", action="store_true", help="send a test alert")
 
+    p = sub.add_parser("retire", help="remove a task from the hub (dry run unless --yes)")
+    p.add_argument("task")
+    p.add_argument("--yes", action="store_true", help="really remove it (hub.db is backed up first)")
+
     p = sub.add_parser("revoke", help="cancel an unused connect code")
     p.add_argument("code")
 
@@ -1242,6 +1309,11 @@ def main(argv=None) -> None:
             if existing:
                 print(f"(updated task {c.id} to version {version}; same code)\n")
             print(provider_message(args.public_url.rstrip("/"), code, c))
+        elif store.is_sealed(used):
+            print(f"Updated task {c.id} to version {version}. The code stays {code}.\n"
+                  f"This provider uses sealed evaluation: ask them to run their original command again\n"
+                  f"(the confidential.sh one from our email). It shows the change for them to approve,\n"
+                  f"then re-encrypts and uploads. Until then the sealed machine uses the version they approved.")
         else:
             print(f"Updated task {c.id} to version {version}. The code stays {code}.\n"
                   f"The provider's machine will show an update; they review and approve it with:\n"
@@ -1254,6 +1326,19 @@ def main(argv=None) -> None:
         print(f"alerts go to {url[:40] + '...' if url else 'nowhere (set --webhook URL)'}")
         if args.test:
             alert(store, "test alert from bmb-hub alerts --test")
+    elif args.cmd == "retire":
+        if not store.q("SELECT 1 FROM enrollments WHERE task=? UNION SELECT 1 FROM node_tasks WHERE task=?",
+                       (args.task, args.task)):
+            raise SystemExit(f"No task {args.task!r} on this hub.")
+        counts = store.retire(args.task, apply=args.yes)
+        print(("Removed" if args.yes else "Would remove") + f" task {args.task}: "
+              + ", ".join(f"{n} {what}" for what, n in counts.items()))
+        if args.yes:
+            print("Finished results are kept. The provider's copy of the data is theirs to delete:\n"
+                  "  own machine: ~/bmb-eval/bmb-eval stop, then remove ~/bmb-eval\n"
+                  "  sealed: disable their key (the command printed when they connected)")
+        else:
+            print("Run again with --yes to do it.")
     elif args.cmd == "revoke":
         with store.lock, store.db:
             n = store.db.execute("UPDATE enrollments SET used_by='revoked' WHERE code=? AND used_by IS NULL",

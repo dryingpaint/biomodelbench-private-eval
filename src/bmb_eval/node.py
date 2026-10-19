@@ -84,7 +84,8 @@ class HubAPI:
 
     # enrollment
     def enrollment(self, code: str) -> dict:
-        return self._req("GET", f"/v1/enroll/{code}")
+        # format=2: this client writes subfolders and binary files (see write_task_files).
+        return self._req("GET", f"/v1/enroll/{code}?format=2")
 
     def activate(self, code: str, name: str) -> dict:
         return self._req("POST", f"/v1/enroll/{code}", {"name": name})

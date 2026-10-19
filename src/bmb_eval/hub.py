@@ -42,7 +42,7 @@ from pathlib import Path
 
 from .blobs import BlobCache, check_manifest, manifest_id
 from .contract import Contract
-from .errors import EvalError
+from .errors import ERRORS, EvalError
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -274,13 +274,14 @@ class HubStore:
     def request_final(self, sid: str, again: bool = True) -> str:
         """Queue a final (test set) evaluation of an existing submission's model.
         Admin only. The provider's node decides whether it may run (its cap). With
-        again=False, an existing final is returned instead of spending another."""
+        again=False, an existing final is returned instead of spending another, unless
+        the node refused it: a refused final never ran and wasn't counted."""
         row = self.q("SELECT task, agent, manifest, kind FROM submissions WHERE id=? AND split='validation' "
                      "AND status NOT IN ('uploading', 'uploading_final')", (sid,), one=True)
         if not row:
             raise KeyError(f"no committed submission {sid}")
         done = self._finals_of(sid)
-        if done and not again:
+        if done and not again and not self._refused(done[-1]):
             return done[-1]
         fid = f"{sid}-final{len(done) + 1}"
         # The final keeps its submission's kind: a baseline's counts against the baseline cap.
@@ -288,6 +289,13 @@ class HubStore:
                "kind) VALUES (?,?,?,?, 'queued', NULL, NULL, ?, 'test', ?)",
                (fid, row[0], row[1], time.time(), row[2], row[3]))
         return fid
+
+    def _refused(self, fid: str) -> bool:
+        """Refused by the node's policy (e.g. no test split yet, before the provider approved
+        one): answered without running, and not counted against the task's finals."""
+        row = self.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)
+        code = ((json.loads(row[0]) if row and row[0] else {}).get("error") or {}).get("code")
+        return code in ERRORS and ERRORS[code][1] == "policy"
 
     def request_finals(self, sid: str, again: bool = True) -> list[str]:
         """Final evaluations for a task submission, or for every dataset of a

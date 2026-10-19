@@ -484,6 +484,33 @@ def render_page(md_text: str, public_url: str) -> bytes:
 SIGN_THREADS = 32
 
 
+def _concurrently(fn, items: list) -> list:
+    from concurrent.futures import ThreadPoolExecutor
+    if len(items) <= 4:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(min(SIGN_THREADS, len(items))) as ex:
+        return list(ex.map(fn, items))
+
+
+def plan_uploads(blobs, agent: str, files: list[dict]) -> list[dict]:
+    """An upload URL for each distinct file the hub doesn't hold yet. Existence checks and
+    signatures are GCS/IAM calls (~0.1 s each): one by one, a 1,482-file bundle took minutes,
+    the client timed out and retried, and each retry left another submission stuck uploading."""
+    uniq = list({f["sha256"]: f for f in files}.values())
+    def one(f):
+        if blobs.has(agent, f["sha256"], f["size"]):
+            return None
+        return {"sha256": f["sha256"], "size": f["size"], **blobs.upload(agent, f["sha256"], f["size"])}
+    return [u for u in _concurrently(one, uniq) if u]
+
+
+def missing_blobs(blobs, agent: str, files: list[dict]) -> list[str]:
+    """Distinct files of a submission the hub doesn't hold (checked concurrently)."""
+    uniq = list({f["sha256"]: f for f in files}.values())
+    held = _concurrently(lambda f: blobs.has(agent, f["sha256"], f["size"]), uniq)
+    return sorted(f["sha256"] for f, h in zip(uniq, held) if not h)
+
+
 def sign_all(blobs, agent: str, files: list[dict]) -> dict[str, str]:
     """A download URL per distinct file, signed concurrently. On GCS each signature is an
     IAM API call (~0.1 s); a 1,482-file bundle took minutes one by one, past the node's 60 s
@@ -772,13 +799,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                         "manifest, group_id, kind) VALUES (?,?,?,?, ?, NULL, NULL, ?, ?, ?)",
                         (rid, task, agent, time.time(), "uploading_final" if final else "uploading",
                          json.dumps(manifest), gid, kind))
-            uploads, seen = [], set()
-            for f in files:
-                if f["sha256"] in seen or blobs.has(agent, f["sha256"], f["size"]):
-                    continue
-                seen.add(f["sha256"])
-                uploads.append({"sha256": f["sha256"], "size": f["size"],
-                                **blobs.upload(agent, f["sha256"], f["size"])})
+            uploads = plan_uploads(blobs, agent, files)
             self._send(201, {"submission_id": sid, "tasks": tasks, "uploads": uploads})
 
         def _commit(self, agent: str, sid: str) -> None:
@@ -791,8 +812,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             final = row[0] == "uploading_final"
             if not final and not self._budget_left(agent):
                 return
-            missing = sorted({f["sha256"] for f in json.loads(row[1])["files"]
-                              if not blobs.has(agent, f["sha256"], f["size"])})
+            missing = missing_blobs(blobs, agent, json.loads(row[1])["files"])
             if missing:
                 return self._err(409, "files_missing", "Some files were not uploaded.",
                                  missing=missing)

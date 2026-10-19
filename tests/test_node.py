@@ -900,6 +900,10 @@ def test_final_on_task_without_split_is_refused(connected):
     w.drain()
     r = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
     assert r["error"]["code"] == "no_test_split"
+    # Refused, so not kept in place of a real final: once the task has a split, asking
+    # without `again` queues a new one rather than returning the refusal.
+    assert store.request_final(sid, again=False) == f"{sid}-final2"
+    assert store.request_final(sid, again=False) == f"{sid}-final2"   # queued: kept
 
 
 def test_resplit_keeps_existing_assignment(tmp_path, provider_files):

@@ -1567,3 +1567,23 @@ def test_sign_all_gives_one_url_per_distinct_file():
     urls = sign_all(Blobs(), "a", files)
     assert len(urls) == 200 and urls[f"{5:064x}"] == f"https://x/a/{5:064x}/5"
     assert time.time() - t < 1.0                      # concurrent, not 2 s one by one
+
+
+def test_upload_plan_and_missing_check_run_concurrently():
+    from bmb_eval.hub import missing_blobs, plan_uploads
+
+    class Blobs:
+        def has(self, agent, sha, size):
+            time.sleep(0.01)
+            return int(sha, 16) % 2 == 0
+        def upload(self, agent, sha, size):
+            time.sleep(0.01)
+            return {"url": f"https://x/{sha}", "method": "PUT"}
+
+    files = [{"sha256": f"{i:064x}", "size": i} for i in range(200)] + [{"sha256": f"{1:064x}", "size": 1}]
+    t = time.time()
+    ups = plan_uploads(Blobs(), "a", files)
+    miss = missing_blobs(Blobs(), "a", files)
+    assert len(ups) == 100 and all(int(u["sha256"], 16) % 2 for u in ups)
+    assert miss == sorted(f"{i:064x}" for i in range(200) if i % 2)
+    assert time.time() - t < 1.5                         # concurrent: ~6 s one by one

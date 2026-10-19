@@ -771,6 +771,7 @@ def test_final_runs_on_test_set_and_is_hidden_from_agent(split_connected):
     final = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
     assert final["split"] == "test" and final["metrics"]["n"] == n_test
     assert agent.status(fid)["error"]["code"] == "not_found"    # agents never see final scores
+    assert store.request_final(sid) == fid                      # one final per model, ever
     # Final runs don't use the agent's validation quota.
     assert w.store.count_total("split_task") == 1
 
@@ -781,10 +782,10 @@ def test_node_enforces_final_cap_and_refusals_dont_count(hub, node_dir, provider
     code, _ = store.add_enrollment(_split_task(tmp_path, final_evaluations=1, name="capped"))
     cfg = _connect(node_dir, url, code, data)
     agent = Client(url, store.add_agent("agent-cap"))
-    sid = agent.submit_async("capped", EXAMPLE_BUNDLE)["submission_id"]
+    sids = [agent.submit_async("capped", EXAMPLE_BUNDLE)["submission_id"] for _ in range(3)]
     w = Worker(cfg)
     w.drain()
-    first, second, third = (store.request_final(sid) for _ in range(3))
+    first, second, third = (store.request_final(s) for s in sids)
     w.drain()
     res = {f: json.loads(store.q("SELECT result FROM submissions WHERE id=?", (f,), one=True)[0])
            for f in (first, second, third)}
@@ -807,16 +808,16 @@ def test_baseline_finals_have_their_own_cap(hub, node_dir, provider_files, tmp_p
                                                baseline_final_evaluations=2))
     cfg = _connect(node_dir, url, code, data)
     op = Client(url, store.set_operator())
-    tok = op.agent_token("ref:score", 1, kind="baseline")
+    tok = op.agent_token("ref:score", 3, kind="baseline")
     assert tok["kind"] == "baseline"
     agent, base = Client(url, store.add_agent("run-a")), Client(url, tok["token"])
-    a_sid = agent.submit_async("sep", EXAMPLE_BUNDLE)["submission_id"]
-    b_sid = base.submit_async("sep", EXAMPLE_BUNDLE)["submission_id"]
-    assert store.q("SELECT kind FROM submissions WHERE id=?", (b_sid,), one=True)[0] == "baseline"
+    a_sids = [agent.submit_async("sep", EXAMPLE_BUNDLE)["submission_id"] for _ in range(2)]
+    b_sids = [base.submit_async("sep", EXAMPLE_BUNDLE)["submission_id"] for _ in range(3)]
+    assert store.q("SELECT kind FROM submissions WHERE id=?", (b_sids[0],), one=True)[0] == "baseline"
     w = Worker(cfg)
     w.drain()
-    b = [store.request_final(b_sid) for _ in range(3)]
-    a = [store.request_final(a_sid) for _ in range(2)]
+    b = [store.request_final(s) for s in b_sids]
+    a = [store.request_final(s) for s in a_sids]
     w.drain()
     res = _final_results(store, a + b)
     assert res[a[0]]["status"] == "ok" and res[a[1]]["error"]["code"] == "final_quota_exceeded"
@@ -840,11 +841,11 @@ def test_baseline_finals_default_to_none(hub, node_dir, provider_files, tmp_path
     cfg = _connect(node_dir, url, code, data)
     agent = Client(url, store.add_agent("run-d"))
     base = Client(url, store.add_agent("ref-d", 1, kind="baseline"))
-    a_sid = agent.submit_async("dflt", EXAMPLE_BUNDLE)["submission_id"]
+    a_sid, a_sid2 = (agent.submit_async("dflt", EXAMPLE_BUNDLE)["submission_id"] for _ in range(2))
     b_sid = base.submit_async("dflt", EXAMPLE_BUNDLE)["submission_id"]
     w = Worker(cfg)
     w.drain()
-    bf, af, af2 = store.request_final(b_sid), store.request_final(a_sid), store.request_final(a_sid)
+    bf, af, af2 = store.request_final(b_sid), store.request_final(a_sid), store.request_final(a_sid2)
     w.drain()
     res = _final_results(store, [bf, af, af2])
     assert res[bf]["error"]["code"] == "final_quota_exceeded"
@@ -859,10 +860,10 @@ def test_unknown_kind_counts_as_an_agents_final(hub, node_dir, provider_files, t
                                                baseline_final_evaluations=5))
     cfg = _connect(node_dir, url, code, data)
     agent = Client(url, store.add_agent("run-u"))
-    sid = agent.submit_async("unk", EXAMPLE_BUNDLE)["submission_id"]
+    sid, sid2 = (agent.submit_async("unk", EXAMPLE_BUNDLE)["submission_id"] for _ in range(2))
     w = Worker(cfg)
     w.drain()
-    f1, f2 = store.request_final(sid), store.request_final(sid)
+    f1, f2 = store.request_final(sid), store.request_final(sid2)
     store.q("UPDATE submissions SET kind='sota' WHERE id IN (?, ?)", (f1, f2))
     w.drain()
     res = _final_results(store, [f1, f2])
@@ -902,8 +903,8 @@ def test_final_on_task_without_split_is_refused(connected):
     assert r["error"]["code"] == "no_test_split"
     # Refused, so not kept in place of a real final: once the task has a split, asking
     # without `again` queues a new one rather than returning the refusal.
-    assert store.request_final(sid, again=False) == f"{sid}-final2"
-    assert store.request_final(sid, again=False) == f"{sid}-final2"   # queued: kept
+    assert store.request_final(sid) == f"{sid}-final2"
+    assert store.request_final(sid) == f"{sid}-final2"          # queued: kept
 
 
 def test_resplit_keeps_existing_assignment(tmp_path, provider_files):
@@ -1536,8 +1537,7 @@ def test_operator_issues_tokens_and_runs_finals_over_the_api(family):
     assert all(d["split"] == "test" for d in view["result"]["datasets"].values())
     assert run.status(sid)["status"] == "registered"                     # the attempt never sees finals
     assert run.tasks()["budget"]["used"] == 0                            # finals cost no budget
-    again = op.request_final(sid, again=True)["finals"]
-    assert len(again) == 2 and not set(again) & set(finals)
+    assert op.request_final(sid)["finals"] == finals                     # done: one final per model
     assert op.final(sid.replace("-", "_", 1))["error"]["code"] == "not_found"   # no wildcard match
     rotated = op.agent_token("run-1", 2, rotate=True)["token"]
     assert run.tasks()["error"]["code"] == "unauthorized" and Client(url, rotated).tasks()["budget"]

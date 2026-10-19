@@ -271,17 +271,17 @@ class HubStore:
         return [r[0] for r in self.q("SELECT id FROM submissions WHERE split='test' "
                                      "AND substr(id, 1, ?) = ? ORDER BY created", (len(pre), pre))]
 
-    def request_final(self, sid: str, again: bool = True) -> str:
-        """Queue a final (test set) evaluation of an existing submission's model.
-        Admin only. The provider's node decides whether it may run (its cap). With
-        again=False, an existing final is returned instead of spending another, unless
-        the node refused it: a refused final never ran and wasn't counted."""
+    def request_final(self, sid: str) -> str:
+        """Queue the final (test set) evaluation of an existing submission's model.
+        Admin only. A model is evaluated on the test set once: an existing final is
+        returned instead, unless the node refused it (a refused final never ran and
+        wasn't counted). The provider's node decides whether it may run (its cap)."""
         row = self.q("SELECT task, agent, manifest, kind FROM submissions WHERE id=? AND split='validation' "
                      "AND status NOT IN ('uploading', 'uploading_final')", (sid,), one=True)
         if not row:
             raise KeyError(f"no committed submission {sid}")
         done = self._finals_of(sid)
-        if done and not again and not self._refused(done[-1]):
+        if done and not self._refused(done[-1]):
             return done[-1]
         fid = f"{sid}-final{len(done) + 1}"
         # The final keeps its submission's kind: a baseline's counts against the baseline cap.
@@ -297,12 +297,12 @@ class HubStore:
         code = ((json.loads(row[0]) if row and row[0] else {}).get("error") or {}).get("code")
         return code in ERRORS and ERRORS[code][1] == "policy"
 
-    def request_finals(self, sid: str, again: bool = True) -> list[str]:
+    def request_finals(self, sid: str) -> list[str]:
         """Final evaluations for a task submission, or for every dataset of a
         family submission."""
         children = [r[0] for r in self.q("SELECT id FROM submissions WHERE group_id=? "
                                          "AND split='validation' ORDER BY task", (sid,))]
-        return [self.request_final(c, again) for c in (children or [sid])]
+        return [self.request_final(c) for c in (children or [sid])]
 
     def add_agent(self, name: str, evaluations: int | None = None, kind: str = "agent") -> str:
         """Token for one attempt. `evaluations` caps its submissions across all
@@ -974,9 +974,10 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                     return self._send(200, view) if view else self._err(
                         404, "not_found", "No final evaluation for this submission.")
                 if not isinstance(body, dict):
-                    return self._err(400, "bad_request", 'Body must be {} or {"again": true}.')
+                    return self._err(400, "bad_request", "Body must be {}.")
                 try:
-                    return self._send(202, {"finals": store.request_finals(m.group(1), bool(body.get("again")))})
+                    # Older clients send {"again": ...}; ignored: a model gets one final.
+                    return self._send(202, {"finals": store.request_finals(m.group(1))})
                 except KeyError:
                     return self._err(404, "not_found", "No such committed submission.")
             self._err(404, "not_found", "No such endpoint.")
@@ -1415,7 +1416,7 @@ def main(argv=None) -> None:
                       "but setup never finished")
     elif args.cmd == "final":
         for fid in store.request_finals(args.submission_id):
-            print(f"queued final evaluation {fid}")
+            print(f"final evaluation {fid}")
         print("see `bmb-hub results <task or family>` when they're done")
     elif args.cmd == "results" and args.task in store.families():
         tasks = store.families()[args.task]

@@ -40,6 +40,8 @@ from pathlib import Path
 
 import yaml
 
+from . import progress
+
 PREFIX = "bmb"                    # object prefix in the provider's bucket
 POOL_ID = "bmb-eval"              # workload identity pool in the provider's project
 PROVIDER_ID = "attestation"
@@ -66,9 +68,9 @@ def pack(task_dir: Path, data_dir: Path, node: dict) -> bytes:
     """The sealed bundle's plaintext: a gzipped tar of task/, data/ and node.json."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for p in sorted(task_dir.iterdir()):
-            if p.is_file():
-                tar.add(p, f"task/{p.name}")
+        for p in sorted(task_dir.rglob("*")):
+            if p.is_file() and "__pycache__" not in p.parts:
+                tar.add(p, f"task/{p.relative_to(task_dir).as_posix()}")
         for name in ("inputs_validation", "inputs_test", "inputs", "answers.parquet", "answers_files"):
             if (data_dir / name).exists():
                 tar.add(data_dir / name, f"data/{name}")
@@ -271,7 +273,17 @@ def upload_sealed(project: str, key: str, bucket: str, task: str, plaintext: byt
 
 
 def cmd_connect_confidential(args) -> None:
-    from .cli import _ask, _summary, _user_path, data_problems
+    from .cli import SetupSteps
+    steps = SetupSteps()
+    try:
+        _connect_confidential(args, steps)
+    except BaseException as e:
+        steps.failed(e)
+        raise
+
+
+def _connect_confidential(args, steps) -> None:
+    from .cli import _ask, _summary, _user_path, data_problems, write_task_files
     from .config import TaskBinding
     from .contract import Contract
     from .node import HubAPI, HubError, parse_connect
@@ -283,12 +295,15 @@ def cmd_connect_confidential(args) -> None:
     state_path = home / "provider.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     hub_url, code = parse_connect(args.code, args.hub or state.get("hub"))
+    steps.hub, steps.code = hub_url, code
     project = args.project or state.get("project")
     region = args.region or state.get("region") or LOCATION
     if not project:
         raise SystemExit("Add --project <your Google Cloud project id>.")
+    steps.at("gcloud_check")
     check_gcloud(project)
 
+    steps.at("fetch_task")
     api = HubAPI(hub_url, state.get("secret"))
     try:
         pkg = api.enrollment(code)
@@ -304,14 +319,15 @@ def cmd_connect_confidential(args) -> None:
     print(f"Connecting to BioModelBench for task '{task}' (sealed: your data stays encrypted)...")
     task_dir = home / "tasks" / task
     task_dir.mkdir(parents=True, exist_ok=True)
-    for name, text in pkg["files"].items():
-        if "/" in name or name.startswith("."):
-            raise SystemExit("unexpected file in task package")
-        (task_dir / name).write_text(text)
+    write_task_files(pkg["files"], task_dir)
 
     data_dir = home / "private" / task
     try:
         contract = Contract.load(task_dir / "contract.yaml")
+        steps.at("data_check")
+        data_bytes = progress.size_of(_user_path(args.data)) if _user_path(args.data).exists() else 0
+        t0 = progress.step(f"Checking your data ({progress.human_bytes(data_bytes)}) and preparing it "
+                           "on this computer", progress.transfer_estimate(data_bytes, mb_per_s=25))
         inputs_dir, answers, n_rows = prepare(contract, _user_path(args.data), data_dir)
         test_dir = None
         if contract.split:
@@ -326,11 +342,13 @@ def cmd_connect_confidential(args) -> None:
         for p in e.problems:
             print(f"  • {p}")
         raise SystemExit("\nFix it and run the same command again.")
-    print(f"✓ Your data looks good ({n_rows:,} rows)")
+    progress.done(t0, f"Your data looks good ({n_rows:,} rows)")
     if contract.split:
         print(f"✓ Split at random on this machine: {n_val:,} validation rows (scored during the "
               f"benchmark), {n_test:,} test rows (held out for final evaluations)")
 
+    steps.at("review")
+    progress.step("Your review: what you're agreeing to")
     print("\n" + _summary(contract, n_rows))
     print(f"  Runs on:             BioModelBench's sealed machine (Google Confidential Space, "
           f"{conf.get('hardware', 'NVIDIA H100')}). Your data is encrypted with your own key in\n"
@@ -344,6 +362,7 @@ def cmd_connect_confidential(args) -> None:
     if not args.yes and _ask("Approve, encrypt and upload? [y/N] ") not in ("y", "yes"):
         raise SystemExit("Nothing was uploaded or shared. Run the same command again whenever you're ready.")
 
+    steps.at("activate")
     try:
         creds = HubAPI(hub_url, state.get("secret")).activate(code, f"sealed-{project}")
     except HubError as e:
@@ -356,21 +375,30 @@ def cmd_connect_confidential(args) -> None:
     state_path.write_text(json.dumps(state, indent=2))
     os.chmod(state_path, 0o600)
 
-    print("  Setting up your key and storage in Google Cloud...")
+    steps.at("cloud_setup")
+    t0 = progress.step(f"Setting up your key and storage in Google Cloud project {project}",
+                       "1-2 minutes the first time, seconds after")
     try:
         ptr = setup_provider_cloud(project, conf["digest"], conf["workload_sa"],
                                    bool(conf.get("gpu_preview")), region)
     except GcloudError as e:
         if "constraints/gcp.resourceLocations" in str(e):
+            steps.reason = "region_blocked"
             raise SystemExit(f"Your organization doesn't allow Google Cloud resources in {region}. "
                              "Run the same command again with a region it allows, for example\n"
                              "    --region europe-west4      (or europe-west1, asia-northeast1, us-east1 ...)\n"
                              "Your data stays encrypted in that region; it works the same.") from None
         raise
-    print("  Encrypting on this machine and uploading...")
+    progress.done(t0, "Key and storage ready")
     node = {"hub": hub_url, "node_id": state["node_id"], "secret": state["secret"], "task": task,
             "package_version": int(pkg.get("version", 1))}
-    upload_sealed(project, ptr["KEY"], ptr["BUCKET"], task, pack(task_dir, data_dir, node))
+    steps.at("upload")
+    sealed = pack(task_dir, data_dir, node)
+    t0 = progress.step(f"Encrypting on this computer and uploading {progress.human_bytes(len(sealed))}",
+                       progress.transfer_estimate(len(sealed), mb_per_s=10))
+    upload_sealed(project, ptr["KEY"], ptr["BUCKET"], task, sealed)
+    progress.done(t0, "Encrypted copy uploaded")
+    steps.at("notify")
     try:
         HubAPI(hub_url, state["secret"])._req("POST", "/v1/node/confidential",
                                               {**ptr, "digest": conf["digest"]})

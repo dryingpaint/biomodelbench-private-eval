@@ -89,6 +89,15 @@ class HubAPI:
     def activate(self, code: str, name: str) -> dict:
         return self._req("POST", f"/v1/enroll/{code}", {"name": name})
 
+    def report_setup(self, code: str, step: str, reason: str, detail: str = "") -> None:
+        """Tell BioModelBench a connect failed: its step and a fixed reason only.
+        Best effort: a report that can't be sent never hides the real error."""
+        try:
+            HubAPI(self.url, timeout=10)._req("POST", f"/v1/enroll/{code}/report",
+                                              {"step": step, "reason": reason, "detail": detail})
+        except Exception:
+            pass
+
     # work
     def hello(self, tasks: dict, accepting: bool, held: list[str], status: dict | None = None) -> dict:
         body = {"tasks": tasks, "accepting": accepting, "held": held}

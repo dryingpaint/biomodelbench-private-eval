@@ -113,8 +113,9 @@ METRICS = {
 
 def write_task(task_id: str, tasks_dir: Path, inputs: list[tuple[str, str, bool]],
                answers: list[tuple[str, str, bool]], key: list[str], kind: str,
-               target: str) -> Path:
-    """Write tasks/<id>/contract.yaml and score.py from column lists."""
+               target: str, split: float | None = None) -> Path:
+    """Write tasks/<id>/contract.yaml and score.py from column lists. A held-out
+    test set is off unless `split` (the validation fraction) is given."""
     if kind not in SCORERS:
         raise SystemExit(f"--kind must be one of {sorted(SCORERS)}")
     if target in {c[0] for c in inputs}:
@@ -155,6 +156,11 @@ def write_task(task_id: str, tasks_dir: Path, inputs: list[tuple[str, str, bool]
         *[_field_yaml(*c) for c in answers],
         "",
         METRICS[kind].rstrip(),
+        "",
+        "# Held-out test set (optional, off by default): validation rows are scored during the",
+        "# benchmark, the rest only for final evaluations.",
+        (f"split: {{validation_fraction: {split}, final_evaluations: 3}}" if split is not None
+         else "# split: {validation_fraction: 0.5, final_evaluations: 3}"),
         "",
         "export:",
         "  decimals: 3",

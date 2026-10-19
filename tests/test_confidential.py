@@ -82,7 +82,10 @@ def test_sealed_node_end_to_end(hub, provider_files, tmp_path, monkeypatch):  # 
     data, _ = provider_files
     store.set_setting("confidential", {"image": f"r/sealed@{DIGEST}", "digest": DIGEST,
                                        "workload_sa": "wl@p", "hardware": "test"})
-    code, _ = store.add_enrollment(_split_task(tmp_path, name="sealed"))
+    task_dir = _split_task(tmp_path, name="sealed")
+    (task_dir / "refs").mkdir()
+    (task_dir / "refs" / "table.bin").write_bytes(bytes(range(256)))     # a subfolder, binary
+    code, _ = store.add_enrollment(task_dir)
     uploaded = {}
     monkeypatch.setattr(conf, "check_gcloud", lambda project=None: None)
     monkeypatch.setattr(conf, "setup_provider_cloud", lambda project, digest, sa, gpu, region=None: {
@@ -95,7 +98,7 @@ def test_sealed_node_end_to_end(hub, provider_files, tmp_path, monkeypatch):  # 
     assert set(uploaded) == {"sealed"}
     with tarfile.open(fileobj=io.BytesIO(uploaded["sealed"])) as tar:
         names = tar.getnames()
-    assert "node.json" in names and "task/score.py" in names
+    assert "node.json" in names and "task/score.py" in names and "task/refs/table.bin" in names
     assert "data/inputs_test/samples.parquet" in names and not any("split.json" in n for n in names)
     node_id = store.q("SELECT id FROM nodes", one=True)[0]
     assert json.loads(store.q("SELECT confidential FROM nodes WHERE id=?", (node_id,), one=True)[0])["BUCKET"] == "gs://b"
@@ -103,6 +106,7 @@ def test_sealed_node_end_to_end(hub, provider_files, tmp_path, monkeypatch):  # 
     # The sealed node: unseal into its memory folder and serve (local sandbox stands in for bwrap).
     root = tmp_path / "sealed_root"
     node = conf.unpack(uploaded["sealed"], root / "tasks" / "sealed", root / "private" / "sealed")
+    assert (root / "tasks" / "sealed" / "refs" / "table.bin").read_bytes() == bytes(range(256))
     cfg_path = conf.write_config(root, {"sealed": (root / "tasks" / "sealed", root / "private" / "sealed",
                                                    node)}, "test", tmp_path / "blobs")
     raw = yaml.safe_load(cfg_path.read_text())
@@ -371,3 +375,30 @@ def test_hub_passes_through_only_uv_and_python_release_files(hub, monkeypatch): 
     assert get("/dl/uv/../../etc/passwd")[0] in (401, 404)
     assert get("/dl/python/../x")[0] in (401, 404)
     assert get("/dl/python/%2E%2E/x")[0] in (401, 404)
+
+
+def test_sealed_connect_reports_google_cloud_refusals(hub, provider_files, tmp_path,  # noqa: F811
+                                                      monkeypatch):
+    store, url = hub
+    data, _ = provider_files
+    store.set_setting("confidential", {"image": f"r/sealed@{DIGEST}", "digest": DIGEST,
+                                       "workload_sa": "wl@p", "hardware": "test"})
+    code, _ = store.add_enrollment(_split_task(tmp_path, name="refused"))
+    monkeypatch.setattr(conf, "check_gcloud", lambda project=None: None)
+    monkeypatch.setattr("bmb_eval.hub.alert", lambda store, text: None)
+
+    def refuse(msg):
+        def f(*a, **k):
+            raise conf.GcloudError(msg)
+        return f
+    home = str(tmp_path / "provider")
+    for msg, reason in [("Google Cloud refused `gcloud kms keyrings`:\n  PERMISSION_DENIED", "gcloud_refused"),
+                        ("violates constraints/gcp.resourceLocations", "region_blocked")]:
+        monkeypatch.setattr(conf, "setup_provider_cloud", refuse(msg))
+        with pytest.raises(SystemExit):
+            cli.main(["connect-confidential", code, "--hub", url, "--data", str(data),
+                      "--project", "p", "--dir", home, "--yes"])
+        assert store.q("SELECT step, reason FROM setup_reports ORDER BY at DESC", one=True) == \
+            ("cloud_setup", reason)
+    [p] = store.setup_problems()
+    assert p["reason"] == "region_blocked" and not p["resolved"]

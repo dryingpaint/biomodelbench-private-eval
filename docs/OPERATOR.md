@@ -64,7 +64,8 @@ deploy/gcp/hub family set admet admet_ism admet_labx      # group datasets for o
 deploy/gcp/hub final <submission_id>                      # held-out test runs (every dataset, for a family)
 deploy/gcp/hub results <task or family>                   # all scores, including finals
 deploy/gcp/hub revoke <code>                              # cancel an unused connect code
-deploy/gcp/hub status                                     # nodes, tasks, queue, codes
+deploy/gcp/hub status                                     # nodes, tasks, queue, codes, setup problems
+deploy/gcp/hub alerts --webhook https://hooks.slack.com/… # where setup alerts go (--test to try it)
 ```
 
 ## Onboard a provider
@@ -97,9 +98,19 @@ deploy/gcp/hub status                                     # nodes, tasks, queue,
 3. **Check it with fake data:** save the public contract (`Contract.load(...).public()`
    as JSON), then run `bmb-eval dryrun contract.json <template>/bundle`.
 4. **Enroll:** `deploy/gcp/hub enroll <task folder>` prints the email. Send it.
+   The whole folder is shipped, subfolders and binary files included (e.g. a
+   reference `.npy` the scorer loads), up to 16 MB. The example `bundle/`,
+   hidden files and `__pycache__` are left out.
    **Each task has one code for good.** It works only for the first machine that
    connects with it, and that machine can reuse it for re-runs and updates.
-5. **Watch it come online:** `deploy/gcp/hub status`.
+5. **Watch it come online:** `deploy/gcp/hub status`. If the provider's command
+   fails, it tells the hub which step failed and why, from a fixed list (for
+   example `cloud_setup: gcloud_refused`, `data_check: data_problem`,
+   `review: declined`), never data or error text. `status` shows it and the
+   alert webhook gets it right away. A code that was used but whose setup hasn't
+   finished an hour later shows as STALLED and alerts once. Either way, the fix
+   is usually to ask the provider for the message they saw and have them run the
+   same command again.
 
 **Changing a task** never needs a new code. Edit the files and run `enroll`
 again:
@@ -127,7 +138,7 @@ code nobody has used, run `deploy/gcp/hub revoke <code>`.
 | metric `per: [...]` | none | Every group adds a full metric to the leakage budget |
 
 | metric `final_only: true` | off | Reported only in final evaluations. Use it for absolute metrics (MAE, RMSE, calibration): agents' public training data comes from other labs' protocols, so absolute errors mostly measure the offset, and repeated feedback lets agents fit it. Needs `split` |
-| `split` | off | **Recommended for every task.** `{validation_fraction: 0.5, final_evaluations: 3}` |
+| `split` | off | Optional held-out test set, e.g. `{validation_fraction: 0.5, final_evaluations: 3}` (`bmb-hub new-task --split 0.5` writes it). Worth it when agents get many evaluations on one task, since repeated feedback can overfit the scored rows. Needed by `final_only` and `final_limits` |
 | `split.baseline_final_evaluations` | 0 | Test runs of our own reference models (baseline tokens), capped separately from the agents' `final_evaluations`; counted in the leakage budget |
 
 ## One run, many datasets: families and attempt budgets

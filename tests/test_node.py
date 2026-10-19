@@ -197,6 +197,43 @@ def test_leakage_budget():
     assert b.timing_bits > 0 and b.lifetime == pytest.approx(b.per_submission * 200)
 
 
+def test_leakage_stated_as_rows_of_hidden_values():
+    import dataclasses
+    c = _contract()                                   # one float answer: ~10 bits per row
+    b = leakage.budget(c)
+    assert leakage.bits_per_row(c) == pytest.approx(leakage.VALUE_BITS)
+    assert leakage.rows_recoverable(c, b.lifetime) == pytest.approx(b.lifetime / leakage.VALUE_BITS)
+    text = " ".join(cli._summary(c, 100_000).split())
+    assert "recover the fitness values of about" in text and "of your 100,000 rows" in text
+    assert "of all 50 rows" in " ".join(cli._summary(c, 50).split())   # capped at the data size
+    # A yes/no answer costs one bit per row, so many more rows are exposed.
+    c2 = dataclasses.replace(c, answers=[c.answers[0], dataclasses.replace(c.answers[1], type="bool")])
+    assert leakage.rows_recoverable(c2, b.lifetime) == pytest.approx(b.lifetime)
+    # Answers kept in private files: no per-row estimate, falls back to an amount of information.
+    c3 = dataclasses.replace(c, answers=[c.answers[0]])
+    assert leakage.rows_recoverable(c3, b.lifetime) is None and "KB" in cli._summary(c3, 100)
+
+
+def test_new_task_has_no_split_unless_asked(tmp_path):
+    cols = [("id", "string", False), ("x", "float", False)], [("id", "string", False), ("y", "float", False)]
+    d = scaffold.write_task("t_off", tmp_path, *cols, ["id"], "regression", "y")
+    assert Contract.load(d / "contract.yaml").split is None
+    d = scaffold.write_task("t_on", tmp_path, *cols, ["id"], "regression", "y", split=0.5)
+    assert Contract.load(d / "contract.yaml").split.validation_fraction == 0.5
+
+
+def test_progress_bar_off_a_terminal_prints_every_tenth(capsys):
+    from bmb_eval import progress
+    bar = progress.Bar("Sandbox image", 1000)
+    for _ in range(100):
+        bar.update(10)
+    bar.close()
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 11 and "100%" in lines[-1] and "1.0 KB of 1.0 KB" in lines[-1]
+    assert progress.transfer_estimate(3_000_000_000) == "about 2 minutes"
+    assert progress.duration(65) == "1m 05s"
+
+
 def test_release_delay_closes_timing_channel():
     import dataclasses
     c = _contract()
@@ -1080,6 +1117,40 @@ def test_enrolling_again_keeps_the_code(tmp_path):
     assert code1 == code2 and store.enrollment(code1)[3] == 2
 
 
+def test_task_folder_with_subfolders_and_binary_files_reaches_the_node(hub, node_dir, provider_files):
+    store, url = hub
+    data, task_dir = provider_files
+    (task_dir / "refs").mkdir()
+    (task_dir / "refs" / "panel.txt").write_text("GENE1\nGENE2\n")
+    (task_dir / "refs" / "table.bin").write_bytes(bytes(range(256)))
+    (task_dir / "bundle").mkdir()
+    (task_dir / "bundle" / "predict.py").write_text("# example model: not shipped\n")
+    (task_dir / ".secret").write_text("not shipped")
+    code, _ = store.add_enrollment(task_dir)
+    assert set(store.enrollment(code)[1]) == {"contract.yaml", "score.py", "refs/panel.txt", "refs/table.bin"}
+    cfg = _connect(node_dir, url, code, data)
+    got = cfg.tasks["binding"].dir
+    assert (got / "refs" / "panel.txt").read_text() == "GENE1\nGENE2\n"
+    assert (got / "refs" / "table.bin").read_bytes() == bytes(range(256))
+    assert not (got / "bundle").exists() and not (got / ".secret").exists()
+
+
+def test_task_package_paths_stay_inside_the_task_folder(tmp_path):
+    for bad in ("../escape.py", "/etc/x", "a/../../b", ".hidden", "a\\..\\b"):
+        with pytest.raises(SystemExit):
+            cli.write_task_files({bad: "x"}, tmp_path / "t")
+    assert not (tmp_path / "escape.py").exists()
+
+
+def test_task_folder_too_big_to_package(tmp_path, monkeypatch):
+    d = scaffold.write_task("t1", tmp_path / "t", [("id", "string", False), ("x", "float", False)],
+                            [("id", "string", False), ("y", "float", False)], ["id"], "regression", "y")
+    monkeypatch.setattr(hub_mod, "MAX_PACKAGE_BYTES", 100)
+    (d / "big.bin").write_bytes(b"\0" * 200)
+    with pytest.raises(ValueError, match="task packages are for"):
+        hub_mod.HubStore.package_files(d)
+
+
 def test_task_update_reaches_provider_who_approves_it(connected, provider_files, capsys):
     cfg, store, url, agent = connected
     _, task_dir = provider_files
@@ -1587,3 +1658,84 @@ def test_upload_plan_and_missing_check_run_concurrently():
     assert len(ups) == 100 and all(int(u["sha256"], 16) % 2 for u in ups)
     assert miss == sorted(f"{i:064x}" for i in range(200) if i % 2)
     assert time.time() - t < 1.5                         # concurrent: ~6 s one by one
+
+
+# ------------------------------------------- failed and stalled setups reach BioModelBench
+
+def _reports(store):
+    return [r[1:4] for r in store.q("SELECT code, step, reason, detail FROM setup_reports ORDER BY at")]
+
+
+def test_failed_connect_reports_step_and_reason_and_alerts(hub, node_dir, provider_files, tmp_path,
+                                                           monkeypatch):
+    import pandas as pd
+    store, url = hub
+    data, task_dir = provider_files
+    alerts = []
+    monkeypatch.setattr(hub_mod, "alert", lambda store, text: alerts.append(text))
+    code, _ = store.add_enrollment(task_dir)
+    pd.read_csv(data).drop(columns=["sequence"]).to_csv(tmp_path / "bad.csv", index=False)
+    with pytest.raises(SystemExit):
+        cli.main(["--config", str(node_dir / "config.yaml"), "connect", code, "--hub", url,
+                  "--data", str(tmp_path / "bad.csv"), "--yes", "--no-service"])
+    assert _reports(store) == [("data_check", "data_problem", "")]
+    # Declining at the approval screen is reported as such.
+    monkeypatch.setattr(cli, "_ask", lambda prompt: "n")
+    with pytest.raises(SystemExit):
+        cli.main(["--config", str(node_dir / "config.yaml"), "connect", code, "--hub", url,
+                  "--data", str(data), "--no-service"])
+    assert _reports(store)[-1] == ("review", "declined", "")
+    # An unexpected error reports only its class name.
+    monkeypatch.setattr(cli, "_summary", lambda c, n: (_ for _ in ()).throw(RuntimeError("/secret/path")))
+    with pytest.raises(RuntimeError):
+        cli.main(["--config", str(node_dir / "config.yaml"), "connect", code, "--hub", url,
+                  "--data", str(data), "--yes", "--no-service"])
+    assert _reports(store)[-1] == ("review", "crashed", "RuntimeError")
+    for _ in range(50):
+        if len(alerts) == 3:
+            break
+        time.sleep(0.05)
+    assert len(alerts) == 3 and "at checking their data: data_problem" in alerts[0]
+    assert not any("secret" in a for a in alerts)
+    probs = store.setup_problems()
+    assert [p["reason"] for p in probs] == ["crashed"] and not probs[0]["resolved"]
+
+
+def test_setup_report_accepts_only_fixed_fields(hub, provider_files):
+    import urllib.error
+    import urllib.request
+    store, url = hub
+    _, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+
+    def post(c, body):
+        req = urllib.request.Request(f"{url}/v1/enroll/{c}/report", data=json.dumps(body).encode(),
+                                     method="POST", headers={"Content-Type": "application/json"})
+        try:
+            return urllib.request.urlopen(req).status
+        except urllib.error.HTTPError as e:
+            return e.code
+    assert post(code, {"step": "upload", "reason": "gcloud_refused"}) == 204
+    assert post(code, {"step": "upload", "reason": "my data is /home/x.csv"}) == 400
+    assert post(code, {"step": "upload", "reason": "crashed", "detail": "a b/c"}) == 400
+    assert post("AAAA-BBBB-CCCC", {"step": "upload", "reason": "crashed"}) == 404
+    for _ in range(30):
+        post(code, {"step": "upload", "reason": "crashed"})
+    assert store.q("SELECT COUNT(*) FROM setup_reports", one=True)[0] == 20     # capped per code
+
+
+def test_used_code_whose_setup_never_finished_is_stalled(hub, provider_files, monkeypatch):
+    from bmb_eval.node import HubAPI
+    store, url = hub
+    _, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    HubAPI(url).activate(code, "sealed-p")                        # approved, then nothing
+    assert store.setup_problems() == []                           # not yet an hour
+    later = time.time() + hub_mod.STALL_S + 60
+    [p] = store.setup_problems(later)
+    assert p["kind"] == "stalled" and p["code"] == code
+    alerts = []
+    monkeypatch.setattr(hub_mod, "alert", lambda store, text: alerts.append(text))
+    hub_mod.check_stalled(store, later)
+    hub_mod.check_stalled(store, later + 600)                     # alerts once per code
+    assert len(alerts) == 1 and "never finished" in alerts[0]

@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
-say "Installing"
+say "Installing the evaluator and its Python packages (usually 1-2 minutes)"
 # uv installs without sudo and brings its own Python, so this works the same on
 # every distribution (stock Ubuntu's python3 can't create virtualenvs).
 # From the hub (install.sh): uv, and the Python it installs, come through the hub, since
@@ -50,7 +50,7 @@ fi
 
 [ -f config.yaml ] || ./bmb-eval init --engine "${BMB_ENGINE:-auto}"
 
-say "Preparing the sandbox"
+say "Preparing the sandbox models run in"
 ./bmb-eval build-image ${BMB_HUB:+--from "$BMB_HUB/sandbox-image.tar"}
 
 # On an update, re-test and re-approve the already-connected task(s).

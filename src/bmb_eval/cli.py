@@ -87,6 +87,11 @@ def cmd_build_image(args) -> None:
     if engine not in ENGINES:
         print("local backend: no image needed")
         return
+    # Updates (setup.sh) call this every time; skip the multi-GB download when the
+    # image here was built from this very code (stamp label == SANDBOX_FILES digest).
+    if make_sandbox(cfg).image_id() != "missing" and not stale_image_message(cfg):
+        print("Sandbox image already current (built from this code); nothing to download")
+        return
     if args.from_url:
         try:
             import hashlib

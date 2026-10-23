@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import re
+import subprocess
 import tarfile
 import threading
 import urllib.request
@@ -121,3 +122,24 @@ def test_hub_publishes_the_release_with_the_hash_of_each_download(hub):
     (state / "sandbox-image.stamp").write_text(sandbox_stamp(REPO) + "\n")
     assert json.loads(_get(f"{url}/release"))["files"]["sandbox-image.tar"]["current"] is True
     assert f"{sha}  sandbox-image.tar\n" in _get(f"{url}/SHA256SUMS").decode()
+
+
+def test_build_image_skips_the_download_when_the_image_is_current(tmp_path, monkeypatch, capsys):
+    # Updates re-run `bmb-eval build-image --from <hub>`; a current image must not be
+    # downloaded again (6.8 GB, minutes).
+    from argparse import Namespace
+    from bmb_eval import cli, sandbox
+    (tmp_path / "config.yaml").write_text("sandbox:\n  backend: podman\n")
+    monkeypatch.setattr(sandbox.ContainerSandbox, "image_id", lambda self: "sha256:deadbeef")
+    monkeypatch.setattr(sandbox.ContainerSandbox, "image_label", lambda self, key: sandbox_stamp(REPO))
+
+    def no_download(*a, **k):
+        raise AssertionError("downloaded")
+    monkeypatch.setattr(cli.urllib.request, "urlopen", no_download)
+    cli.cmd_build_image(Namespace(config=str(tmp_path / "config.yaml"), from_url="http://hub/sandbox-image.tar"))
+    assert "already current" in capsys.readouterr().out
+    # Once the code moves on, the download happens again.
+    monkeypatch.setattr(sandbox.ContainerSandbox, "image_label", lambda self, key: "0123456789abcdef")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("built")))
+    with pytest.raises(AssertionError, match="downloaded|built"):
+        cli.cmd_build_image(Namespace(config=str(tmp_path / "config.yaml"), from_url="http://hub/sandbox-image.tar"))

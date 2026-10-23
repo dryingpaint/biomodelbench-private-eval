@@ -1,5 +1,8 @@
-# What submitted models can import without shipping wheels. Pin exact versions
-# (`uv pip compile`) before production so image rebuilds are reproducible.
+# What submitted models can import without shipping wheels: the packages we choose,
+# as ranges. What the image installs is sandbox/requirements.lock: every package,
+# dependencies included, pinned to one version with the hash of each wheel. After
+# editing this file, or to take upstream updates, run sandbox/lock.sh and commit
+# both files (the lock is part of the sandbox stamp, so the hub rebuilds the image).
 numpy>=1.26
 pandas>=2.2
 pyarrow>=15

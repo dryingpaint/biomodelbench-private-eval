@@ -187,4 +187,6 @@ or `false`. When it's `false`, `metrics` repeats your previous best.
 | `GET /install.sh` | The provider installer |
 | `GET /bmb-eval.tar.gz` | The node code |
 | `GET /sandbox-image.tar`, `GET /sandbox-image.tar.sha256` | The prebuilt sandbox image and its checksum |
+| `GET /release` | The release being served: `version` (git tag), `commit`, and under `files` the sha256 and size of each download; the image's entry also has the `stamp` it was built with and `current` (whether that is this code's stamp) |
+| `GET /SHA256SUMS` | The same checksums in `sha256sum -c` form |
 | `GET /guide` | The provider guide (HTML; `/guide.md` for Markdown) |

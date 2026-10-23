@@ -91,8 +91,9 @@ bmb-eval dryrun contract.json my_bundle/      # contract.json from hub.contract(
 ```
 install.sh, setup.sh, bmb-eval   what providers run
 src/bmb_eval/                    node, hub, sandbox entry points, contracts, client
-sandbox/                         the sandbox image (Dockerfile, packages)
+sandbox/                         the sandbox image (Dockerfile, packages and their lock)
 deploy/gcp/                      bring up the hub on Google Cloud
+deploy/release.sh                cut a release: one tag for installer, evaluator and image
 examples/tasks/                  task templates (contract, scorer, example model)
 docs/                            provider guide, operator guide, intake questions, threat model
 tests/                           pytest (runs without containers)

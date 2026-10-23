@@ -15,8 +15,9 @@ as_bmb "cd $CODE && ~/.local/bin/uv venv -q --python 3.12 .venv 2>/dev/null || t
 as_bmb "mkdir -p $STATE"
 
 # Sandbox image providers download (rebuilt only when its inputs change).
-# Only what runs inside the sandbox: contract checks and the three entry points.
-SANDBOX_FILES="sandbox/Dockerfile sandbox/requirements.txt src/bmb_eval/__init__.py src/bmb_eval/contract.py src/bmb_eval/errors.py src/bmb_eval/sandbox_entry/__init__.py src/bmb_eval/sandbox_entry/predict.py src/bmb_eval/sandbox_entry/validate.py src/bmb_eval/sandbox_entry/score.py"
+# Only what goes into the sandbox: contract checks, the three entry points, and the lock
+# that pins its packages. The same list as sandbox.SANDBOX_FILES (a test keeps them equal).
+SANDBOX_FILES="sandbox/Dockerfile sandbox/requirements.txt sandbox/requirements.lock src/bmb_eval/__init__.py src/bmb_eval/contract.py src/bmb_eval/errors.py src/bmb_eval/sandbox_entry/__init__.py src/bmb_eval/sandbox_entry/predict.py src/bmb_eval/sandbox_entry/validate.py src/bmb_eval/sandbox_entry/score.py"
 STAMP="$(cd "$CODE" && cat $SANDBOX_FILES | sha256sum | cut -c1-16)"
 # Built as root: a boot script has no user login session, which rootless
 # Podman needs. The image is only exported as a file for providers.
@@ -103,7 +104,12 @@ elif [ "$caddy_changed" = 1 ]; then systemctl reload caddy; fi
 for i in $(seq 1 60); do
   # Any HTTP answer means it's up (/v1/tasks wants a token: 401 without one).
   code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8790/v1/tasks || true)"
-  [ "$code" != "000" ] && { echo "hub is serving the new code (HTTP $code)"; exit 0; }
+  [ "$code" != "000" ] && {
+    echo "hub is serving the new code (HTTP $code)"
+    # The release it serves: tag, commit, and the sha256 of each download.
+    curl -s http://127.0.0.1:8790/release; echo
+    exit 0
+  }
   sleep 1
 done
 echo "the hub didn't answer within 60s after the restart; see: journalctl -u bmb-hub" >&2

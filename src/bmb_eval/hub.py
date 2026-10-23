@@ -15,6 +15,7 @@ gated results nodes send back. Never sees provider data.
     enroll   GET  /v1/enroll/<code>               task package (contract, scorer, ...)
              POST /v1/enroll/<code>               activate: bind task to a node
     public   GET  /install.sh, /bmb-eval.tar.gz, /sandbox-image.tar,
+                  /release, /SHA256SUMS (the release tag, commit and sha256 of each download)
                   /guide (the provider guide as a web page)
 
 Model files live in Google Cloud Storage (`--bucket`), moved with signed URLs
@@ -27,6 +28,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import gzip
 import hashlib
 import io
 import json
@@ -40,9 +42,11 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import release
 from .blobs import BlobCache, check_manifest, manifest_id
 from .contract import Contract
 from .errors import ERRORS, EvalError
+from .sandbox import sandbox_stamp
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -558,19 +562,54 @@ def cached_download(cache: Path, kind: str, release: str, name: str) -> Path | N
         return None
 
 
-def code_tarball(root: Path) -> bytes | None:
-    """The node code providers install, built from this checkout."""
+def code_tarball(root: Path, rel: dict | None = None) -> bytes | None:
+    """The node code providers install, built from this checkout, with release.json
+    saying which release it is. Byte-for-byte the same for the same files (no
+    timestamps or owners), so its sha256 identifies the release (GET /release)."""
     if not (root / "setup.sh").is_file():
         return None
     include = ["pyproject.toml", "README.md", "setup.sh", "bmb-eval", "sandbox", "src", "docs"]
+
+    def clean(ti: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        if "__pycache__" in ti.name or ti.name.endswith(".pyc"):
+            return None
+        ti.mtime = 0
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
+        ti.mode = 0o755 if ti.isdir() or ti.mode & 0o100 else 0o644
+        return ti
+
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for name in include:
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz, \
+            tarfile.open(fileobj=gz, mode="w") as tar:
+        for name in include:            # tarfile walks directories in sorted order
             p = root / name
             if p.exists():
-                tar.add(p, arcname=name, filter=lambda ti: None
-                        if "__pycache__" in ti.name or ti.name.endswith(".pyc") else ti)
+                tar.add(p, arcname=name, filter=clean)
+        if rel:
+            data = (json.dumps(rel) + "\n").encode()
+            ti = tarfile.TarInfo("release.json")
+            ti.size, ti.mode = len(data), 0o644
+            tar.addfile(ti, io.BytesIO(data))
     return buf.getvalue()
+
+
+def published_image(state: Path, expected_stamp: str | None) -> dict | None:
+    """The sandbox image this hub publishes: its sha256 and size, the stamp it was
+    built with (deploy/gcp/hub-deploy.sh), and whether that is this code's stamp.
+    None until an image has been published."""
+    tar = state / "sandbox-image.tar"
+    sums = tar.with_suffix(".tar.sha256")
+    if not tar.is_file() or not sums.is_file():
+        return None
+    stamp_file = state / "sandbox-image.stamp"
+    stamp = stamp_file.read_text().strip() if stamp_file.is_file() else None
+    return {"sha256": sums.read_text().split()[0], "bytes": tar.stat().st_size,
+            "stamp": stamp, "current": stamp is not None and stamp == expected_stamp}
+
+
+def _digest(body: bytes) -> dict:
+    return {"sha256": hashlib.sha256(body).hexdigest(), "bytes": len(body)}
 
 
 # --------------------------------------------------------------------- HTTP
@@ -727,12 +766,25 @@ def watch_stalled(store: HubStore, every_s: int = 300) -> threading.Thread:
 
 def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_bundle_gb: int):
     max_bundle = max_bundle_gb << 30
-    tarball = code_tarball(repo_root)
+    rel = release.info(repo_root)
+    expected_stamp = sandbox_stamp(repo_root)
+    tarball = code_tarball(repo_root, rel)
     install_sh = repo_root / "install.sh"
     confidential_sh = repo_root / "confidential.sh"
     verify_sh = repo_root / "deploy" / "confidential" / "verify-image.sh"
     pages = {"/guide": repo_root / "docs" / "PROVIDER_SETUP.md"}
     image_tar = store.state / "sandbox-image.tar"
+
+    def release_view() -> dict:
+        """GET /release: which release this is, and the sha256 of each download. The
+        image's entry is None until deploy/gcp/hub-deploy.sh has published one."""
+        files = {}
+        if install_sh.is_file():
+            files["install.sh"] = _digest(install_sh.read_text().replace("__BMB_HUB__", public_url).encode())
+        if tarball:
+            files["bmb-eval.tar.gz"] = _digest(tarball)
+        files["sandbox-image.tar"] = published_image(store.state, expected_stamp)
+        return {**rel, "sandbox_stamp": expected_stamp, "files": files}
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "bmb-hub"
@@ -824,6 +876,11 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if p == "/sandbox-image.tar.sha256" and image_tar.with_suffix(".tar.sha256").is_file():
                 return self._send(200, body=image_tar.with_suffix(".tar.sha256").read_bytes(),
                                   ctype="text/plain")
+            if p == "/release":
+                return self._send(200, release_view())
+            if p == "/SHA256SUMS":           # the same checksums, for `sha256sum -c`
+                lines = [f"{v['sha256']}  {k}\n" for k, v in release_view()["files"].items() if v]
+                return self._send(200, body="".join(lines).encode(), ctype="text/plain")
             if m := re.fullmatch(r"/v1/enroll/([A-Z0-9-]{14})", p):
                 e = store.enrollment(m.group(1))
                 me = store.node(self._bearer()) if self._bearer() else None
@@ -1277,14 +1334,15 @@ def main(argv=None) -> None:
     store = HubStore(state)
     if args.cmd == "serve":
         url = args.public_url.rstrip("/")
-        handler = make_handler(store, make_blobs(state, url, args.bucket), url, _repo_root(),
+        root = _repo_root()
+        handler = make_handler(store, make_blobs(state, url, args.bucket), url, root,
                                args.max_bundle_gb)
         httpd = ThreadingHTTPServer((args.host, args.port), handler)
         if args.launch_sealed:
             from .sealed_launcher import loop
             loop(store)
         watch_stalled(store)
-        print(f"bmb-hub on http://{args.host}:{args.port} (public: {url}; "
+        print(f"bmb-hub {release.describe(root)} on http://{args.host}:{args.port} (public: {url}; "
               f"model files: {'gs://' + args.bucket if args.bucket else 'hub disk'})")
         try:
             httpd.serve_forever()
@@ -1393,6 +1451,13 @@ def main(argv=None) -> None:
                 print(f"{k}={v}")
     elif args.cmd == "status":
         now = time.time()
+        root = _repo_root()
+        img = published_image(state, sandbox_stamp(root))
+        print(f"release {release.describe(root)}; sandbox image: " + (
+            "not published yet" if img is None else
+            f"stamp {img['stamp'] or 'unstamped'}" + (
+                " (current)" if img["current"] else
+                f" (STALE: this code expects {sandbox_stamp(root)}; run deploy/gcp/hub deploy)")))
         for nid, name, seen, acc, st in store.q("SELECT id, name, last_seen, accepting, status FROM nodes"):
             age = f"{int(now - seen)}s ago" if seen else "never"
             tasks = [r[0] for r in store.q("SELECT task FROM node_tasks WHERE node_id=?", (nid,))]

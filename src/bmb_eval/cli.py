@@ -628,6 +628,8 @@ def cmd_status(args) -> None:
     drift = approval.diff(cfg)
     running = subprocess.run(["systemctl", "--user", "is-active", "bmb-eval"],
                              capture_output=True, text=True).stdout.strip() if shutil.which("systemctl") else "?"
+    from . import release
+    print(f"version     {release.describe(cfg.path.parent)}")
     print(f"connected   {cfg.hub.get('url', 'NO (run the connect command)')}")
     print(f"service     {running}")
     from .node import pending_updates

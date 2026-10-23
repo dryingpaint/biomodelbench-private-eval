@@ -212,6 +212,11 @@ Rocky 9), the drop-in `/etc/systemd/system/user@.service.d/delegate.conf`
 your user so the evaluator keeps running after you log out. Tested on Ubuntu
 22.04 and 24.04, Debian 12 and Rocky 9 (SELinux enforcing).
 
+`~/bmb-eval/bmb-eval status` shows the version installed (a release tag and its
+source commit). For that release, `https://<hub address>/release` lists the
+sha256 of the installer, the evaluator and the sandbox image, so your IT team
+can check what was downloaded against what we published.
+
 ### How models are contained
 Each model runs in a locked-down container with no network access, a
 read-only filesystem, no access to the answers, and strict memory, CPU and

@@ -24,7 +24,11 @@ fi
 
 as_bmb() { sudo -u bmb -H bash -lc "$*"; }
 as_bmb 'command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null'
-if [ -d "$CODE/.git" ]; then as_bmb "git -C $CODE pull -q"; else as_bmb "git clone -q $REPO $CODE"; fi
+# On a branch (main), pull, so "push, then reboot" deploys. A deployed release
+# (`deploy/gcp/hub deploy vX.Y.Z`: a detached checkout of the tag) stays as it is.
+if [ ! -d "$CODE/.git" ]; then as_bmb "git clone -q $REPO $CODE"
+elif as_bmb "git -C $CODE symbolic-ref -q HEAD >/dev/null"; then as_bmb "git -C $CODE pull -q --ff-only"
+else as_bmb "git -C $CODE fetch -q --tags origin"; fi
 # The VM runs the copy of this script stored in its metadata at setup time. Run the
 # repo's current copy instead, so "push, then reboot" also deploys changes to this script.
 if [ -z "${BMB_STARTUP_REEXEC:-}" ] && ! cmp -s "$0" "$CODE/deploy/gcp/hub-vm-startup.sh"; then

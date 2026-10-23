@@ -39,7 +39,8 @@ head -3` prints the installer.
 GB, and caching on providers' machines means a shared base model is downloaded
 once per provider.
 
-**Updating:** push to the repo, then run `deploy/gcp/hub deploy`. It pulls the code on
+**Updating:** push to the repo, then run `deploy/gcp/hub deploy` (or `deploy/gcp/hub deploy
+v0.2.0` for a release tag; see Releases below). It pulls the code on
 the VM, installs it, rebuilds the sandbox image if it changed and loads the new code into
 memory, all while the running hub keeps serving; then it restarts the hub, which takes about
 a second. Caddy holds requests during that second rather than failing them, and nodes keep
@@ -52,6 +53,34 @@ their node pauses until they approve the new version.
 
 **Backups:** `/home/bmb/hub_state/hub.db` on the VM (tokens, codes, queue,
 results). Snapshot the VM's disk on a schedule.
+
+## Releases: one tag for the three downloads
+
+Providers download three things from the hub, and they have to match: `install.sh`,
+`bmb-eval.tar.gz` (the evaluator, built from the checkout when the hub starts) and
+`sandbox-image.tar` (built by `hub-deploy.sh`, stamped with the digest of the sandbox code
+and its lock). A release is one git tag naming the commit all three come from:
+
+```bash
+deploy/release.sh v0.2.0 --push     # sets the version in pyproject.toml, commits, tags, pushes
+deploy/gcp/hub deploy v0.2.0        # the hub checks out exactly that tag; rebuilds what changed
+curl -fsS https://<hub>/release     # the tag, the commit, and the sha256 of each download
+```
+
+`/release` also says whether the published image was built from the code the hub runs
+(`files."sandbox-image.tar".current`); `deploy/gcp/hub status` prints the same line.
+`/SHA256SUMS` has the same checksums in `sha256sum -c` form. Give partners the tag and
+that page: the hashes don't change until the next release, because every input is pinned:
+
+- the evaluator tarball is built without timestamps or owners, so one commit gives one file;
+- the sandbox image pins its base image by digest, Debian packages by snapshot date, and
+  Python packages by version and hash (`sandbox/requirements.lock`). To change packages,
+  edit `sandbox/requirements.txt`, run `sandbox/lock.sh` and commit both; the lock is part
+  of the sandbox stamp, so the next deploy rebuilds and republishes the image.
+
+`deploy/gcp/hub deploy` without a tag deploys main's head and goes back to following main;
+`/release` then shows something like `v0.2.0-3-g1a2b3c4` (three commits past the tag). Fine
+for trying things, not what to hand a partner.
 
 ## Admin commands
 

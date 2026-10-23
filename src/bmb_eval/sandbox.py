@@ -62,10 +62,13 @@ class Result:
 
 ENGINES = ("docker", "podman")
 
-# What runs inside the sandbox; deploy/gcp/hub-vm-startup.sh stamps the image it
+# What goes into the sandbox image; deploy/gcp/hub-deploy.sh stamps the image it
 # publishes with the same digest (label bmb.sandbox), so a node can tell when its
 # image is older than its code: the validator inside would then fail every run.
-SANDBOX_FILES = ("sandbox/Dockerfile", "sandbox/requirements.txt", "src/bmb_eval/__init__.py",
+# The lock pins every package the image installs, so the stamp names the image's
+# whole content, not just our code (tests/test_release.py keeps the lists in step).
+SANDBOX_FILES = ("sandbox/Dockerfile", "sandbox/requirements.txt", "sandbox/requirements.lock",
+                 "src/bmb_eval/__init__.py",
                  "src/bmb_eval/contract.py", "src/bmb_eval/errors.py",
                  "src/bmb_eval/sandbox_entry/__init__.py", "src/bmb_eval/sandbox_entry/predict.py",
                  "src/bmb_eval/sandbox_entry/validate.py", "src/bmb_eval/sandbox_entry/score.py")

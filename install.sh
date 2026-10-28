@@ -127,6 +127,22 @@ if [ "$ENGINE" != "local" ] && [ "$(id -u)" != 0 ] && command -v podman >/dev/nu
   fi
 fi
 
+# Docker: the background service runs under the user's systemd manager, which keeps the groups
+# it started with. A user added to the docker group after it started (typically just before
+# running this) can use Docker here but the service can't: it saw no image and refused all
+# work while showing as connected. Restart the manager so it picks up the group.
+if [ "$ENGINE" != "local" ] && [ "$(id -u)" != 0 ] && ! command -v podman >/dev/null &&
+   command -v docker >/dev/null && [ -S /var/run/docker.sock ] && command -v systemctl >/dev/null; then
+  SOCK_GID="$(stat -c %g /var/run/docker.sock 2>/dev/null || true)"
+  MGR="$(systemctl show "user@$(id -u).service" -p MainPID --value 2>/dev/null || true)"
+  if [ -n "$SOCK_GID" ] && [ -n "$MGR" ] && [ "$MGR" != 0 ] && id -G | tr ' ' '\n' | grep -qx "$SOCK_GID" &&
+     ! grep '^Groups:' "/proc/$MGR/status" 2>/dev/null | tr -s ' \t' '\n' | grep -qx "$SOCK_GID"; then
+    say "Letting the background service use Docker (restarting your user session's services)"
+    sudo systemctl restart "user@$(id -u).service" 2>/dev/null ||
+      { sleep 5; sudo systemctl restart "user@$(id -u).service" 2>/dev/null; } || true
+  fi
+fi
+
 # GPU machines: let containers use the GPU (NVIDIA container toolkit).
 if [ "$ENGINE" != "local" ] && command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1 &&
    ! command -v nvidia-ctk >/dev/null; then

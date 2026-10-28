@@ -96,8 +96,24 @@ def stale_image_message(cfg) -> str | None:
     have = ContainerSandbox(cfg.backend, cfg.image, cfg.runtime).image_label("bmb.sandbox")
     if have == want:
         return None
+    if have is None and (why := engine_access_problem(cfg.backend)):
+        return why
     return (f"the sandbox image ({have or 'unstamped'}) is older than this node's code ({want}); "
             "run `bmb-eval build-image` (or re-run the install command) to update it")
+
+
+def engine_access_problem(engine: str) -> str | None:
+    """Why this process can't use the container engine, when that's the reason it sees no
+    image (a user added to the docker group after their session started); None otherwise."""
+    try:
+        r = subprocess.run([engine, "info"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 and "permission denied" in (r.stderr + r.stdout).lower():
+        return (f"this process can't use {engine} (permission denied on its socket). If you were just "
+                f"added to the {engine} group, re-run the install command (it restarts the background "
+                "service with the new group), or log out and back in")
+    return None
 
 
 def detect_engine() -> str | None:

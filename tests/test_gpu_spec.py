@@ -144,3 +144,20 @@ def test_output_past_the_cap_is_drained_not_left_blocking_the_writer(tmp_path):
     assert r.stdout_overflow and len(r.stdout) <= 1 << 20
     assert done.exists()                    # the writer wasn't left blocked (or killed by EPIPE)
     assert r.seconds < 10                    # and nothing waited on the kill while output piled up
+
+
+def test_a_node_that_cant_use_docker_says_so_instead_of_unstamped(monkeypatch):
+    # Seen on the Docker run: the service lacked the docker group, so `docker image inspect`
+    # failed and the node reported the image "unstamped", refusing work while connected.
+    import subprocess
+    from types import SimpleNamespace
+    from bmb_eval import sandbox
+    cfg = SimpleNamespace(backend="docker", image="bmb-eval-sandbox:latest", runtime=None)
+    monkeypatch.setattr(sandbox.ContainerSandbox, "image_label", lambda self, key: None)
+    denied = SimpleNamespace(returncode=1, stdout="", stderr="permission denied while trying to connect "
+                             "to the Docker daemon socket at unix:///var/run/docker.sock")
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: denied)
+    msg = sandbox.stale_image_message(cfg)
+    assert "permission denied" in msg and "docker group" in msg and "unstamped" not in msg
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    assert "unstamped" in sandbox.stale_image_message(cfg)      # engine fine: really no stamp

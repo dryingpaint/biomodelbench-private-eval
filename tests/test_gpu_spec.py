@@ -68,3 +68,40 @@ def test_selftest_accepts_readonly_driver_mounts_and_nothing_else():
     assert not ok("/data/answers.parquet", "ro")                  # not a driver file
     assert not ok(f"{LIB}/libssl.so.3", "ro")
     assert not ok("/home/me/nvidia-notes.csv", "ro")              # outside the system directories
+
+
+def test_connect_names_an_nvidia_driver_too_old_for_the_sandbox(monkeypatch):
+    from types import SimpleNamespace
+    from bmb_eval import cli
+    lim = SimpleNamespace(gpus=1, gpu_memory_gb=16)
+    monkeypatch.setattr(cli, "gpus_here", lambda: [24])
+    monkeypatch.setattr(cli, "podman_version", lambda: (4, 9))
+    monkeypatch.setattr(cli, "nvidia_driver", lambda: ("570.86.15", 570))
+    assert any("driver 580 or newer" in p and "570.86.15" in p for p in cli.gpu_problems(lim))
+    monkeypatch.setattr(cli, "nvidia_driver", lambda: ("580.178.04", 580))
+    assert cli.gpu_problems(lim) == []
+
+
+def test_min_driver_matches_the_cuda_build_in_the_lock():
+    from bmb_eval import cli
+    lock = (Path(__file__).resolve().parents[1] / "sandbox" / "requirements.lock").read_text()
+    if "-cu13==" in lock:                  # CUDA 13 wheels need driver 580+
+        assert cli.MIN_NVIDIA_DRIVER >= 580
+    if "-cu12==" in lock:
+        assert cli.MIN_NVIDIA_DRIVER >= 525
+
+
+def test_installer_stops_on_arm_before_installing_anything(tmp_path):
+    import subprocess
+    repo = Path(__file__).resolve().parents[1]
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Linux;; -m) echo aarch64;; *) echo Linux;; esac\n')
+    (fake / "sudo").write_text("#!/bin/sh\necho SUDO-CALLED >&2; exit 99\n")
+    for f in ("uname", "sudo"):
+        (fake / f).chmod(0o755)
+    r = subprocess.run(["sh", str(repo / "install.sh")], capture_output=True, text=True,
+                       env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(tmp_path),
+                            "BMB_HUB": "https://hub.example"})
+    assert r.returncode == 1
+    assert "x86_64" in r.stderr and "aarch64" in r.stderr and "SUDO-CALLED" not in r.stderr

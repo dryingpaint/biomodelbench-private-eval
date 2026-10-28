@@ -270,10 +270,30 @@ def hardware_problems(lim, root: Path) -> list[str]:
     return out
 
 
+# The sandbox's PyTorch is built for CUDA 13 (sandbox/requirements.lock), which needs this
+# NVIDIA driver or newer. With an older one CUDA reports no GPU inside the sandbox, and the
+# self-test fails with a runtime error that doesn't say why.
+MIN_NVIDIA_DRIVER = 580
+
+
+def nvidia_driver() -> tuple[str, int] | None:
+    """The oldest NVIDIA driver version on this machine, as ("570.86.15", 570); None if unknown."""
+    if not shutil.which("nvidia-smi"):
+        return None
+    r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                       capture_output=True, text=True)
+    found = [(v, int(m.group(1))) for v in r.stdout.split() if (m := re.match(r"(\d+)\.", v))]
+    return min(found, key=lambda x: x[1]) if r.returncode == 0 and found else None
+
+
 def gpu_problems(lim) -> list[str]:
     out = []
     if lim.gpus:
         mem = gpus_here()
+        if mem and (d := nvidia_driver()) and d[1] < MIN_NVIDIA_DRIVER:
+            out.append(f"This task needs NVIDIA driver {MIN_NVIDIA_DRIVER} or newer (the sandbox runs "
+                       f"CUDA 13); this machine has {d[0]}. Update the driver, then run the same "
+                       "command again.")
         if len(mem) < lim.gpus:
             out.append(f"This task needs {lim.gpus} NVIDIA GPU(s); found {len(mem)}."
                        + ("" if mem else " (If it has one, its driver may not be installed.)"))

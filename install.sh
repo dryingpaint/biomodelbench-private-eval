@@ -15,6 +15,14 @@ if [ "$ENGINE" != "local" ] && [ "$(uname -s)" != "Linux" ]; then
   echo "This needs a Linux machine. See $HUB/guide for how to get one." >&2
   exit 1
 fi
+# The sandbox image is built for x86_64 only: stop here rather than after installing
+# everything (an ARM machine would fail loading or building the image).
+if [ "$ENGINE" != "local" ] && [ "$(uname -m)" != "x86_64" ]; then
+  echo "This needs an x86_64 (Intel or AMD) Linux machine; this one is $(uname -m) (ARM)." >&2
+  echo "The sandbox models run in is built for x86_64 only. If you have no such machine," >&2
+  echo "the sealed option needs none: see $HUB/guide." >&2
+  exit 1
+fi
 
 if [ $# -gt 0 ]; then
   cat <<'EOF'

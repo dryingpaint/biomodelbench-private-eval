@@ -418,11 +418,16 @@ def _run(cmd: list[str], timeout_s: int, stdout_cap: int, stdin: bytes,
 
     def read_stdout() -> None:
         while chunk := proc.stdout.read(1 << 16):
+            if overflow.is_set():
+                continue                 # past the cap: discard, but keep the pipe flowing
             if len(out) + len(chunk) > stdout_cap:
                 overflow.set()
                 kill()
-                break
+                continue
             out.extend(chunk)
+        # Read to EOF even after an overflow. With Docker the output passes through the
+        # client and the daemon; if we stop reading, they block on a full pipe and the
+        # daemon can't finish killing the container (seen: `docker kill` hung for 13 hours).
         proc.stdout.close()
 
     def read_stderr() -> None:

@@ -119,3 +119,20 @@ def test_a_podman_exported_image_gets_the_short_name_docker_needs(monkeypatch):
     cli._tag_loaded("podman", "Loaded image(s): bmb-eval-sandbox:latest\n", "bmb-eval-sandbox:latest")
     cli._tag_loaded("docker", "Loaded image ID: sha256:abc\n", "bmb-eval-sandbox:latest")
     assert calls == []                      # already the right name, or nothing named to tag
+
+
+def test_output_past_the_cap_is_drained_not_left_blocking_the_writer(tmp_path):
+    # With Docker, container output passes through the client and daemon. If the node stops
+    # reading after an overflow, they block on the full pipe and `docker kill` never
+    # completes (the flood_output self-test hung for 13 hours). Model that: the process
+    # we kill is a shell, while its child, standing in for the daemon, keeps writing. It
+    # must be able to finish.
+    import sys
+    from bmb_eval.sandbox import _run
+    done = tmp_path / "writer_finished"
+    child = (f"import os, sys; [os.write(1, b'x' * (1 << 16)) for _ in range(64)]; "
+             f"open({str(done)!r}, 'w').close()")
+    r = _run(["sh", "-c", f"{sys.executable} -c \"{child}\" & wait"], timeout_s=30,
+             stdout_cap=1 << 20, stdin=b"", on_kill=lambda: None)
+    assert r.stdout_overflow and len(r.stdout) <= 1 << 20
+    assert done.exists()                    # the writer wasn't left blocked (or killed by EPIPE)

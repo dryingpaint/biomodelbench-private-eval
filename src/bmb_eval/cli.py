@@ -80,6 +80,17 @@ def _has_gvisor(engine: str) -> bool:
     return shutil.which("runsc") is not None
 
 
+def _tag_loaded(engine: str, load_output: str, image: str) -> None:
+    """Give the image just loaded the name the node uses. The hub exports it with Podman,
+    which records it as localhost/bmb-eval-sandbox:latest; Podman finds that under the short
+    name, Docker doesn't (it then reports the image missing and unstamped)."""
+    loaded = re.findall(r"Loaded image(?:\(s\))?: *(\S+)", load_output)
+    for name in loaded:
+        if name != image and not name.startswith("sha256:"):
+            subprocess.run([engine, "tag", name, image], check=True, capture_output=True)
+            return
+
+
 def cmd_build_image(args) -> None:
     """Load the prebuilt sandbox image from the hub if offered, else build it."""
     cfg = _cfg(args)
@@ -115,7 +126,8 @@ def cmd_build_image(args) -> None:
                 if h.hexdigest() != want:
                     raise ValueError("checksum mismatch")
                 print(f"  Loading it into {engine} (a minute or two)...", flush=True)
-                subprocess.run([engine, "load", "-i", f.name], check=True, capture_output=True)
+                r = subprocess.run([engine, "load", "-i", f.name], check=True, capture_output=True, text=True)
+                _tag_loaded(engine, r.stdout + r.stderr, cfg.image)
             progress.done(t0, "Sandbox image ready")
             return
         except Exception as e:

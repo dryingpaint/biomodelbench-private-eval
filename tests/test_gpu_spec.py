@@ -105,3 +105,17 @@ def test_installer_stops_on_arm_before_installing_anything(tmp_path):
                             "BMB_HUB": "https://hub.example"})
     assert r.returncode == 1
     assert "x86_64" in r.stderr and "aarch64" in r.stderr and "SUDO-CALLED" not in r.stderr
+
+
+def test_a_podman_exported_image_gets_the_short_name_docker_needs(monkeypatch):
+    # Docker loads the hub's image as localhost/bmb-eval-sandbox:latest and doesn't find it
+    # under the short name: the node saw it as missing (downloaded it again) and unstamped.
+    from bmb_eval import cli
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    cli._tag_loaded("docker", "Loaded image: localhost/bmb-eval-sandbox:latest\n", "bmb-eval-sandbox:latest")
+    assert calls == [["docker", "tag", "localhost/bmb-eval-sandbox:latest", "bmb-eval-sandbox:latest"]]
+    calls.clear()
+    cli._tag_loaded("podman", "Loaded image(s): bmb-eval-sandbox:latest\n", "bmb-eval-sandbox:latest")
+    cli._tag_loaded("docker", "Loaded image ID: sha256:abc\n", "bmb-eval-sandbox:latest")
+    assert calls == []                      # already the right name, or nothing named to tag

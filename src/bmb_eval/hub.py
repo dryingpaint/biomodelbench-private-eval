@@ -525,12 +525,13 @@ class HubStore:
             out.append({"kind": "failed", "code": code, "task": task, "step": step, "reason": reason,
                         "detail": detail, "at": at, "resolved": done})
         reported = {p["code"] for p in out}
-        for code, task, at in self.q(
-                "SELECT e.code, e.task, COALESCE(e.activated, n.created) FROM enrollments e "
+        for code, task, at, name in self.q(
+                "SELECT e.code, e.task, COALESCE(e.activated, n.created), n.name FROM enrollments e "
                 "JOIN nodes n ON n.id = e.used_by WHERE n.last_seen IS NULL AND n.confidential IS NULL "
                 "AND COALESCE(e.activated, n.created) < ?", (now - STALL_S,)):
             if code not in reported:
-                out.append({"kind": "stalled", "code": code, "task": task, "at": at})
+                out.append({"kind": "stalled", "code": code, "task": task, "at": at,
+                            "sealed": (name or "").startswith("sealed-")})
         return out
 
 
@@ -738,6 +739,18 @@ def alert_setup_failure(store: HubStore, code: str, task: str, step: str, reason
     threading.Thread(target=alert, args=(store, text), daemon=True).start()
 
 
+def stalled_hint(prob: dict) -> str:
+    """A stalled setup got past the approval screen (the code was activated), so what's
+    missing is the step after it: the sealed upload, or the provider's background node."""
+    if prob.get("sealed"):
+        return ("the provider approved it, but the encrypted upload never completed; ask them to run "
+                "the same command again")
+    return ("the provider approved it, but their machine's background service never checked in "
+            "(not started, or no way out to the hub: proxy, firewall, certificate); ask them for the "
+            "output of `~/bmb-eval/bmb-eval status` and `journalctl --user -u bmb-eval -n 30`, or to "
+            "run the same command again")
+
+
 def check_stalled(store: HubStore, now: float | None = None) -> None:
     """Alert once per code whose setup was started but never finished (STALL_S)."""
     now = now or time.time()
@@ -746,7 +759,7 @@ def check_stalled(store: HubStore, now: float | None = None) -> None:
         if prob["kind"] == "stalled" and prob["code"] not in seen:
             alert(store, f"setup for task {prob['task']} (code {prob['code']}) was started "
                          f"{int((now - prob['at']) // 60)} min ago and never finished; "
-                         "the provider may need help")
+                         f"{stalled_hint(prob)}")
             seen[prob["code"]] = now
     store.set_setting("stall_alerted", seen)
 
@@ -977,6 +990,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                     out = store.activate(m.group(1), node_id, str(body.get("name", ""))[:64])
                 except (KeyError, ValueError) as e:
                     return self._err(409, "code_invalid", str(e).strip("'\""))
+                print(f"[bmb-hub] code {m.group(1)} activated for task {out['task']} by node "
+                      f"{out['node_id']} ({str(body.get('name', ''))[:64]})", flush=True)
                 return self._send(200, out)
             if p.startswith("/v1/node/"):
                 return self._node_post(p)
@@ -1112,6 +1127,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if node is None:
                 self._err(401, "unauthorized", "Missing or invalid node secret.")
             else:
+                if store.q("SELECT last_seen FROM nodes WHERE id=?", (node,), one=True)[0] is None:
+                    print(f"[bmb-hub] node {node} checked in for the first time", flush=True)
                 store.q("UPDATE nodes SET last_seen=? WHERE id=?", (time.time(), node))
             return node
 
@@ -1196,8 +1213,11 @@ def make_blobs(state: Path, public_url: str, bucket: str | None):
 
 def _repo_root() -> Path:
     for d in [Path.cwd(), *Path(__file__).resolve().parents]:
-        if (d / "setup.sh").is_file() and (d / "src" / "bmb_eval").is_dir():
-            return d
+        try:
+            if (d / "setup.sh").is_file() and (d / "src" / "bmb_eval").is_dir():
+                return d
+        except OSError:      # e.g. run as the hub user from another user's home (deploy/gcp/hub)
+            continue
     return Path.cwd()
 
 
@@ -1477,7 +1497,7 @@ def main(argv=None) -> None:
                       + (" [since completed]" if prob["resolved"] else ""))
             else:
                 print(f"setup {prob['task']} ({prob['code']}): STALLED, code used {when} "
-                      "but setup never finished")
+                      f"but setup never finished; {stalled_hint(prob)}")
     elif args.cmd == "final":
         for fid in store.request_finals(args.submission_id):
             print(f"queued final evaluation {fid}")

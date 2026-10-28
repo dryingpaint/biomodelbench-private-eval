@@ -136,6 +136,15 @@ class Runner:
             }.get(r.exit_code, "predict_runtime_error"), internal=f"exit {r.exit_code}")
         if not r.stdout:
             raise EvalError("predictions_missing")
+        if not r.stdout.endswith(b"PAR1"):
+            # The entry writes one whole parquet file, which ends in its magic. Anything
+            # else is either the container engine losing output on the way out (conmon
+            # before 2.1 drops most of a multi-MB output; `connect` refuses that engine),
+            # or the model writing to stdout itself. Reported as infra_error so the
+            # operator looks, but still counted: the model controls its stdout, so an
+            # uncounted outcome would be a free channel out of the sandbox.
+            raise EvalError("infra_error", internal=f"predictions cut off after {len(r.stdout)} bytes: "
+                            "the container engine dropped output (conmon older than 2.1?)")
 
         # 3. validate: untrusted predictions -> canonical arrays, no answers present
         r = self._stage(run_dir, internal, "validate", run_id,

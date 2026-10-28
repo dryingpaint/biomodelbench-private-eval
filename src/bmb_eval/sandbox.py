@@ -422,12 +422,13 @@ def _run(cmd: list[str], timeout_s: int, stdout_cap: int, stdin: bytes,
                 continue                 # past the cap: discard, but keep the pipe flowing
             if len(out) + len(chunk) > stdout_cap:
                 overflow.set()
-                kill()
+                # Kill in the background and keep reading. With Docker the output passes
+                # through the client and the daemon, and `docker kill` returns only once
+                # the container is gone, which waits for its output to drain. Killing
+                # here, or no longer reading, deadlocks (seen: hung for 13 hours).
+                threading.Thread(target=kill, daemon=True).start()
                 continue
             out.extend(chunk)
-        # Read to EOF even after an overflow. With Docker the output passes through the
-        # client and the daemon; if we stop reading, they block on a full pipe and the
-        # daemon can't finish killing the container (seen: `docker kill` hung for 13 hours).
         proc.stdout.close()
 
     def read_stderr() -> None:

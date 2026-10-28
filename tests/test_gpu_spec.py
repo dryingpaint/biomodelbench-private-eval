@@ -132,7 +132,15 @@ def test_output_past_the_cap_is_drained_not_left_blocking_the_writer(tmp_path):
     done = tmp_path / "writer_finished"
     child = (f"import os, sys; [os.write(1, b'x' * (1 << 16)) for _ in range(64)]; "
              f"open({str(done)!r}, 'w').close()")
+    import time
+
+    def docker_kill():                       # like `docker kill`: returns once the output has drained
+        t0 = time.time()
+        while not done.exists() and time.time() - t0 < 15:
+            time.sleep(0.05)
+
     r = _run(["sh", "-c", f"{sys.executable} -c \"{child}\" & wait"], timeout_s=30,
-             stdout_cap=1 << 20, stdin=b"", on_kill=lambda: None)
+             stdout_cap=1 << 20, stdin=b"", on_kill=docker_kill)
     assert r.stdout_overflow and len(r.stdout) <= 1 << 20
     assert done.exists()                    # the writer wasn't left blocked (or killed by EPIPE)
+    assert r.seconds < 10                    # and nothing waited on the kill while output piled up

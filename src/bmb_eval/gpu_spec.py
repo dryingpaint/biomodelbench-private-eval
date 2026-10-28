@@ -14,7 +14,8 @@ sandbox:
 So this writes a spec without those hooks, with each symlink the hook would
 have made provided as a read-only bind mount of the file it points to, and in
 CDI 0.6 format. The toolkit's refresh service would put its own spec back (in
-/var/run/cdi, which takes precedence), so it is turned off; setup re-runs this
+/var/run/cdi, which takes precedence), and a udev rule starts it whenever the
+driver loads, so disabling it isn't enough: it is masked. Setup re-runs this
 after a driver upgrade (re-running the install command does).
 
 Run as root on the provider's machine: `python -m bmb_eval.gpu_spec`.
@@ -99,7 +100,9 @@ def main() -> None:
     tmp.replace(OUT)
     for p in STALE:
         p.unlink(missing_ok=True)
-    subprocess.run(["systemctl", "disable", "--now", *REFRESH_UNITS], capture_output=True)
+    # Masked, not disabled: the toolkit's udev rule starts the service on every driver load.
+    subprocess.run(["systemctl", "stop", *REFRESH_UNITS], capture_output=True)
+    subprocess.run(["systemctl", "mask", *REFRESH_UNITS], capture_output=True)
     edits = [spec["containerEdits"], *(d.get("containerEdits", {}) for d in spec.get("devices") or [])]
     print(f"wrote {OUT}: {len(spec.get('devices') or [])} devices, "
           f"{sum(len(e.get('mounts') or []) for e in edits)} mounts", file=sys.stderr)

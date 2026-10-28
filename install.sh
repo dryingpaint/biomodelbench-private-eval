@@ -138,7 +138,7 @@ if [ "$ENGINE" != "local" ] && command -v nvidia-smi >/dev/null && nvidia-smi >/
 fi
 if command -v nvidia-ctk >/dev/null; then
   if command -v podman >/dev/null; then
-    sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml >/dev/null 2>&1 || true
+    :   # setup.sh writes the device spec Podman's sandbox needs (src/bmb_eval/gpu_spec.py)
   elif command -v docker >/dev/null && ! docker info 2>/dev/null | grep -q nvidia; then
     sudo nvidia-ctk runtime configure --runtime=docker >/dev/null && sudo systemctl restart docker
   fi

@@ -50,6 +50,14 @@ fi
 
 [ -f config.yaml ] || ./bmb-eval init --engine "${BMB_ENGINE:-auto}"
 
+# GPU machines with Podman: the NVIDIA toolkit's own device spec doesn't work with the
+# sandbox (an older Podman can't read it, and its hooks write into the read-only sandbox),
+# so write one that does (src/bmb_eval/gpu_spec.py). Re-run after a driver upgrade.
+if command -v nvidia-ctk >/dev/null && command -v podman >/dev/null && [ "${BMB_ENGINE:-auto}" != local ]; then
+  say "Setting up GPU access for the sandbox"
+  sudo .venv/bin/python -m bmb_eval.gpu_spec
+fi
+
 say "Preparing the sandbox models run in"
 ./bmb-eval build-image ${BMB_HUB:+--from "$BMB_HUB/sandbox-image.tar"}
 

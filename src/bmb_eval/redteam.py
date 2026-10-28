@@ -81,6 +81,15 @@ ATTACKS = [
                    "/etc/passwd", "/etc/group", "/run/secrets",
                    "/usr/local/nvidia")   # the GPU driver (read-only), on GPU machines
 
+        def _gpu_driver_mount(target, opts):
+            # Podman's GPU spec mounts the host's driver files at their system paths: read-only
+            # NVIDIA/CUDA libraries, tools and firmware. Anything else there is still an escape.
+            name = os.path.basename(target)
+            return ("ro" in opts.split(",")
+                    and target.startswith(("/usr/lib/", "/usr/lib64/", "/lib/", "/lib64/", "/usr/bin/",
+                                           "/etc/OpenCL/vendors/"))
+                    and (name.startswith(("libcuda", "libnvidia", "nvidia")) or "/firmware/nvidia/" in target))
+
         def load_model():
             hits = [k for k in os.environ if "ANSWER" in k.upper() or "TOKEN" in k.upper()]
             for sock in ["/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"]:
@@ -94,7 +103,8 @@ ATTACKS = [
                 for line in fh:
                     fields = line.split()
                     target, fstype = fields[4], fields[fields.index("-") + 1]
-                    if fstype in private or target == "/" or target.startswith(ALLOWED):
+                    if (fstype in private or target == "/" or target.startswith(ALLOWED)
+                            or _gpu_driver_mount(target, fields[5])):
                         continue
                     hits.append(f"mount:{target} ({fstype})")
             # 2. Data files outside the inputs and the image's own libraries.

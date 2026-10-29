@@ -25,7 +25,8 @@ import yaml
 
 from . import approval, audit, leakage, progress, scaffold
 from .config import save_yaml
-from .sandbox import ENGINES, detect_engine, gpus_here, make as make_sandbox, sandbox_stamp, stale_image_message
+from .sandbox import (ENGINES, detect_engine, engine_query, gpus_here, make as make_sandbox, sandbox_stamp,
+                      stale_image_message)
 
 IMAGE = "bmb-eval-sandbox:latest"
 
@@ -75,9 +76,8 @@ def cmd_init(args) -> None:
 
 def _has_gvisor(engine: str) -> bool:
     if engine == "docker":
-        r = subprocess.run(["docker", "info", "--format", "{{json .Runtimes}}"],
-                           capture_output=True, text=True)
-        return "runsc" in r.stdout
+        r = engine_query(["docker", "info", "--format", "{{json .Runtimes}}"])
+        return r is not None and "runsc" in r.stdout
     return shutil.which("runsc") is not None
 
 
@@ -322,8 +322,8 @@ def gpu_problems(lim) -> list[str]:
 def podman_version() -> tuple | None:
     if not shutil.which("podman"):
         return None
-    r = subprocess.run(["podman", "--version"], capture_output=True, text=True)
-    m = re.search(r"(\d+)\.(\d+)", r.stdout)
+    r = engine_query(["podman", "--version"])
+    m = re.search(r"(\d+)\.(\d+)", r.stdout) if r else None
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
@@ -331,9 +331,8 @@ def conmon_version() -> tuple | None:
     """Podman's conmon, from `podman info` ("conmon version 2.0.25, commit: ...")."""
     if not shutil.which("podman"):
         return None
-    r = subprocess.run(["podman", "info", "--format", "{{.Host.Conmon.Version}}"],
-                       capture_output=True, text=True)
-    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", r.stdout)
+    r = engine_query(["podman", "info", "--format", "{{.Host.Conmon.Version}}"])
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", r.stdout) if r else None
     return tuple(int(x) for x in m.groups(default="0")) if m else None
 
 
@@ -865,8 +864,8 @@ def cmd_check(args) -> None:
     errors, warnings = [], []
     if cfg.backend == "local":
         errors.append("sandbox.backend is local: submitted code would NOT be isolated")
-    elif subprocess.run([cfg.backend, "info"], capture_output=True).returncode != 0:
-        errors.append(f"{cfg.backend} is not running")
+    elif (r := engine_query([cfg.backend, "info"])) is None or r.returncode != 0:
+        errors.append(f"{cfg.backend} is not running" + (" (it didn't answer within a minute)" if r is None else ""))
     elif make_sandbox(cfg).image_id() == "missing":
         errors.append(f"sandbox image {cfg.image} missing (bmb-eval build-image)")
     elif stale := stale_image_message(cfg):

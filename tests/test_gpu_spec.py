@@ -162,3 +162,21 @@ def test_a_node_that_cant_use_docker_says_so_instead_of_unstamped(monkeypatch):
     monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""))
     assert "unstamped" in sandbox.stale_image_message(cfg)      # engine fine: really no stamp
 
+
+
+def test_an_engine_that_never_answers_is_treated_as_unavailable(monkeypatch):
+    # Seen in CI: rootless `podman info` sometimes never returned, hanging connect (and the
+    # suite) with no time limit. Every engine query now gives up after a minute.
+    import subprocess
+    from bmb_eval import cli, sandbox
+
+    def hangs(cmd, **kw):
+        assert kw.get("timeout"), f"no time limit on {cmd}"
+        raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+    monkeypatch.setattr(sandbox.subprocess, "run", hangs)
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert sandbox.detect_engine() is None
+    assert sandbox.engine_access_problem("podman") is None
+    assert cli.podman_version() is None and cli.conmon_version() is None
+    assert cli._has_gvisor("docker") is False

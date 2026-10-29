@@ -102,12 +102,24 @@ def stale_image_message(cfg) -> str | None:
             "run `bmb-eval build-image` (or re-run the install command) to update it")
 
 
+ENGINE_QUERY_TIMEOUT_S = 60
+
+
+def engine_query(cmd: list[str], timeout_s: int = ENGINE_QUERY_TIMEOUT_S):
+    """Run a quick container-engine query (info, version); None if it can't run or doesn't
+    answer in time. Seen in CI: rootless `podman info` sometimes never returns while it sets
+    itself up, which hung connect (and the test suite) with no time limit."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def engine_access_problem(engine: str) -> str | None:
     """Why this process can't use the container engine, when that's the reason it sees no
     image (a user added to the docker group after their session started); None otherwise."""
-    try:
-        r = subprocess.run([engine, "info"], capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
+    r = engine_query([engine, "info"])
+    if r is None:
         return None
     if r.returncode != 0 and "permission denied" in (r.stderr + r.stdout).lower():
         return (f"this process can't use {engine} (permission denied on its socket). If you were just "
@@ -119,8 +131,7 @@ def engine_access_problem(engine: str) -> str | None:
 def detect_engine() -> str | None:
     """First container engine whose daemon/service actually answers."""
     for engine in ("podman", "docker"):
-        if shutil.which(engine) and subprocess.run(
-                [engine, "info"], capture_output=True).returncode == 0:
+        if shutil.which(engine) and (r := engine_query([engine, "info"])) and r.returncode == 0:
             return engine
     return None
 

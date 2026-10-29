@@ -137,10 +137,15 @@ deploy/gcp/hub alerts --webhook https://hooks.slack.com/… # where setup alerts
    fails, it tells the hub which step failed and why, from a fixed list (for
    example `cloud_setup: gcloud_refused`, `data_check: data_problem`,
    `review: declined`), never data or error text. `status` shows it and the
-   alert webhook gets it right away. A code that was used but whose setup hasn't
-   finished an hour later shows as STALLED and alerts once. Either way, the fix
-   is usually to ask the provider for the message they saw and have them run the
-   same command again.
+   alert webhook gets it right away. The connect command counts as finished only
+   once the provider's background service has checked in with the hub (or, sealed,
+   once the upload is in); a service that can't start or can't get out is reported
+   as `start_service: ...` on the spot. A code that was used but whose setup still
+   hasn't finished an hour later shows as STALLED and alerts once, with what to
+   ask the provider for (`~/bmb-eval/bmb-eval status`, `journalctl --user -u
+   bmb-eval -n 30`). The hub's journal records each activation and each node's
+   first check-in. Either way, the fix is usually to ask the provider for the
+   message they saw and have them run the same command again.
 
 **Changing a task** never needs a new code. Edit the files and run `enroll`
 again:

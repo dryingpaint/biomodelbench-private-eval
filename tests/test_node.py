@@ -1744,6 +1744,121 @@ def test_used_code_whose_setup_never_finished_is_stalled(hub, provider_files, mo
     hub_mod.check_stalled(store, later)
     hub_mod.check_stalled(store, later + 600)                     # alerts once per code
     assert len(alerts) == 1 and "never finished" in alerts[0]
+    assert "upload never completed" in alerts[0]                  # a sealed node: what's missing is the upload
+
+
+def _fake_service(monkeypatch, start=None):
+    """Stand in for systemd: the service "starts" by running start(cfg), or nothing at all."""
+    def install(cfg):
+        if start:
+            start(cfg)
+        return True, ""
+    monkeypatch.setattr(cli, "_install_service", install)
+
+
+def _connect_with_service(node_dir, url, code, data):
+    cli.main(["--config", str(node_dir / "config.yaml"), "connect", code, "--hub", url,
+              "--data", str(data), "--yes"])
+
+
+def test_connect_is_done_only_when_the_background_node_checks_in(hub, node_dir, provider_files,
+                                                                 monkeypatch, capsys):
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    threads = []
+
+    def start(cfg):                                               # what systemd would run
+        t = threading.Thread(target=lambda: Worker(cfg).step(), daemon=True)
+        t.start()
+        threads.append(t)
+    _fake_service(monkeypatch, start)
+    _connect_with_service(node_dir, url, code, data)
+    out = capsys.readouterr().out
+    assert "has checked in with BioModelBench" in out and "is live" in out
+    assert _reports(store) == []
+    node_id = Config.load(node_dir / "config.yaml").hub["node_id"]
+    assert store.q("SELECT last_seen FROM nodes WHERE id=?", (node_id,), one=True)[0]
+    assert store.setup_problems(time.time() + hub_mod.STALL_S + 60) == []   # not a stall, ever
+    for t in threads:
+        t.join(5)
+
+
+def test_connect_reports_a_node_that_never_checks_in(hub, node_dir, provider_files, monkeypatch, capsys):
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    monkeypatch.setattr(cli, "CHECKIN_WAIT_S", 1)
+    monkeypatch.setattr(cli, "_service_state", lambda: "active")
+    # The service "started" but nothing ever reached the hub.
+    _fake_service(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        _connect_with_service(node_dir, url, code, data)
+    assert "hasn't checked in" in str(e.value) and "bmb-eval status" in str(e.value)
+    assert _reports(store)[-1] == ("start_service", "stopped", "no_checkin")
+    # The node ran and said why: the provider sees the error, the hub a fixed reason.
+    _fake_service(monkeypatch, lambda cfg: audit.record(
+        cfg.state_dir, "hub_unreachable", error="cannot reach https://hub: [Errno -2] Name or service not known"))
+    with pytest.raises(SystemExit) as e:
+        _connect_with_service(node_dir, url, code, data)
+    assert "Name or service not known" in str(e.value) and "HTTPS_PROXY" in str(e.value)
+    assert _reports(store)[-1] == ("start_service", "hub_error", "unreachable")
+    _fake_service(monkeypatch, lambda cfg: audit.record(
+        cfg.state_dir, "hub_unreachable", error="[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"))
+    with pytest.raises(SystemExit) as e:
+        _connect_with_service(node_dir, url, code, data)
+    assert _reports(store)[-1] == ("start_service", "tls", "certificate")
+    # The service kept dying.
+    _fake_service(monkeypatch)
+    monkeypatch.setattr(cli, "_service_state", lambda: "failed")
+    monkeypatch.setattr(cli, "_service_log", lambda n=20: "Traceback: boom")
+    with pytest.raises(SystemExit) as e:
+        _connect_with_service(node_dir, url, code, data)
+    assert "isn't running" in str(e.value) and "boom" in str(e.value)
+    assert _reports(store)[-1] == ("start_service", "crashed", "service_exited")
+    # No user systemd at all: no "Connected" either, and how to run it by hand.
+    monkeypatch.setattr(cli, "_install_service", lambda cfg: (False, "Failed to connect to bus: No medium found"))
+    with pytest.raises(SystemExit) as e:
+        _connect_with_service(node_dir, url, code, data)
+    assert "No medium found" in str(e.value) and "bmb-eval run" in str(e.value)
+    assert _reports(store)[-1] == ("start_service", "machine_not_ready", "service_install_failed")
+    assert "✓ Connected" not in capsys.readouterr().out
+    # Every one of those is a failure the operator sees, never a silent stall.
+    probs = store.setup_problems(time.time() + hub_mod.STALL_S + 60)
+    assert [p["kind"] for p in probs] == ["failed"] and probs[0]["step"] == "start_service"
+
+
+def test_repo_root_survives_an_unreadable_working_directory(tmp_path, monkeypatch):
+    # deploy/gcp/hub runs bmb-hub as the hub user from the operator's home, which it can't read.
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0)
+    try:
+        if os.access(locked / "x", os.R_OK):
+            pytest.skip("running as root: nothing is unreadable")
+        monkeypatch.setattr(hub_mod.Path, "cwd", classmethod(lambda cls: locked))
+        assert hub_mod._repo_root() == REPO
+    finally:
+        locked.chmod(0o700)
+
+
+def test_service_unit_carries_the_shells_proxy_and_certificate_settings(cfg, tmp_path, monkeypatch):
+    import subprocess
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    monkeypatch.setenv("SSL_CERT_FILE", "/etc/ssl/corp.pem")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", ""))
+    ok, why = cli._install_service(cfg)
+    unit = (tmp_path / "home" / ".config/systemd/user/bmb-eval.service").read_text()
+    assert ok and why == ""
+    assert 'Environment="HTTPS_PROXY=http://proxy.example:3128"' in unit
+    assert 'Environment="SSL_CERT_FILE=/etc/ssl/corp.pem"' in unit and "NO_PROXY" not in unit
+    assert ["systemctl", "--user", "enable", "--now", "bmb-eval"] in calls
 
 
 def test_reactivating_a_stalled_code_restarts_the_clock_and_rearms_the_alert(hub, provider_files):
@@ -1822,3 +1937,29 @@ def test_old_clients_get_an_update_message_for_folder_packages(hub, provider_fil
         urllib.request.urlopen(f"{url}/v1/enroll/{code}")
     assert e.value.code == 409 and "install command" in json.loads(e.value.read())["error"]["message"]
     assert "refs/panel.txt" in HubAPI(url).enrollment(code)["files"]   # a current client
+
+
+# ------------------------------------------- the node's own failures cost the agent nothing
+
+def test_truncated_predictions_are_reported_as_infra_error(cfg):
+    import dataclasses
+    r = Runner(cfg, send_alerts=False)
+    real = r.sandbox.run
+
+    def dropping(*, entry, **kw):                              # conmon before 2.1 (Ubuntu 22.04)
+        res = real(entry=entry, **kw)
+        return dataclasses.replace(res, stdout=res.stdout[: len(res.stdout) // 2]) if entry == "predict" else res
+    r.sandbox.run = dropping
+    p = r.evaluate(TASK, pack_dir(EXAMPLE_BUNDLE))
+    assert p["status"] == "error" and p["error"]["code"] == "infra_error"
+    r.sandbox.run = real
+    assert r.evaluate(TASK, pack_dir(EXAMPLE_BUNDLE))["status"] == "ok"
+
+
+def test_connect_refuses_a_conmon_that_drops_output(monkeypatch):
+    monkeypatch.setattr(cli, "conmon_version", lambda: (2, 0, 25))   # Ubuntu 22.04's
+    [p] = cli.engine_problems("podman")
+    assert "2.0.25" in p and "2.1" in p and "containers.conf" in p
+    assert cli.engine_problems("docker") == []
+    monkeypatch.setattr(cli, "conmon_version", lambda: (2, 1, 12))
+    assert cli.engine_problems("podman") == []

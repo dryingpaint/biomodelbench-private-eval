@@ -149,6 +149,11 @@ def updates_path(cfg: Config):
     return cfg.state_dir / "updates.json"
 
 
+def checkin_path(cfg: Config):
+    """Touched after every successful check-in with the hub; `connect` waits for the first."""
+    return cfg.state_dir / "last_checkin"
+
+
 def pending_updates(cfg: Config) -> dict[str, int]:
     """Task updates BioModelBench has published that the provider hasn't approved."""
     try:
@@ -217,6 +222,7 @@ class Worker:
             try:
                 reply = self.api.hello({t: b.contract.public() for t, b in self.cfg.tasks.items()},
                                        accepting, held, self.status)
+                checkin_path(self.cfg).write_text(str(time.time()))
                 self._note_updates(reply.get("versions") or {})
                 if self._hello_rejected:
                     audit.record(self.cfg.state_dir, "hello_accepted")

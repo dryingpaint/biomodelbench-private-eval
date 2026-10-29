@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import urllib.request
 from pathlib import Path, PurePosixPath
 
@@ -326,6 +327,39 @@ def podman_version() -> tuple | None:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def conmon_version() -> tuple | None:
+    """Podman's conmon, from `podman info` ("conmon version 2.0.25, commit: ...")."""
+    if not shutil.which("podman"):
+        return None
+    r = subprocess.run(["podman", "info", "--format", "{{.Host.Conmon.Version}}"],
+                       capture_output=True, text=True)
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", r.stdout)
+    return tuple(int(x) for x in m.groups(default="0")) if m else None
+
+
+CONMON_MIN = (2, 1)
+
+
+def engine_problems(backend: str) -> list[str]:
+    """Container-engine bugs that would corrupt evaluations. Measured on Ubuntu 22.04
+    (Podman 3.4.4, conmon 2.0.25) with our image: a container's stdout of a few MB or
+    more arrives mostly missing (5 MB -> 377 KB), whatever the log driver, so a large
+    task's predictions reach the validator cut off. The same Podman with a conmon 2.1
+    binary delivers 20 MB intact."""
+    if backend == "podman" and (v := conmon_version()) and v < CONMON_MIN:
+        vs = ".".join(map(str, v))
+        return [f"Podman's conmon here is {vs}; before 2.1 it loses most of a container's output once there "
+                "is more than a megabyte or so of it, so a large task's predictions would arrive incomplete "
+                "(Ubuntu 22.04 ships 2.0.25). "
+                "Install conmon 2.1 or later: Ubuntu 24.04 has it. On 22.04, download conmon.amd64 from "
+                "https://github.com/containers/conmon/releases to /usr/local/bin/conmon, make it executable, "
+                "and tell Podman with:\n"
+                "      mkdir -p ~/.config/containers && printf '[engine]\\nconmon_path = [\"/usr/local/bin/conmon\"]\\n' "
+                ">> ~/.config/containers/containers.conf\n"
+                "    (or install Docker instead). Then run the same command again."]
+    return []
+
+
 def disk_note(lim, root: Path) -> str | None:
     """Advice (not a blocker): large models need room to cache."""
     free_gb, want_gb = shutil.disk_usage(root).free >> 30, 2 * lim.max_bundle_gb
@@ -397,17 +431,17 @@ class SetupSteps:
                    "activate": "hub_error", "notify": "hub_error"}
 
     def __init__(self):
-        self.step, self.reason, self.hub, self.code = "start", None, None, None
+        self.step, self.reason, self.detail, self.hub, self.code = "start", None, "", None, None
 
     def at(self, step: str) -> None:
-        self.step, self.reason = step, None
+        self.step, self.reason, self.detail = step, None, ""
 
     def failed(self, e: BaseException) -> None:
         if not (self.hub and self.code) or (isinstance(e, SystemExit) and e.code in (None, 0)):
             return
         detail = ""
         if self.reason:
-            reason = self.reason
+            reason, detail = self.reason, self.detail
         elif isinstance(e, KeyboardInterrupt):
             reason = "interrupted"
         elif "HTTPS certificate" in str(e):
@@ -510,7 +544,7 @@ def _connect(args, steps: SetupSteps) -> None:
               f"the benchmark), {split_counts[1]:,} test rows (held out for final evaluations)")
 
     steps.at("hardware_check")
-    if problems := hardware_problems(cfg.tasks[task].contract.limits, root):
+    if problems := hardware_problems(cfg.tasks[task].contract.limits, root) + engine_problems(cfg.backend):
         print("\nThis machine isn't quite ready for this task:")
         for p in problems:
             print(f"  • {p}")
@@ -567,14 +601,32 @@ def _connect(args, steps: SetupSteps) -> None:
         updates_path(Config.load(cfg_path)).write_text(json.dumps(pending))
 
     steps.at("start_service")
-    if not args.no_service:
-        progress.step("Starting the evaluator in the background", "a few seconds")
-    started = not args.no_service and _install_service(Config.load(cfg_path))
-    print(f"\n✓ Connected. Task '{task}' is live.")
-    if started:
-        print("  The node runs in the background and restarts on reboot. You can log out.")
-    else:
+    if args.no_service:
+        print(f"\n✓ Connected. Task '{task}' is live.")
         print(f"  Start the node with:  {root}/bmb-eval run")
+    else:
+        # "Connected" means the background node has actually reached BioModelBench. A
+        # service that didn't start, or has no way out (proxy, firewall, certificate),
+        # is found and reported now, not an hour later as a stalled setup.
+        cfg = Config.load(cfg_path)
+        t0 = progress.step("Starting the evaluator in the background and waiting for its first "
+                           "check-in with BioModelBench", "a few seconds")
+        since, audit_from = time.time() - 1, _audit_size(cfg)
+        started, why = _install_service(cfg)
+        if not started:
+            steps.reason, steps.detail = "machine_not_ready", "service_install_failed"
+            raise SystemExit(
+                "\nCouldn't start the background service (systemd --user)"
+                + (f":\n  {why}" if why else ".")
+                + "\nYour approval is saved on this machine, but nothing is running yet. Start it with:\n"
+                f"    {root}/bmb-eval run\nor send this message to BioModelBench and we'll help.")
+        if problem := _wait_for_checkin(cfg, since, audit_from):
+            steps.reason, steps.detail, text = problem
+            raise SystemExit(text + "\nYour approval is saved on this machine; evaluations start as soon "
+                             f"as the service reaches BioModelBench.\nCheck with:  {root}/bmb-eval status")
+        progress.done(t0, "The node is running and has checked in with BioModelBench")
+        print(f"\n✓ Connected. Task '{task}' is live.")
+        print("  The node runs in the background and restarts on reboot. You can log out.")
     print(f"  Check on it:  {root}/bmb-eval status      Emergency stop:  {root}/bmb-eval stop")
 
 
@@ -612,10 +664,20 @@ def cmd_update(args) -> None:
                                        no_service=args.no_service))
 
 
-def _install_service(cfg) -> bool:
+CHECKIN_WAIT_S = 120     # the node's first hello is immediate; a black-holed connection gives up at 60 s
+# What the connecting shell may need to reach the hub, which a systemd user service wouldn't inherit.
+SERVICE_ENV = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+               "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+
+
+def _install_service(cfg) -> tuple[bool, str]:
+    """Install and start the node as a systemd user service. (False, why) when this
+    machine can't: no systemd, or no user session (a bare SSH login on some servers)."""
     if platform.system() != "Linux" or not shutil.which("systemctl"):
-        return False
+        return False, "this machine has no systemd"
     exe = shutil.which("bmb-eval") or f"{sys.executable} -m bmb_eval.cli"
+    env = "".join(f'Environment="{k}={os.environ[k]}"\n' for k in SERVICE_ENV
+                  if os.environ.get(k) and not any(c in os.environ[k] for c in '"\n'))
     unit = Path.home() / ".config/systemd/user/bmb-eval.service"
     unit.parent.mkdir(parents=True, exist_ok=True)
     unit.write_text(f"""[Unit]
@@ -625,7 +687,7 @@ After=network-online.target
 [Service]
 WorkingDirectory={cfg.path.parent}
 Environment=BMB_CONFIG={cfg.path}
-ExecStart={exe} --config {cfg.path} run
+{env}ExecStart={exe} --config {cfg.path} run
 Restart=always
 RestartSec=10
 
@@ -633,20 +695,104 @@ RestartSec=10
 WantedBy=default.target
 """)
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-    r = subprocess.run(["systemctl", "--user", "enable", "--now", "bmb-eval"], capture_output=True)
+    r = subprocess.run(["systemctl", "--user", "enable", "--now", "bmb-eval"], capture_output=True, text=True)
     if r.returncode != 0:
-        return False
+        return False, (r.stderr or r.stdout or "").strip()
     subprocess.run(["systemctl", "--user", "restart", "bmb-eval"], capture_output=True)
     user = os.environ.get("USER", "")
     if subprocess.run(["loginctl", "enable-linger", user], capture_output=True).returncode != 0:
         print(f"  NOTE: so the node keeps running after you log out, run once:\n"
               f"    sudo loginctl enable-linger {user}")
-    return True
+    return True, ""
+
+
+def _audit_size(cfg) -> int:
+    p = cfg.state_dir / "audit.jsonl"
+    return p.stat().st_size if p.exists() else 0
+
+
+def _audit_events_since(cfg, offset: int) -> list[dict]:
+    p = cfg.state_dir / "audit.jsonl"
+    if not p.exists():
+        return []
+    with p.open("rb") as f:
+        f.seek(offset)
+        lines = f.read().decode(errors="replace").splitlines()
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return out
+
+
+def _service_state() -> str:
+    if not shutil.which("systemctl"):
+        return "unknown"
+    r = subprocess.run(["systemctl", "--user", "is-active", "bmb-eval"], capture_output=True, text=True)
+    return r.stdout.strip() or "unknown"
+
+
+def _service_log(n: int = 20) -> str:
+    if not shutil.which("journalctl"):
+        return ""
+    r = subprocess.run(["journalctl", "--user", "-u", "bmb-eval", "-n", str(n), "--no-pager"],
+                       capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def _wait_for_checkin(cfg, since: float, audit_from: int) -> tuple[str, str, str] | None:
+    """Wait for the background node's first check-in with the hub (it touches
+    state/last_checkin). None once it has. Otherwise what to report to the hub
+    (reason, detail: fixed words only) and what to tell the provider, from the
+    node's own audit log and systemd."""
+    from .node import checkin_path
+    marker = checkin_path(cfg)
+    deadline = time.monotonic() + CHECKIN_WAIT_S
+    while time.monotonic() < deadline:
+        try:
+            if marker.stat().st_mtime >= since:
+                return None
+        except OSError:          # not written yet
+            pass
+        time.sleep(1)
+    events = [e for e in _audit_events_since(cfg, audit_from)
+              if e.get("event") in ("hub_unreachable", "hello_rejected")]
+    if events:
+        e, err = events[-1], str(events[-1].get("error", ""))
+        if e["event"] == "hello_rejected":
+            return ("hub_error", "hello_rejected",
+                    f"\nThe background service is running, but BioModelBench rejected its check-in "
+                    f"(HTTP {e.get('status')}): {err}\nPlease send this message to BioModelBench.")
+        if "certificate" in err.lower() or "ssl" in err.lower():
+            return ("tls", "certificate",
+                    f"\nThe background service started, but can't verify BioModelBench's HTTPS "
+                    f"certificate:\n  {err}\nIf your network inspects HTTPS with its own certificate "
+                    "authority, point SSL_CERT_FILE at its certificate in this shell and run the same "
+                    "command again; the service takes the setting from here.")
+        return ("hub_error", "unreachable",
+                f"\nThe background service started, but can't reach BioModelBench:\n  {err}\n"
+                "If this machine reaches the internet through a proxy, set HTTPS_PROXY in this shell "
+                "and run the same command again; the service takes the setting from here. Otherwise "
+                f"this machine needs outbound HTTPS to {(cfg.hub or {}).get('url', 'the hub')}.")
+    state = _service_state()
+    if state != "active":
+        log = _service_log()
+        return ("crashed", "service_exited",
+                f"\nThe background service isn't running (systemd says: {state})."
+                + (f" Its last log lines:\n{log}" if log else "")
+                + "\nPlease send this message to BioModelBench.")
+    return ("stopped", "no_checkin",
+            f"\nThe background service is running, but hasn't checked in with BioModelBench after "
+            f"{CHECKIN_WAIT_S} seconds. Its log:  journalctl --user -u bmb-eval -n 30\n"
+            "Please send it to BioModelBench.")
 
 
 def cmd_install_service(args) -> None:
-    if not _install_service(_cfg(args)):
-        raise SystemExit("could not install a systemd user service; use `bmb-eval run`")
+    ok, why = _install_service(_cfg(args))
+    if not ok:
+        raise SystemExit(f"could not install a systemd user service ({why}); use `bmb-eval run`")
     print("service installed; logs: journalctl --user -u bmb-eval -f")
 
 

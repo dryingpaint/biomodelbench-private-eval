@@ -168,7 +168,8 @@ tests its own security, and then shows you exactly what you're agreeing to:
 Approve and start? [y/N]
 ```
 
-Type `y`. It runs in the background and restarts after
+Type `y`. It starts the evaluator in the background, waits for it to check in
+with BioModelBench, and only then says it's connected. It restarts after
 reboots.
 
 If something needs fixing, it says what (for example, *"It has no column
@@ -191,7 +192,12 @@ The machine only makes outbound HTTPS connections: to the BioModelBench hub
 (`https://<hub address>`) and to `storage.googleapis.com`, where models are
 downloaded from. During installation it also reaches standard package mirrors
 (Ubuntu or Red Hat, PyPI, and NVIDIA on GPU machines). Nothing connects in, so
-no ports, web server or firewall changes are needed.
+no ports, web server or firewall changes are needed. If the machine reaches the
+internet through a proxy, set `HTTPS_PROXY` in the shell you run the command
+from; the background service takes the setting from there (likewise
+`SSL_CERT_FILE` for a network that inspects HTTPS with its own certificate
+authority). If the service can't get out, the command says so instead of
+reporting a connection.
 
 ### What leaves the machine
 Only scores, such as `{"spearman": 0.712, "pearson": 0.731, "rmse": 0.193}`,
@@ -210,7 +216,16 @@ Rocky 9), the drop-in `/etc/systemd/system/user@.service.d/delegate.conf`
 (Podman's documented setting); and, if Podman would otherwise use its slow
 `vfs` storage, `~/.config/containers/storage.conf`. Lingering is enabled for
 your user so the evaluator keeps running after you log out. Tested on Ubuntu
-22.04 and 24.04, Debian 12 and Rocky 9 (SELinux enforcing).
+22.04 and 24.04, Debian 12 and Rocky 9 (SELinux enforcing). Two things to know
+about Ubuntu 22.04's own Podman (3.4): it comes with conmon 2.0.25, which loses
+most of a container's output once there is more than a megabyte or so of it (a
+large task's predictions), so the command refuses it and says how to install
+conmon 2.1 or later (or Docker); and the first time the
+sandbox runs, Podman 3.4 makes a user-mapped copy of the whole image (another
+7 GB of disk), which on a slow disk can take longer than the self-test allows.
+If the self-test fails with `predict_timeout` on a fresh 22.04 machine, run the
+same command again: the copy is kept, and the second run takes a few minutes.
+Ubuntu 24.04 has neither issue.
 
 `~/bmb-eval/bmb-eval status` shows the version installed (a release tag and its
 source commit). For that release, `https://<hub address>/release` lists the

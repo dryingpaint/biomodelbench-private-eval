@@ -68,3 +68,96 @@ def test_selftest_accepts_readonly_driver_mounts_and_nothing_else():
     assert not ok("/data/answers.parquet", "ro")                  # not a driver file
     assert not ok(f"{LIB}/libssl.so.3", "ro")
     assert not ok("/home/me/nvidia-notes.csv", "ro")              # outside the system directories
+
+
+def test_connect_names_an_nvidia_driver_too_old_for_the_sandbox(monkeypatch):
+    from types import SimpleNamespace
+    from bmb_eval import cli
+    lim = SimpleNamespace(gpus=1, gpu_memory_gb=16)
+    monkeypatch.setattr(cli, "gpus_here", lambda: [24])
+    monkeypatch.setattr(cli, "podman_version", lambda: (4, 9))
+    monkeypatch.setattr(cli, "nvidia_driver", lambda: ("570.86.15", 570))
+    assert any("driver 580 or newer" in p and "570.86.15" in p for p in cli.gpu_problems(lim))
+    monkeypatch.setattr(cli, "nvidia_driver", lambda: ("580.178.04", 580))
+    assert cli.gpu_problems(lim) == []
+
+
+def test_min_driver_matches_the_cuda_build_in_the_lock():
+    from bmb_eval import cli
+    lock = (Path(__file__).resolve().parents[1] / "sandbox" / "requirements.lock").read_text()
+    if "-cu13==" in lock:                  # CUDA 13 wheels need driver 580+
+        assert cli.MIN_NVIDIA_DRIVER >= 580
+    if "-cu12==" in lock:
+        assert cli.MIN_NVIDIA_DRIVER >= 525
+
+
+def test_installer_stops_on_arm_before_installing_anything(tmp_path):
+    import subprocess
+    repo = Path(__file__).resolve().parents[1]
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Linux;; -m) echo aarch64;; *) echo Linux;; esac\n')
+    (fake / "sudo").write_text("#!/bin/sh\necho SUDO-CALLED >&2; exit 99\n")
+    for f in ("uname", "sudo"):
+        (fake / f).chmod(0o755)
+    r = subprocess.run(["sh", str(repo / "install.sh")], capture_output=True, text=True,
+                       env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(tmp_path),
+                            "BMB_HUB": "https://hub.example"})
+    assert r.returncode == 1
+    assert "x86_64" in r.stderr and "aarch64" in r.stderr and "SUDO-CALLED" not in r.stderr
+
+
+def test_a_podman_exported_image_gets_the_short_name_docker_needs(monkeypatch):
+    # Docker loads the hub's image as localhost/bmb-eval-sandbox:latest and doesn't find it
+    # under the short name: the node saw it as missing (downloaded it again) and unstamped.
+    from bmb_eval import cli
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    cli._tag_loaded("docker", "Loaded image: localhost/bmb-eval-sandbox:latest\n", "bmb-eval-sandbox:latest")
+    assert calls == [["docker", "tag", "localhost/bmb-eval-sandbox:latest", "bmb-eval-sandbox:latest"]]
+    calls.clear()
+    cli._tag_loaded("podman", "Loaded image(s): bmb-eval-sandbox:latest\n", "bmb-eval-sandbox:latest")
+    cli._tag_loaded("docker", "Loaded image ID: sha256:abc\n", "bmb-eval-sandbox:latest")
+    assert calls == []                      # already the right name, or nothing named to tag
+
+
+def test_output_past_the_cap_is_drained_not_left_blocking_the_writer(tmp_path):
+    # With Docker, container output passes through the client and daemon. If the node stops
+    # reading after an overflow, they block on the full pipe and `docker kill` never
+    # completes (the flood_output self-test hung for 13 hours). Model that: the process
+    # we kill is a shell, while its child, standing in for the daemon, keeps writing. It
+    # must be able to finish.
+    import sys
+    from bmb_eval.sandbox import _run
+    done = tmp_path / "writer_finished"
+    child = (f"import os, sys; [os.write(1, b'x' * (1 << 16)) for _ in range(64)]; "
+             f"open({str(done)!r}, 'w').close()")
+    import time
+
+    def docker_kill():                       # like `docker kill`: returns once the output has drained
+        t0 = time.time()
+        while not done.exists() and time.time() - t0 < 15:
+            time.sleep(0.05)
+
+    r = _run(["sh", "-c", f"{sys.executable} -c \"{child}\" & wait"], timeout_s=30,
+             stdout_cap=1 << 20, stdin=b"", on_kill=docker_kill)
+    assert r.stdout_overflow and len(r.stdout) <= 1 << 20
+    assert done.exists()                    # the writer wasn't left blocked (or killed by EPIPE)
+    assert r.seconds < 10                    # and nothing waited on the kill while output piled up
+
+
+def test_a_node_that_cant_use_docker_says_so_instead_of_unstamped(monkeypatch):
+    # Seen on the Docker run: the service lacked the docker group, so `docker image inspect`
+    # failed and the node reported the image "unstamped", refusing work while connected.
+    import subprocess
+    from types import SimpleNamespace
+    from bmb_eval import sandbox
+    cfg = SimpleNamespace(backend="docker", image="bmb-eval-sandbox:latest", runtime=None)
+    monkeypatch.setattr(sandbox.ContainerSandbox, "image_label", lambda self, key: None)
+    denied = SimpleNamespace(returncode=1, stdout="", stderr="permission denied while trying to connect "
+                             "to the Docker daemon socket at unix:///var/run/docker.sock")
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: denied)
+    msg = sandbox.stale_image_message(cfg)
+    assert "permission denied" in msg and "docker group" in msg and "unstamped" not in msg
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    assert "unstamped" in sandbox.stale_image_message(cfg)      # engine fine: really no stamp

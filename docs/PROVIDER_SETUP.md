@@ -126,10 +126,10 @@ them on your data and sends back only the scores. Your data never leaves.
 
 ## What you need
 
-- **A Linux machine that stays on**, of the size our email gives for your
+- **An x86_64 (Intel or AMD) Linux machine that stays on**, of the size our email gives for your
   tasks (for example, two 80 GB NVIDIA GPUs, 24 CPUs, 256 GB RAM and 500 GB
   free disk for tasks whose final evaluations run the largest models). Most of
-  the time it runs small models on CPUs. The install checks the machine and
+  the time it runs small models on CPUs. GPUs need NVIDIA driver 580 or newer. The install checks the machine and
   says if anything is missing. If you don't have a suitable machine, talk to
   us and we'll help you set one up, or use Option A.
 - **The data you described to us**, as one file or one folder, in whatever

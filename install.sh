@@ -15,6 +15,14 @@ if [ "$ENGINE" != "local" ] && [ "$(uname -s)" != "Linux" ]; then
   echo "This needs a Linux machine. See $HUB/guide for how to get one." >&2
   exit 1
 fi
+# The sandbox image is built for x86_64 only: stop here rather than after installing
+# everything (an ARM machine would fail loading or building the image).
+if [ "$ENGINE" != "local" ] && [ "$(uname -m)" != "x86_64" ]; then
+  echo "This needs an x86_64 (Intel or AMD) Linux machine; this one is $(uname -m) (ARM)." >&2
+  echo "The sandbox models run in is built for x86_64 only. If you have no such machine," >&2
+  echo "the sealed option needs none: see $HUB/guide." >&2
+  exit 1
+fi
 
 if [ $# -gt 0 ]; then
   cat <<'EOF'
@@ -116,6 +124,22 @@ if [ "$ENGINE" != "local" ] && [ "$(id -u)" != 0 ] && command -v podman >/dev/nu
     fi
     printf '[storage]\ndriver = "overlay"\n[storage.options.overlay]\n%s\n' "$MP" \
       > "$HOME/.config/containers/storage.conf"
+  fi
+fi
+
+# Docker: the background service runs under the user's systemd manager, which keeps the groups
+# it started with. A user added to the docker group after it started (typically just before
+# running this) can use Docker here but the service can't: it saw no image and refused all
+# work while showing as connected. Restart the manager so it picks up the group.
+if [ "$ENGINE" != "local" ] && [ "$(id -u)" != 0 ] && ! command -v podman >/dev/null &&
+   command -v docker >/dev/null && [ -S /var/run/docker.sock ] && command -v systemctl >/dev/null; then
+  SOCK_GID="$(stat -c %g /var/run/docker.sock 2>/dev/null || true)"
+  MGR="$(systemctl show "user@$(id -u).service" -p MainPID --value 2>/dev/null || true)"
+  if [ -n "$SOCK_GID" ] && [ -n "$MGR" ] && [ "$MGR" != 0 ] && id -G | tr ' ' '\n' | grep -qx "$SOCK_GID" &&
+     ! grep '^Groups:' "/proc/$MGR/status" 2>/dev/null | tr -s ' \t' '\n' | grep -qx "$SOCK_GID"; then
+    say "Letting the background service use Docker (restarting your user session's services)"
+    sudo systemctl restart "user@$(id -u).service" 2>/dev/null ||
+      { sleep 5; sudo systemctl restart "user@$(id -u).service" 2>/dev/null; } || true
   fi
 fi
 

@@ -30,6 +30,11 @@ from .sandbox_entry.validate import EXIT_INVALID
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
 OOM_EXITS = (137, -9, EXIT_MEMORY)
+# The parquet reader's native code aborts or faults on some malformed files instead of
+# raising (seen on Linux: SIGABRT on ~3% of the self-test's random parquet). Directly the
+# signal is negative; through a container engine it is 128 + the signal number.
+CRASH_SIGNALS = (4, 6, 7, 8, 11)      # SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV
+CRASH_EXITS = tuple(-n for n in CRASH_SIGNALS) + tuple(128 + n for n in CRASH_SIGNALS)
 
 
 def new_run_id() -> str:
@@ -155,8 +160,10 @@ class Runner:
                         stdout_cap=lim.max_predictions_mb << 20, stdin=r.stdout)
         if r.exit_code == EXIT_INVALID:
             raise self._gate_validation_error(c, r.stdout)
-        if r.timed_out or r.exit_code in OOM_EXITS:
-            # The untrusted file made the parser blow up: the submission's fault.
+        if r.timed_out or r.exit_code in OOM_EXITS + CRASH_EXITS:
+            # The untrusted file made the parser blow up (hang, memory, or a native crash):
+            # the submission's fault. Reporting it as infra_error paged the operator for a
+            # malformed upload, and failed providers' self-tests at random.
             raise EvalError("predictions_invalid", detail={"column": "*", "reason": "unreadable"},
                             internal=f"validate exit {r.exit_code} timeout {r.timed_out}")
         if r.exit_code != 0 or r.stdout_overflow:

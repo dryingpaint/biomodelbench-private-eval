@@ -161,3 +161,4 @@ def test_a_node_that_cant_use_docker_says_so_instead_of_unstamped(monkeypatch):
     assert "permission denied" in msg and "docker group" in msg and "unstamped" not in msg
     monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""))
     assert "unstamped" in sandbox.stale_image_message(cfg)      # engine fine: really no stamp
+

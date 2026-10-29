@@ -1956,6 +1956,27 @@ def test_truncated_predictions_are_reported_as_infra_error(cfg):
     assert r.evaluate(TASK, pack_dir(EXAMPLE_BUNDLE))["status"] == "ok"
 
 
+
+def test_a_validator_crash_on_the_models_file_is_invalid_predictions(cfg):
+    # The parquet reader aborts on some malformed files (SIGABRT on 48 of 1,600 parser_attack
+    # runs on Linux). That is the submission's fault: as infra_error it paged the operator and
+    # failed providers' self-tests at random.
+    import dataclasses
+    from bmb_eval.runner import CRASH_EXITS
+    r = Runner(cfg, send_alerts=False)
+    real = r.sandbox.run
+    for code in (-6, -11, 134, 139):            # direct, and through a container engine
+        assert code in CRASH_EXITS
+
+        def crashing(*, entry, code=code, **kw):
+            res = real(entry=entry, **kw)
+            return dataclasses.replace(res, exit_code=code, stdout=b"") if entry == "validate" else res
+        r.sandbox.run = crashing
+        p = r.evaluate(TASK, pack_dir(EXAMPLE_BUNDLE))
+        assert p["status"] == "error" and p["error"]["code"] == "predictions_invalid", (code, p)
+    r.sandbox.run = real
+    assert r.evaluate(TASK, pack_dir(EXAMPLE_BUNDLE))["status"] == "ok"
+
 def test_connect_refuses_a_conmon_that_drops_output(monkeypatch):
     monkeypatch.setattr(cli, "conmon_version", lambda: (2, 0, 25))   # Ubuntu 22.04's
     [p] = cli.engine_problems("podman")

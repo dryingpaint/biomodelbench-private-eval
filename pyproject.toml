@@ -1,6 +1,6 @@
 [project]
 name = "bmb-eval"
-version = "0.2.1"
+version = "0.2.2"
 description = "BioModelBench private evaluation node: score agent-trained models on private data without the data leaving the provider."
 readme = "README.md"
 requires-python = ">=3.11"

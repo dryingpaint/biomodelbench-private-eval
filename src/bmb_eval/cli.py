@@ -81,6 +81,17 @@ def _has_gvisor(engine: str) -> bool:
     return shutil.which("runsc") is not None
 
 
+def _tag_loaded(engine: str, load_output: str, image: str) -> None:
+    """Give the image just loaded the name the node uses. The hub exports it with Podman,
+    which records it as localhost/bmb-eval-sandbox:latest; Podman finds that under the short
+    name, Docker doesn't (it then reports the image missing and unstamped)."""
+    loaded = re.findall(r"Loaded image(?:\(s\))?: *(\S+)", load_output)
+    for name in loaded:
+        if name != image and not name.startswith("sha256:"):
+            subprocess.run([engine, "tag", name, image], check=True, capture_output=True)
+            return
+
+
 def cmd_build_image(args) -> None:
     """Load the prebuilt sandbox image from the hub if offered, else build it."""
     cfg = _cfg(args)
@@ -116,7 +127,8 @@ def cmd_build_image(args) -> None:
                 if h.hexdigest() != want:
                     raise ValueError("checksum mismatch")
                 print(f"  Loading it into {engine} (a minute or two)...", flush=True)
-                subprocess.run([engine, "load", "-i", f.name], check=True, capture_output=True)
+                r = subprocess.run([engine, "load", "-i", f.name], check=True, capture_output=True, text=True)
+                _tag_loaded(engine, r.stdout + r.stderr, cfg.image)
             progress.done(t0, "Sandbox image ready")
             return
         except Exception as e:
@@ -271,10 +283,30 @@ def hardware_problems(lim, root: Path) -> list[str]:
     return out
 
 
+# The sandbox's PyTorch is built for CUDA 13 (sandbox/requirements.lock), which needs this
+# NVIDIA driver or newer. With an older one CUDA reports no GPU inside the sandbox, and the
+# self-test fails with a runtime error that doesn't say why.
+MIN_NVIDIA_DRIVER = 580
+
+
+def nvidia_driver() -> tuple[str, int] | None:
+    """The oldest NVIDIA driver version on this machine, as ("570.86.15", 570); None if unknown."""
+    if not shutil.which("nvidia-smi"):
+        return None
+    r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                       capture_output=True, text=True)
+    found = [(v, int(m.group(1))) for v in r.stdout.split() if (m := re.match(r"(\d+)\.", v))]
+    return min(found, key=lambda x: x[1]) if r.returncode == 0 and found else None
+
+
 def gpu_problems(lim) -> list[str]:
     out = []
     if lim.gpus:
         mem = gpus_here()
+        if mem and (d := nvidia_driver()) and d[1] < MIN_NVIDIA_DRIVER:
+            out.append(f"This task needs NVIDIA driver {MIN_NVIDIA_DRIVER} or newer (the sandbox runs "
+                       f"CUDA 13); this machine has {d[0]}. Update the driver, then run the same "
+                       "command again.")
         if len(mem) < lim.gpus:
             out.append(f"This task needs {lim.gpus} NVIDIA GPU(s); found {len(mem)}."
                        + ("" if mem else " (If it has one, its driver may not be installed.)"))

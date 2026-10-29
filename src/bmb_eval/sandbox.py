@@ -96,8 +96,24 @@ def stale_image_message(cfg) -> str | None:
     have = ContainerSandbox(cfg.backend, cfg.image, cfg.runtime).image_label("bmb.sandbox")
     if have == want:
         return None
+    if have is None and (why := engine_access_problem(cfg.backend)):
+        return why
     return (f"the sandbox image ({have or 'unstamped'}) is older than this node's code ({want}); "
             "run `bmb-eval build-image` (or re-run the install command) to update it")
+
+
+def engine_access_problem(engine: str) -> str | None:
+    """Why this process can't use the container engine, when that's the reason it sees no
+    image (a user added to the docker group after their session started); None otherwise."""
+    try:
+        r = subprocess.run([engine, "info"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 and "permission denied" in (r.stderr + r.stdout).lower():
+        return (f"this process can't use {engine} (permission denied on its socket). If you were just "
+                f"added to the {engine} group, re-run the install command (it restarts the background "
+                "service with the new group), or log out and back in")
+    return None
 
 
 def detect_engine() -> str | None:
@@ -418,10 +434,16 @@ def _run(cmd: list[str], timeout_s: int, stdout_cap: int, stdin: bytes,
 
     def read_stdout() -> None:
         while chunk := proc.stdout.read(1 << 16):
+            if overflow.is_set():
+                continue                 # past the cap: discard, but keep the pipe flowing
             if len(out) + len(chunk) > stdout_cap:
                 overflow.set()
-                kill()
-                break
+                # Kill in the background and keep reading. With Docker the output passes
+                # through the client and the daemon, and `docker kill` returns only once
+                # the container is gone, which waits for its output to drain. Killing
+                # here, or no longer reading, deadlocks (seen: hung for 13 hours).
+                threading.Thread(target=kill, daemon=True).start()
+                continue
             out.extend(chunk)
         proc.stdout.close()
 

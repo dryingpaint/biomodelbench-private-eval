@@ -660,6 +660,22 @@ def test_gcs_signed_urls_offline():
     assert g._name("agent-1", sha) != g._name("agent-2", sha)   # per-agent storage
 
 
+def test_gcs_download_links_reused():
+    """A download link is signed once per (agent, file) and reused while plenty of it
+    remains: a family's datasets and a re-offered job cost no new IAM calls."""
+    pytest.importorskip("google.cloud.storage")
+    g = object.__new__(hub_mod.GCSBlobs)
+    g._signed, g._signed_lock = {}, threading.Lock()
+    calls = []
+    g._sign = lambda agent, sha, method: calls.append((agent, sha)) or f"https://s/{agent}/{sha}/{len(calls)}"
+    first = g.download("a", "1" * 64, 5)["url"]
+    assert g.download("a", "1" * 64, 5)["url"] == first and len(calls) == 1
+    g.download("b", "1" * 64, 5)                       # another agent's copy: its own link
+    assert len(calls) == 2
+    g._signed[("a", "1" * 64)] = (time.time() - 1, first)   # under URL_REUSE_MIN left: re-sign
+    assert g.download("a", "1" * 64, 5)["url"] != first and len(calls) == 3
+
+
 def test_guide_page(hub):
     import urllib.error
     import urllib.request

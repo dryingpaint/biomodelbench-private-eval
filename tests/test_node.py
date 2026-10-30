@@ -475,6 +475,20 @@ def test_quota_enforced_by_node(connected):
     assert agent.status(b)["result"]["error"]["code"] == "quota_exceeded"
 
 
+def test_total_quota_counts_per_submitter(connected):
+    cfg, store, url, agent = connected
+    cfg.tasks["binding"].contract.limits.submissions_total = 1
+    other = Client(url, store.add_agent("agent-2"))
+    w = Worker(cfg)
+    a = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    b = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    c = other.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain()
+    assert agent.status(a)["result"]["status"] == "ok"
+    assert agent.status(b)["result"]["error"]["code"] == "quota_exceeded"
+    assert other.status(c)["result"]["status"] == "ok"      # another run has its own cap
+
+
 def test_result_held_on_node_until_release(connected):
     cfg, store, url, agent = connected
     cfg.tasks["binding"].contract.limits.release_after_s = 4
@@ -772,7 +786,7 @@ def test_final_runs_on_test_set_and_is_hidden_from_agent(split_connected):
     assert final["split"] == "test" and final["metrics"]["n"] == n_test
     assert agent.status(fid)["error"]["code"] == "not_found"    # agents never see final scores
     # Final runs don't use the agent's validation quota.
-    assert w.store.count_total("split_task") == 1
+    assert w.store.count_total("agent-split", "split_task") == 1
 
 
 def test_node_enforces_final_cap_and_refusals_dont_count(hub, node_dir, provider_files, tmp_path):
@@ -887,7 +901,7 @@ def test_baseline_final_evaluations_validated_and_counted(tmp_path):
     assert "3 of BioModelBench's reference models (5 in total)" in leakage.describe(c)
     summary = cli._summary(c, 500)
     assert "at most 2 final evaluations of agents' models and 3 of BioModelBench's" in summary
-    assert "across all 205 evaluations" in summary
+    assert "across one agent's 205 evaluations" in summary
     assert "reference models" not in cli._summary(without, 500)
 
 
@@ -931,7 +945,7 @@ def test_existing_databases_gain_split_column(tmp_path):
     db.commit()
     db.close()
     s = Store(tmp_path)
-    assert s.count_total("t") == 1                               # old rows count as validation
+    assert s.count_total("a", "t") == 1                          # old rows count as validation
     h = tmp_path / "hub"
     h.mkdir()
     hdb = sqlite3.connect(h / "hub.db")
@@ -1314,7 +1328,7 @@ def test_final_candidate_skips_validation_and_runs_under_final_limits(hub, node_
     w.drain()
     assert agent.status(r["submission_id"])["status"] == "registered"   # never run on validation
     assert agent.tasks()["budget"] == {"evaluations": 1, "used": 0}
-    assert w.store.count_total("big") == 0
+    assert w.store.count_total("agent-big", "big") == 0
     fid = store.request_final(r["submission_id"])
     w.drain()
     final = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])

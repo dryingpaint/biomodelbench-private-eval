@@ -30,7 +30,7 @@ class Budget:
     per_submission: float          # a benchmark (validation) evaluation
     per_final: float               # a final evaluation (adds final_only metrics)
     per_day_per_submitter: float
-    lifetime: float | None       # None when submissions_total is unset
+    lifetime: float | None       # per submitter; None when submissions_total is unset
     notes: list[str]
 
 
@@ -137,7 +137,7 @@ def describe(c: Contract) -> str:
         f"  timing    {b.timing_bits:8.1f} bits",
         f"  = {b.per_submission:.0f} bits/submission, "
         f"{b.per_day_per_submitter:.0f} bits/day/submitter",
-        "  lifetime  " + (f"{b.lifetime:.0f} bits ({c.limits.submissions_total} submissions)"
+        "  lifetime  " + (f"{b.lifetime:.0f} bits per submitter ({c.limits.submissions_total} submissions)"
                           if b.lifetime is not None else "unbounded (set limits.submissions_total)"),
     ]
     if b.lifetime is not None and (n := rows_recoverable(c, b.lifetime)) is not None:

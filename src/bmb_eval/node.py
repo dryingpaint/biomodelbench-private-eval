@@ -412,7 +412,7 @@ class Worker:
             refusal = EvalError("final_hardware_missing")
         elif split == "validation" and (
                 self.store.count_today(submitter, task) >= lim.submissions_per_day or (
-                lim.submissions_total and self.store.count_total(task) >= lim.submissions_total)):
+                lim.submissions_total and self.store.count_total(submitter, task) >= lim.submissions_total)):
             refusal = EvalError("quota_exceeded")
         else:
             try:

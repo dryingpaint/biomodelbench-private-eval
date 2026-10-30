@@ -372,16 +372,16 @@ def _summary(c, n_rows: int) -> str:
     from .prepare import describe_hidden, describe_inputs
     b = leakage.budget(c)
     lim = c.limits
-    total = f", {lim.submissions_total} in total" if lim.submissions_total else ""
+    total = f", {lim.submissions_total} in total per agent" if lim.submissions_total else ""
     n_all = (lim.submissions_total or 0) + (c.split.total_finals if c.split else 0)
     rows = leakage.rows_recoverable(c, b.lifetime) if b.lifetime else None
     if rows is not None:
         hidden = describe_hidden(c)
-        worst = (f"recover the {hidden} values of {_rows(rows, n_rows)}, across all "
+        worst = (f"recover the {hidden} values of {_rows(rows, n_rows)}, across one agent's "
                  f"{n_all} evaluations (estimate, at about 3 significant digits per value)")
     elif b.lifetime and (n := leakage.values_recoverable(b.lifetime)) is not None:
         worst = (f"recover about {_round(n):,} of the hidden measured values in your data, across "
-                 f"all {n_all} evaluations (estimate, at about 3 significant digits per value)")
+                 f"one agent's {n_all} evaluations (estimate, at about 3 significant digits per value)")
     else:
         worst = f"learn at most ~{b.per_submission:.0f} bits per evaluation"
     return "\n".join([

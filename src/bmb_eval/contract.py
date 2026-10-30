@@ -164,7 +164,7 @@ class Limits:
     # Per submitter per UTC day.
     submissions_per_day: int = 20
     # Across all submitters, for the life of this contract version. None = no cap.
-    submissions_total: int | None = None
+    submissions_total: int | None = None   # per submitter (one agent run's token), lifetime
     # Results become visible this many seconds after submission (not after the
     # run finishes), so run time cannot carry information. 0 = release on finish.
     release_after_s: int = 0

@@ -489,3 +489,17 @@ def test_modal_sync_verify_reports_couldnt_check_not_drift(modal_connected, caps
     with pytest.raises(SystemExit) as e:
         cli.main(["--config", str(cfg.path), "modal-sync", "--verify"])
     assert e.value.code == 2 and "Couldn't check" in capsys.readouterr().out
+
+
+def test_sandbox_pythonpath_drops_entries_the_sandbox_user_cannot_list(tmp_path):
+    """Modal's runtime appends root-only /pkg and /root to PYTHONPATH; pip, which lists
+    every sys.path entry, failed every bundle with wheels/ until they were dropped."""
+    import os
+    from bmb_eval.modal_entry import _sandbox_pythonpath
+    shared, private = tmp_path / "shared", tmp_path / "private"
+    shared.mkdir(mode=0o755)
+    private.mkdir(mode=0o700)
+    shared.chmod(0o755)
+    private.chmod(0o700)
+    value = os.pathsep.join([str(shared), str(private), str(tmp_path / "missing"), ""])
+    assert _sandbox_pythonpath(value) == str(shared)

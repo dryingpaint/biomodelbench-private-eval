@@ -91,6 +91,7 @@ MAX_HELLO_BYTES = 4 << 20   # a node's hello carries every task's public contrac
 MAX_RESULT_BYTES = 64 << 10
 MAX_PACKAGE_BYTES = 16 << 20   # a task folder: contract, scorer, labels, small reference files
 URL_TTL = datetime.timedelta(hours=24)
+URL_REUSE_MIN = datetime.timedelta(hours=12)   # a reused download link has at least this left
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
 AGENT_KINDS = ("agent", "baseline")
 
@@ -140,21 +141,42 @@ class GCSBlobs:
         self._creds = credentials
         self._request = gauth_requests.Request()
         self._refresh_lock = threading.Lock()
+        self._iam_creds = None
+        # Download links by (agent, sha): (reuse until, url). See download().
+        self._signed: dict[tuple[str, str], tuple[float, str]] = {}
+        self._signed_lock = threading.Lock()
         self.bucket = storage.Client(project=project, credentials=self._creds).bucket(bucket)
 
     def _name(self, agent: str, sha: str) -> str:
         return f"blobs/{_h(agent)[:16]}/{sha}"
 
+    def _signing_creds(self):
+        """Compute Engine credentials sign through the IAM API. Left to google-cloud-storage,
+        every signature opens a new HTTPS session; the TLS handshakes alone saturated the
+        hub's 8 cores on 2026-10-30 (a 3,063-file bundle). One pooled session instead."""
+        if self._iam_creds is None:
+            import requests
+            from google.auth import iam
+            from google.auth.transport import requests as gauth_requests
+            from google.oauth2 import service_account
+            session = requests.Session()
+            session.mount("https://", requests.adapters.HTTPAdapter(pool_maxsize=SIGN_THREADS))
+            email = self._creds.service_account_email
+            signer = iam.Signer(gauth_requests.Request(session=session), self._creds, email)
+            self._iam_creds = service_account.Credentials(
+                signer=signer, service_account_email=email,
+                token_uri="https://oauth2.googleapis.com/token")
+        return self._iam_creds
+
     def _sign(self, agent: str, sha: str, method: str, **kw) -> str:
         signer = {}
         if hasattr(self._creds, "service_account_email") and not hasattr(self._creds, "signer"):
-            # Compute Engine credentials sign through the IAM API. Signing runs in parallel
-            # (sign_all): refresh the token under a lock, once.
+            # Signing runs in parallel (sign_all): refresh the token under a lock, once.
             with self._refresh_lock:
                 if not self._creds.valid:
                     self._creds.refresh(self._request)
-            signer = {"service_account_email": self._creds.service_account_email,
-                      "access_token": self._creds.token}
+                creds = self._signing_creds()
+            signer = {"credentials": creds}
         return self.bucket.blob(self._name(agent, sha)).generate_signed_url(
             version="v4", expiration=URL_TTL, method=method, **signer, **kw)
 
@@ -168,7 +190,22 @@ class GCSBlobs:
                 "headers": {"Content-Type": ct}, "auth": False}
 
     def download(self, agent: str, sha: str, size: int) -> dict:
-        return {"url": self._sign(agent, sha, "GET"), "headers": {}, "auth": False}
+        """A signed GET link, reused while at least URL_REUSE_MIN of it remains. A family's
+        datasets share one bundle, and a job whose hand-out times out is offered again a
+        minute later: without reuse each re-signed every file (on 2026-10-30, 3,063 files
+        per poll, never finishing inside the node's 60 s read timeout)."""
+        now = time.time()
+        with self._signed_lock:
+            hit = self._signed.get((agent, sha))
+        if hit and hit[0] > now:
+            return {"url": hit[1], "headers": {}, "auth": False}
+        url = self._sign(agent, sha, "GET")
+        until = now + (URL_TTL - URL_REUSE_MIN).total_seconds()
+        with self._signed_lock:
+            if len(self._signed) > 200_000:
+                self._signed = {k: v for k, v in self._signed.items() if v[0] > now}
+            self._signed[(agent, sha)] = (until, url)
+        return {"url": url, "headers": {}, "auth": False}
 
 
 # -------------------------------------------------------------------- state
@@ -217,6 +254,13 @@ class HubStore:
                                  ("submissions", "kind", "TEXT NOT NULL DEFAULT 'agent'")]:
             if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        # Each submission row carries its bundle's manifest (up to a few MB), and the columns
+        # added above sit after it: without indexes, every status poll and job hand-out read
+        # every manifest (5,708 rows, 425 MB on 2026-10-30) under the store's one lock.
+        for name, cols in [("group", "group_id, split"), ("agent", "agent, split"),
+                           ("queue", "status, created"), ("node", "node_id, status"),
+                           ("task", "task, status")]:
+            self.db.execute(f"CREATE INDEX IF NOT EXISTS submissions_{name} ON submissions ({cols})")
         self.db.commit()
         self.lock = threading.Lock()
 

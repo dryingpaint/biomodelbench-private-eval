@@ -910,7 +910,11 @@ def cmd_check(args) -> None:
         if stale := stale_image_message(cfg):
             errors.append(stale)
         else:
-            errors += [f"Modal: {p}" for p in verify(cfg) + drift(cfg)]
+            from .modal_sync import ModalCheckError
+            try:
+                errors += [f"Modal: {p}" for p in verify(cfg) + drift(cfg)]
+            except ModalCheckError as e:
+                warnings.append(f"Modal: couldn't check the volumes ({e})")
     elif (r := engine_query([cfg.backend, "info"])) is None or r.returncode != 0:
         errors.append(f"{cfg.backend} is not running" + (" (it didn't answer within a minute)" if r is None else ""))
     elif make_sandbox(cfg).image_id() == "missing":
@@ -974,7 +978,13 @@ def cmd_modal_sync(args) -> None:
     if not args.verify:
         sync(cfg)
         print("Synced. Run `bmb-eval approve` to accept the uploaded data.")
-    problems = verify(cfg) + drift(cfg)
+    from .modal_sync import ModalCheckError
+    try:
+        problems = verify(cfg) + drift(cfg)
+    except ModalCheckError as e:
+        print(f"Couldn't check every volume (Modal didn't answer: {e}). Nothing found differs; "
+              "run it again later. Volumes checked so far aren't listed again for an hour.")
+        sys.exit(2)
     for p in problems:
         print("  ", p)
     if args.verify and problems:

@@ -33,6 +33,10 @@ HUB_ALERT_AFTER = 60   # consecutive failed hub calls (~5 minutes) before alerti
 MAX_INFRA_REQUEUES = 2
 INFRA_BACKOFF_S = (60, 300, 900, 1800)   # no new work for this long after each lost sandbox in a row
 MODAL_VERIFY_S = 3600  # full check of a Modal node's volumes against its manifest
+MODAL_DRIFT_S = 300    # the manifest on Modal against the approved one (one API call)
+MODAL_DRIFT_RETRY_S = 60   # sooner while drifted, to notice the fix
+MODAL_CHECK_BACKOFF_S = (60, 120, 300, 600, 1800)   # after checks Modal couldn't answer
+MODAL_CHECK_ALERT_AFTER = 3   # failed checks in a row before alerting
 
 
 class HubError(Exception):
@@ -200,6 +204,12 @@ class Worker:
         self.parallel = 1 if cfg.sealed else cfg.max_parallel
         self.capacity = machine_capacity(cfg, self.runner.sandbox)
         self._modal_verified = 0.0
+        # Last answer of the Modal data check: None = not known yet, [] = matches, else the
+        # problems. A check Modal can't answer (rate limit, API error) leaves it as it was.
+        self._modal_state: list[str] | None = None
+        self._modal_next_check = 0.0
+        self._modal_check_failures = 0
+        self._modal_lock_mtime: float | None = None
         self._infra_pause_until = 0.0     # after a lost sandbox: don't take new work until then
         self._modal_alerted: str | None = None
 
@@ -220,7 +230,12 @@ class Worker:
             return False
         self._stale_alerted = False
         drift = approval.diff(self.cfg)
-        if not drift and self.cfg.backend == "modal" and (why := self._modal_drift()):
+        why = self._modal_drift() if not drift and self.cfg.backend == "modal" else []
+        if why is None:
+            # Not checked successfully yet (Modal hasn't answered): no work, but no drift either.
+            self._accepting = (time.time(), False)
+            return False
+        if why:
             # The data on Modal must be what was approved. A local config that drifts gets
             # the usual alert below; data drift on Modal gets its own.
             if self._modal_alerted != why[0]:
@@ -238,13 +253,46 @@ class Worker:
         self._unapproved_alerted = bool(drift)
         return not drift
 
-    def _modal_drift(self) -> list[str]:
+    def _modal_drift(self) -> list[str] | None:
+        """The data on Modal against what was approved: [] when it matches, the problems
+        when it doesn't, None while it has never been checked. The manifest is checked every
+        MODAL_DRIFT_S (at once after an approval), every volume hourly. When Modal can't
+        answer, the last answer stands and the next try backs off."""
+        import random
         from . import modal_sync
-        out = modal_sync.drift(self.cfg)
-        if not out and time.time() - self._modal_verified > MODAL_VERIFY_S:
-            out = modal_sync.verify(self.cfg)
-            if not out:
-                self._modal_verified = time.time()
+        now = time.time()
+        try:
+            lock = approval.lock_path(self.cfg).stat().st_mtime
+        except OSError:
+            lock = None
+        if now < self._modal_next_check and lock == self._modal_lock_mtime:
+            return self._modal_state
+        try:
+            out = modal_sync.drift(self.cfg)
+            if not out and now - self._modal_verified > MODAL_VERIFY_S:
+                # Volumes listed in the last half hour (a check cut short) aren't listed again.
+                out = modal_sync.verify(self.cfg, max_age_s=MODAL_VERIFY_S / 2)
+                if not out:
+                    self._modal_verified = now
+        except modal_sync.ModalCheckError as e:
+            self._modal_check_failures += 1
+            n = self._modal_check_failures
+            wait = MODAL_CHECK_BACKOFF_S[min(n, len(MODAL_CHECK_BACKOFF_S)) - 1]
+            self._modal_next_check = now + wait * (0.75 + random.random() / 2)
+            self._modal_lock_mtime = lock
+            if n == 1:
+                audit.record(self.cfg.state_dir, "modal_check_failed", error=str(e)[:300])
+            if n == MODAL_CHECK_ALERT_AFTER:
+                alerts.send(self.cfg, "infra", f"can't check the task data on Modal ({n} tries in a row); "
+                            + ("still accepting on the last good check" if self._modal_state == []
+                               else "no new work until a check succeeds"), error=str(e)[:200])
+            return self._modal_state
+        if self._modal_check_failures:
+            audit.record(self.cfg.state_dir, "modal_check_recovered", failures=self._modal_check_failures)
+        self._modal_check_failures = 0
+        self._modal_state = out
+        self._modal_lock_mtime = lock
+        self._modal_next_check = now + (MODAL_DRIFT_RETRY_S if out else MODAL_DRIFT_S)
         return out
 
     # -------------------------------------------------------------- loop

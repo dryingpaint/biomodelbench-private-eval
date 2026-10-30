@@ -31,6 +31,48 @@ from .modal_backend import modal_dir, vol_name
 
 SHARED_MIN_BYTES = 256 << 20
 MANIFEST = "MANIFEST.json"
+# Modal rate-limits its API (ResourceExhaustedError when ~100 volumes are listed at once).
+LIST_TRIES = 6                  # attempts per call, with exponential back-off and jitter
+LIST_BACKOFF_S = 1.0            # first back-off; doubles each time, capped at LIST_BACKOFF_MAX_S
+LIST_BACKOFF_MAX_S = 30.0
+LIST_CONCURRENCY = 4            # volumes listed at once
+VERIFY_MAX_AGE_S = 3600         # a volume verified this recently (same manifest) isn't listed again
+
+
+class ModalCheckError(Exception):
+    """Modal couldn't be asked (rate limit, API error, timeout): nothing is known about
+    drift, either way. Never treated as drift."""
+
+
+def _not_found(e: BaseException) -> bool:
+    return type(e).__name__ in ("NotFoundError",)
+
+
+def call_with_retry(fn, what: str, tries: int | None = None):
+    """fn() with exponential back-off and jitter on Modal's transient errors (rate limits,
+    service errors, timeouts). A missing object is returned as the error itself
+    (NotFoundError: real drift, not a transient). Raises ModalCheckError when tries run out."""
+    import random
+    import time
+    tries = tries or LIST_TRIES
+    last = None
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if _not_found(e):
+                raise
+            last = e
+            if attempt + 1 < tries:
+                delay = min(LIST_BACKOFF_MAX_S, LIST_BACKOFF_S * 2 ** attempt)
+                time.sleep(delay * (0.5 + random.random() / 2))
+    raise ModalCheckError(f"{what}: {type(last).__name__}: {str(last)[:160]}") from last
+
+
+def _listing(m, cfg, name: str) -> dict[str, int]:
+    vol = m.Volume.from_name(name, environment_name=cfg.modal.environment)
+    return call_with_retry(lambda: {e.path.strip("/"): e.size for e in vol.listdir("/", recursive=True)
+                                    if _is_file(e)}, f"listing {name}")
 
 
 def _is_file(entry) -> bool:
@@ -124,12 +166,10 @@ def sync(cfg, modal_mod=None, say=print) -> dict:
     sent = 0
     for name, files in sorted(vols.items()):
         vol = m.Volume.from_name(name, environment_name=env, create_if_missing=True)
-        have = {}
-        try:
-            have = {e.path.strip("/"): e.size for e in vol.listdir("/", recursive=True)
-                    if _is_file(e)}
-        except Exception:
-            pass
+        # A listing that fails (rate limit) must not look like an empty volume: that would
+        # re-upload everything. Retried, then the sync stops with the error.
+        have = call_with_retry(lambda: {e.path.strip("/"): e.size for e in vol.listdir("/", recursive=True)
+                                        if _is_file(e)}, f"listing {name}")
         want = manifest["volumes"][name]
         # The size check catches most changes; a recorded hash catches same-size edits.
         uploaded = _uploaded(cfg).get(name, {})
@@ -176,11 +216,12 @@ def _record_uploaded(cfg, volume: str, files: dict) -> None:
 def remote_manifest(cfg, modal_mod=None) -> bytes:
     m = modal_mod or modal_backend.import_modal(cfg.modal)
     meta = m.Volume.from_name(vol_name(cfg.modal.volume_prefix, "meta"), environment_name=cfg.modal.environment)
-    return b"".join(meta.read_file("/" + MANIFEST))
+    return call_with_retry(lambda: b"".join(meta.read_file("/" + MANIFEST)), "reading the manifest")
 
 
 def drift(cfg, modal_mod=None) -> list[str]:
-    """Why the data on Modal isn't what the operator approved; [] when it is."""
+    """Why the data on Modal isn't what the operator approved; [] when it is.
+    Raises ModalCheckError when Modal couldn't be asked."""
     try:
         approved = json.loads(approval.lock_path(cfg).read_text())
     except (OSError, ValueError):
@@ -188,8 +229,12 @@ def drift(cfg, modal_mod=None) -> list[str]:
     want = ((approved.get("sandbox") or {}).get("modal") or {}).get("manifest")
     try:
         body = remote_manifest(cfg, modal_mod)
+    except ModalCheckError:
+        raise
     except Exception as e:
-        return [f"can't read the manifest on Modal ({type(e).__name__})"]
+        if _not_found(e):
+            return ["the manifest on Modal is missing (run `bmb-eval modal-sync`)"]
+        raise ModalCheckError(f"reading the manifest: {type(e).__name__}") from e
     out = []
     if hashlib.sha256(body).hexdigest() != want:
         out.append("the manifest on Modal differs from the approved one (run `bmb-eval modal-sync`, "
@@ -204,27 +249,69 @@ def drift(cfg, modal_mod=None) -> list[str]:
     return out
 
 
-def verify(cfg, modal_mod=None) -> list[str]:
+def _verify_cache_path(cfg) -> Path:
+    return modal_dir(cfg) / "verified.json"
+
+
+def verify(cfg, modal_mod=None, max_age_s: float | None = None) -> list[str]:
     """Each volume's files (paths and sizes) against the local manifest: catches a
-    volume changed on Modal behind the manifest's back."""
+    volume changed on Modal behind the manifest's back. [] when every volume matches.
+
+    Volumes are listed a few at a time, each call retried with back-off. A volume that
+    matched within max_age_s (for this same manifest) isn't listed again, so a check cut
+    short by rate limits resumes where it stopped. Raises ModalCheckError when some
+    volume couldn't be listed and no listing showed a difference (real drift wins)."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
     m = modal_mod or modal_backend.import_modal(cfg.modal)
     try:
-        manifest = json.loads((modal_dir(cfg) / MANIFEST).read_text())
+        body = (modal_dir(cfg) / MANIFEST).read_bytes()
+        manifest = json.loads(body)
     except (OSError, ValueError):
         return ["no local manifest (run `bmb-eval modal-sync`)"]
-    out = []
-    for name, files in manifest["volumes"].items():
+    mhash = hashlib.sha256(body).hexdigest()
+    max_age_s = VERIFY_MAX_AGE_S if max_age_s is None else max_age_s
+    try:
+        cache = json.loads(_verify_cache_path(cfg).read_text())
+    except (OSError, ValueError):
+        cache = {}
+    if cache.get("manifest") != mhash:
+        cache = {"manifest": mhash, "volumes": {}}
+    now = time.time()
+    todo = [(n, f) for n, f in sorted(manifest["volumes"].items())
+            if now - cache["volumes"].get(n, 0) > max_age_s]
+
+    def check(item):
+        name, files = item
         try:
-            vol = m.Volume.from_name(name, environment_name=cfg.modal.environment)
-            have = {e.path.strip("/"): e.size for e in vol.listdir("/", recursive=True)
-                    if _is_file(e)}
+            have = _listing(m, cfg, name)
+        except ModalCheckError as e:
+            return name, None, str(e)
         except Exception as e:
-            out.append(f"{name}: can't list it ({type(e).__name__})")
-            continue
+            if _not_found(e):
+                return name, f"{name}: the volume is missing", None
+            return name, None, f"{name}: {type(e).__name__}"
         have.pop(".bmb_links.json", None)
         want = {rel: v[0] for rel, v in files.items()}
-        if have != want:
-            extra, missing = sorted(set(have) - set(want)), sorted(set(want) - set(have))
-            changed = sorted(r for r in set(have) & set(want) if have[r] != want[r])
-            out.append(f"{name}: {len(extra)} unexpected, {len(missing)} missing, {len(changed)} changed file(s)")
-    return out
+        if have == want:
+            return name, "", None
+        extra, missing = sorted(set(have) - set(want)), sorted(set(want) - set(have))
+        changed = sorted(r for r in set(have) & set(want) if have[r] != want[r])
+        return name, f"{name}: {len(extra)} unexpected, {len(missing)} missing, {len(changed)} changed file(s)", None
+
+    out, failed = [], []
+    with ThreadPoolExecutor(max_workers=LIST_CONCURRENCY) as pool:
+        for name, problem, err in pool.map(check, todo):
+            if err is not None:
+                failed.append(err)
+            elif problem:
+                out.append(problem)
+                cache["volumes"].pop(name, None)
+            else:
+                cache["volumes"][name] = time.time()
+    _verify_cache_path(cfg).write_text(json.dumps(cache))
+    if out:
+        return out
+    if failed:
+        raise ModalCheckError(f"{len(failed)} of {len(todo)} volume(s) couldn't be listed (first: {failed[0]})")
+    return []

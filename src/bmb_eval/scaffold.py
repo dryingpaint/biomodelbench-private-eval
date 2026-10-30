@@ -171,7 +171,7 @@ def write_task(task_id: str, tasks_dir: Path, inputs: list[tuple[str, str, bool]
         "  memory: 8g",
         "  cpus: 2",
         "  submissions_per_day: 20",
-        "  submissions_total: 200     # lifetime cap across all agents; see `bmb-eval check`",
+        "  submissions_total: 200     # lifetime cap per agent run; see `bmb-eval check`",
         "  release_after_s: 0         # >= sum of timeouts removes the timing channel",
         "",
     ])

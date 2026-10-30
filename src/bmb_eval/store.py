@@ -62,11 +62,12 @@ class Store:
                 "SELECT COUNT(*) FROM submissions WHERE submitter=? AND task=? AND day=? "
                 "AND split='validation'", (submitter, task, _day())).fetchone()[0]
 
-    def count_total(self, task: str) -> int:
+    def count_total(self, submitter: str, task: str) -> int:
+        """Validation submissions this submitter (one agent run's token) ever made to the task."""
         with self.lock:
             return self.db.execute(
-                "SELECT COUNT(*) FROM submissions WHERE task=? AND split='validation'",
-                (task,)).fetchone()[0]
+                "SELECT COUNT(*) FROM submissions WHERE submitter=? AND task=? AND split='validation'",
+                (submitter, task)).fetchone()[0]
 
     def count_final(self, task: str, kind: str = "agent") -> int:
         """Final (test set) evaluations run or accepted for this task, ever, of one

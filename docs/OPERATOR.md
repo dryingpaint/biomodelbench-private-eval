@@ -165,7 +165,7 @@ what would go, then again with `--yes`.
 
 | Setting | Default | Trade-off |
 |---|---|---|
-| `limits.submissions_total` | 200 | Lifetime leakage scales with it |
+| `limits.submissions_total` | 200 | Lifetime cap per submitter (one agent run's token). Each run's leakage scales with it; all runs together aren't capped |
 | `limits.submissions_per_day` | 20 | Per agent |
 | `limits.release_after_s` | 0 | Setting it at or above the total timeout removes the timing channel, but slows feedback |
 | `limits.gpus`, `gpu_memory_gb` | 0 | Large models need a GPU at the provider; connect checks the GPU is big enough |
@@ -202,9 +202,11 @@ An agent submits to `admet` exactly as it would to a task:
 - `bmb-hub final <submission>` on a family submission runs every dataset's
   held-out test half.
 
-Providers' own caps still apply on their machines. Because the benchmark runs
-several independent attempts, size each provider's `submissions_total` (and
-the leakage they approve) for **all** attempts, e.g. 3 attempts x 40.
+Providers' own caps still apply on their machines. `submissions_total` counts
+per submitter, so each attempt (agent run) gets its own; size it for one
+attempt's budget plus its final scoring, e.g. 60 for a 40-evaluation budget.
+Independent attempts aren't capped together: what all of them can learn grows
+with the number of attempts, so tell providers how many you plan.
 
 ## Held-out test set and final evaluations
 

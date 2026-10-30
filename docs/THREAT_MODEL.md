@@ -93,7 +93,7 @@ How to shrink it, from most to least effective:
 
 | Lever | Effect |
 |---|---|
-| `submissions_total` | Lifetime bits scale linearly with it. The main control. |
+| `submissions_total` | Lifetime bits per submitter scale linearly with it. The main control for one agent run; the number of runs multiplies it. |
 | `release_after_s` ≥ total timeout | Removes about 11 bits per submission. |
 | Fewer metrics / fewer `decimals` / tighter metric bounds | Each 3-decimal correlation costs about 11 bits; each decimal dropped saves about 3.3 bits per metric. |
 | `ladder_step` (the Ladder mechanism) | Most submissions return only "not improved"; information grows roughly logarithmically, not linearly, with submissions. |

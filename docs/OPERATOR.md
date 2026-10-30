@@ -242,3 +242,101 @@ against `final_evaluations`, so a job is never less restricted than before.
 A model too big for validation (see `final_limits`) is registered by the agent
 with `Client.register_final` instead of submitted; `final` accepts its
 submission id like any other.
+
+## Run a Modal node (GPU tasks on Modal's H100s)
+
+A node can run its sandboxes on Modal instead of a local container engine
+(`sandbox.backend: modal`, `src/bmb_eval/modal_backend.py`). The node loop
+(queue, quotas, audit log, approval lock) still runs on a VM; each stage runs in
+its own Modal Sandbox (gVisor, `block_network=True`, no secrets) with the
+contract's GPUs, CPUs, memory and time limit. Use it for our own public-data
+tasks that need more GPUs than a VM has (the genomic suite: 1×H100 per
+validation run, 8×H100 per final), not for a provider's private data unless
+they accept Modal as a processor (see the threat model).
+
+**How the data is laid out.** `bmb-eval modal-sync` uploads each task's prepared
+data into Modal Volumes in the `bmb-eval` environment, one volume per task and
+kind: validation inputs, test inputs, answers, and the task folder (contract and
+scorer). Every stage mounts read-only only what it may see; predict never gets
+answers, the scorer or the other half. A large file both halves see (the 3 GB
+reference genome linked into every genomic task) goes once into a volume of its
+own and is linked into each task's inputs folder. Model files go to a
+content-addressed blob volume that only a trusted stager mounts; each job's
+files are copied into a volume of their own, mounted read-only into predict,
+and deleted after it. `modal-sync` writes a manifest of what it uploaded (the
+same tree hashes as `bmb-eval approve`); the node accepts no work while the
+manifest on Modal or any volume's files differ from what was approved.
+
+**Separate environment.** Agent runs execute in the workspace's default
+environment (`main`) with the workspace's container credentials. The evaluation
+volumes live in `bmb-eval`, created as a restricted environment, so code in
+`main` can't open them. Check it after any change to workspace roles:
+
+```bash
+MODAL_PROFILE=biomodelbench modal environment list           # bmb-eval is there
+# From a Modal Function in main (as an agent's code would run), try to read them:
+MODAL_PROFILE=biomodelbench .venv/bin/python deploy/modal/isolation_probe.py <prefix>-meta <prefix>-<task>-ans
+# every line must say "refused"
+```
+
+**Set it up** on the node VM, in its own folder beside any container node (each
+node has its own config, state, approval lock and systemd unit):
+
+```bash
+git clone https://github.com/dryingpaint/biomodelbench-private-eval ~/bmb-eval-modal
+cd ~/bmb-eval-modal && BMB_ENGINE=modal BMB_SKIP_SELFTEST=1 ./setup.sh
+.venv/bin/pip install 'modal>=1.6'            # or: uv pip install --python .venv/bin/python -e '.[modal]'
+# Modal credentials for the biomodelbench workspace, in ~/.modal.toml (profile biomodelbench):
+.venv/bin/modal token new --profile biomodelbench
+```
+
+`setup.sh` with `BMB_ENGINE=modal` writes a `config.yaml` like this; edit it
+before the first connect:
+
+```yaml
+node_name: bmb-node-public-modal
+service_name: bmb-eval-modal      # its own systemd unit; the container node keeps bmb-eval
+sandbox: {backend: modal}
+modal:
+  environment: bmb-eval           # restricted; agents' environment (main) can't open it
+  app: bmb-eval-sandbox
+  profile: biomodelbench
+  gpu: H100
+  max_gpus: 64                    # hard cap on GPUs held at once by this node
+  max_jobs: 16                    # evaluations at once
+```
+
+Then build the image on Modal (Python 3.11, PyTorch 2.5.1 with CUDA 12.4,
+transformers 4.46.3 and the genomics tools; `sandbox/modal/`) and connect each
+task as usual. Connect uploads the data to Modal, runs the self-test on Modal,
+and approves:
+
+```bash
+./bmb-eval modal-deploy                        # about 3 min; again after each code update
+./bmb-eval connect <code> --data <folder> --yes --no-service   # each task
+./bmb-eval install-service                     # starts bmb-eval-modal
+./bmb-eval modal-sync --verify                 # volumes match the approved manifest
+```
+
+After a code update: `./bmb-eval modal-deploy && ./bmb-eval approve`, then
+`systemctl --user restart bmb-eval-modal`. After a data change:
+`./bmb-eval modal-sync && ./bmb-eval approve`.
+
+**Failures.** A Modal error (no capacity, an API error, a sandbox that vanished
+without its launcher's report) is retried twice inside the stage. If it still
+fails, the job goes back to the hub without counting against the agent, and the
+node takes no new work for a minute (growing to 30 minutes while it keeps
+failing). After `infra_failure_threshold` such failures in a row the alert
+webhook fires. A job is handed back at most twice; a third failure is a counted
+`infra_error`. The model's own outcomes (exit codes, out of memory, time limit,
+too much output) are never retried. `bmb-eval stop` terminates every sandbox
+tagged with this node; a restarted node also cleans up orphaned sandboxes and
+job volumes.
+
+**Timings** (measured 2026-10-29, controller on a laptop). The image builds in
+about 2.5 minutes. A stage's sandbox is ready in about 3 s on CPU and 6 s with
+an H100; the example task's whole evaluation (1×H100 predict, staging included)
+took 24 s. Data into a sandbox moves at about 35 MB/s, but output comes back at
+only about 4 MB/s (Modal's limit, not the network's: 1 GB took 290 s, and
+parallel streams don't help). Predictions near the 512 MB cap therefore spend
+about 2 minutes in transfer per stage that returns them.

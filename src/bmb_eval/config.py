@@ -29,6 +29,33 @@ class TaskBinding:
 
 
 @dataclass
+class ModalSettings:
+    """The `modal:` section of a Modal node's config.yaml (sandbox.backend: modal)."""
+    environment: str = "bmb-eval"     # Modal environment holding the evaluation volumes and app
+    app: str = "bmb-eval-sandbox"     # Modal app the sandboxes belong to
+    profile: str | None = None        # ~/.modal.toml profile (MODAL_PROFILE), e.g. biomodelbench
+    gpu: str = "H100"
+    max_gpus: int = 64                # GPUs this node may hold at once, across all jobs
+    max_jobs: int = 16                # evaluations at once
+    max_gpus_per_job: int = 8         # what one Modal container can have
+    gpu_memory_gb: int = 80
+    volume_prefix: str = ""           # names this node's volumes; default: the node name
+    retries: int = 2                  # retries of a stage after a Modal (not model) failure
+    memory_headroom_mb: int = 2048    # container memory above the contract's, for the launcher
+
+    @classmethod
+    def parse(cls, raw: dict | None, node_name: str) -> "ModalSettings":
+        known = {f for f in cls.__dataclass_fields__}
+        raw = dict(raw or {})
+        if bad := set(raw) - known:
+            raise SystemExit(f"modal: unknown setting(s) {sorted(bad)}")
+        s = cls(**raw)
+        if not s.volume_prefix:
+            s.volume_prefix = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in node_name)[:24]
+        return s
+
+
+@dataclass
 class Config:
     path: Path
     node_name: str
@@ -46,6 +73,10 @@ class Config:
     max_parallel: int
     hub: dict          # {url, node_id, secret} once connected; {} before
     blob_dir: Path | None = None   # model-file cache; default state_dir/blobs
+    modal: ModalSettings | None = None   # sandbox.backend: modal
+    # The systemd user unit the node runs as. A second node on the same machine (e.g. a
+    # Modal node beside a container node) needs its own.
+    service_name: str = "bmb-eval"
     tasks: dict[str, TaskBinding] = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
@@ -78,8 +109,11 @@ class Config:
             max_parallel=max(1, int(raw.get("max_parallel", 1))),
             hub=dict(raw.get("hub") or {}),
             blob_dir=rel(raw["blob_dir"]) if raw.get("blob_dir") else None,
+            service_name=str(raw.get("service_name") or "bmb-eval"),
             raw=raw,
         )
+        if not cfg.service_name.replace("-", "").replace("_", "").isalnum():
+            raise SystemExit("service_name may hold only letters, digits, - and _")
         cfg.blob_dir = cfg.blob_dir or cfg.state_dir / "blobs"
         for tid, t in (raw.get("tasks") or {}).items():
             d = rel(t["dir"])
@@ -90,8 +124,12 @@ class Config:
                                          rel(t["inputs_dir"]) if t.get("inputs_dir") else None,
                                          rel(t["answers_dir"]) if t.get("answers_dir") else None,
                                          rel(t["test_inputs_dir"]) if t.get("test_inputs_dir") else None)
-        if cfg.backend not in ("docker", "podman", "bwrap", "local"):
-            raise SystemExit("sandbox.backend must be docker, podman, bwrap or local")
+        if cfg.backend not in ("docker", "podman", "bwrap", "local", "modal"):
+            raise SystemExit("sandbox.backend must be docker, podman, bwrap, modal or local")
+        if cfg.backend == "modal":
+            cfg.modal = ModalSettings.parse(raw.get("modal"), cfg.node_name)
+            # Evaluations run side by side, each in its own Modal container.
+            cfg.max_parallel = max(1, cfg.modal.max_jobs)
         if cfg.backend == "local" and not cfg.allow_unisolated:
             raise SystemExit("sandbox.backend local is NOT isolated; set "
                              "sandbox.i_understand_local_backend_is_not_isolated: true "

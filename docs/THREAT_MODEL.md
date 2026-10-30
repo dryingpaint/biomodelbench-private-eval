@@ -121,7 +121,7 @@ returns your most extreme label directly.
 | One agent planting a bad file under another's hash | Hub storage is per agent; nodes verify hashes anyway | `hub.py` | None known |
 | Tar tricks (symlinks, `..`, devices, decompression bombs) | Rejected before extraction; "data" extraction filter | `bundle.py` | None known |
 | Fork bomb, CPU exhaustion | `--pids-limit`, `--cpus`, timeouts | `sandbox.py` | None known |
-| Covert channel between concurrent runs | One run at a time | `node.py` | None known |
+| Covert channel between concurrent runs | One run at a time (container nodes, `max_parallel: 1`) | `node.py` | A Modal node runs up to `modal.max_jobs` at once, possibly on shared hosts (below) |
 | Container or kernel escape | Capabilities dropped, no-new-privileges, non-root; **gVisor recommended** | `sandbox.py` | Without gVisor, a host-kernel bug = escape. This is the largest remaining technical risk. |
 | Silently swapped scorer, contract, data or image | Fingerprint lock; node refuses until re-approved and alerts | `approval.py` | Someone with root can re-approve |
 | Tampering with run history | Hash-chained audit log | `audit.py` | Root can rewrite the whole chain; copy the latest hash off the machine periodically |
@@ -132,11 +132,35 @@ returns your most extreme label directly.
 | Per-group metrics multiply leakage | Each group is a separately bounded metric, and the budget counts every one | `contract.py`, `leakage.py` | Operators must keep group counts small |
 | A file column pointing at the answers | File paths must stay inside the data folder and may not name the samples table; only listed columns and files are linked into the model's folder | `prepare.py` | A provider could put answers inside a pass-through file themselves; the approval summary lists every file the model will see |
 | Node running on the provider's main data server | Same sandbox; only the task's two files are mounted | `sandbox.py` | A container escape would reach everything that account can read. Use gVisor, or a dedicated account or VM |
+| Modal node: read the answers or the other half | One read-only Modal Volume per task and kind (validation inputs, test inputs, answers, task folder); each stage's mounts are checked against an allowlist before it starts, so predict never gets answers, the scorer or the other half. Model files reach predict only through the job's own volume | `modal_backend.py` | None known |
+| Modal node: data on Modal changed after approval | `modal-sync` records what it uploaded (tree hashes as in the approval fingerprint, and every file's size and sha256); the fingerprint holds the manifest's hash; the node accepts no work while the manifest on Modal differs, or (checked hourly) a volume's files differ from it | `modal_sync.py`, `node.py` | Someone in the `bmb-eval` environment could change a file without changing its size between hourly checks |
+| Modal node: answers readable outside the node | The data lives in the restricted `bmb-eval` Modal environment; agent runs execute in `main` and can't open it (`deploy/modal/isolation_probe.py` checks) | Modal RBAC | **Members of the `bmb-eval` environment and workspace admins can read the labels. Modal (and its cloud providers) process the data as a sub-processor.** Use it for public-data tasks, or with the provider's consent |
+| Modal node: concurrent jobs on shared hosts | Each stage is its own gVisor sandbox with its own GPUs; jobs never share a container | Modal | Concurrent jobs (this node's and other Modal customers') may share a physical host: cache-timing or GPU-contention covert channels between two submissions are not closed. Set `modal.max_jobs: 1` to remove the ones between our own jobs |
+| Modal node: faking an infrastructure failure for free retries | Only Modal's own errors and a sandbox that vanished without its launcher's report count as infrastructure; a sandbox killed for memory (exit 137) is the model's `predict_resource_limit`, and a launcher that doesn't report in time is the model's timeout. A job is handed back uncounted at most twice | `modal_backend.py`, `node.py` | A model that could make its sandbox vanish gets at most two extra, unreported runs per submission |
 
 `bmb-eval selftest` runs the first half of this table as real attack bundles
 against the live sandbox. A configuration error, such as forgetting
 `--network none` or using an image with a writable root, shows up as `FAIL`
 before any private data is exposed.
+
+### What a Modal sandbox doesn't have
+
+ContainerSandbox's engine flags have no Modal equivalent. The trusted launcher
+(`modal_entry.py`, root inside the sandbox) restores most of them for the stage
+it runs as uid 65534:
+
+| Container node | Modal node |
+|---|---|
+| `--network none` | `block_network=True` |
+| gVisor optional (`runtime: runsc`) | gVisor always |
+| `--read-only` root | Not configurable. The root filesystem is writable by root, but the stage runs as uid 65534, which owns nothing, so it can write only `/tmp` (the sandbox's own disk, discarded with it) |
+| `--cap-drop ALL`, `no-new-privileges` | Not configurable for the container; the launcher's switch to uid 65534 drops every capability, and it sets `no_new_privs` |
+| `--pids-limit` | Not configurable; `RLIMIT_NPROC` on uid 65534 (which runs nothing else) |
+| `--memory` | The container's memory limit (contract + 2 GB for the launcher; a kill there is exit 137, `predict_resource_limit`), plus a data limit (CPU stages) or a watchdog on the stage's memory (GPU stages) at the contract's limit |
+| `--tmpfs /tmp` size cap | Not configurable: `/tmp` is the container's disk, as big as Modal makes it |
+| `--log-driver none` | Stage output goes to files in the sandbox and to the controller, never to Modal's logs |
+| Files bind-mounted one by one | Whole volumes, one per task and kind: validate and score also see the rest of their half's inputs folder (predict sees it anyway) |
+| Image built and pinned per release, its stamp checked | A separate image (`sandbox/modal/`), its Modal id in the approval fingerprint; the node refuses work when the image is older than its code |
 
 ## What this design does not protect
 

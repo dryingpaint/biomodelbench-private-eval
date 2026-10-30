@@ -53,7 +53,9 @@ fi
 # GPU machines with Podman: the NVIDIA toolkit's own device spec doesn't work with the
 # sandbox (an older Podman can't read it, and its hooks write into the read-only sandbox),
 # so write one that does (src/bmb_eval/gpu_spec.py). Re-run after a driver upgrade.
-if command -v nvidia-ctk >/dev/null && command -v podman >/dev/null && [ "${BMB_ENGINE:-auto}" != local ]; then
+# A Modal node's models run on Modal's GPUs, not this machine's: nothing to set up.
+if command -v nvidia-ctk >/dev/null && command -v podman >/dev/null && [ "${BMB_ENGINE:-auto}" != local ] &&
+   [ "${BMB_ENGINE:-auto}" != modal ] && ! grep -q '^ *backend: modal' "${BMB_CONFIG:-config.yaml}" 2>/dev/null; then
   say "Setting up GPU access for the sandbox"
   sudo .venv/bin/python -m bmb_eval.gpu_spec
 fi

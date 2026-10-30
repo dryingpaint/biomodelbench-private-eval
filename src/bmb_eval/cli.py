@@ -52,6 +52,21 @@ def cmd_init(args) -> None:
     if cfg_path.exists() and not args.force:
         raise SystemExit(f"{cfg_path} exists (use --force to overwrite)")
     engine = args.engine
+    if engine == "modal":
+        raw = {
+            "node_name": socket.gethostname().split(".")[0] + "-modal",
+            "service_name": "bmb-eval-modal",
+            "sandbox": {"backend": "modal"},
+            "modal": {"environment": "bmb-eval", "app": "bmb-eval-sandbox", "profile": "biomodelbench",
+                      "gpu": "H100", "max_gpus": 64, "max_jobs": 16},
+            "alerts": {"webhook_url": None, "infra_failure_threshold": 3},
+            "retain_bundles": False,
+            "tasks": {},
+        }
+        save_yaml(cfg_path, raw)
+        print(f"wrote {cfg_path}  (sandbox: Modal, environment bmb-eval; edit its modal: section, "
+              "then run `bmb-eval modal-deploy`)")
+        return
     if engine == "auto":
         engine = detect_engine()
         if engine is None:
@@ -96,6 +111,9 @@ def cmd_build_image(args) -> None:
     """Load the prebuilt sandbox image from the hub if offered, else build it."""
     cfg = _cfg(args)
     engine = cfg.backend
+    if engine == "modal":
+        print("Modal backend: its image is built on Modal by `bmb-eval modal-deploy`")
+        return
     if engine not in ENGINES:
         print("local backend: no image needed")
         return
@@ -238,7 +256,7 @@ def _selftest(cfg, task: str, verbose: bool) -> int:
         limits = a.limits
         if a.gpu_only:
             gpus = t.contract.limits_for("test", sealed=cfg.sealed).gpus
-            if not (gpus and gpus_here()):
+            if not (gpus and runner.sandbox.gpus_available()):
                 continue
             limits = {**limits, "gpus": gpus}
         if a.backends and cfg.backend not in a.backends:
@@ -276,8 +294,8 @@ def _rows(n: float, n_rows: int) -> str:
     return f"about {n:,.0f} of your {n_rows:,} rows ({n / n_rows:.1%})"
 
 
-def hardware_problems(lim, root: Path) -> list[str]:
-    out = gpu_problems(lim)
+def hardware_problems(lim, root: Path, cfg=None) -> list[str]:
+    out = gpu_problems(lim, cfg)
     if (shutil.disk_usage(root).free >> 30) < 20:
         out.append("Less than 20 GB of disk is free; models need room to download.")
     return out
@@ -299,8 +317,16 @@ def nvidia_driver() -> tuple[str, int] | None:
     return min(found, key=lambda x: x[1]) if r.returncode == 0 and found else None
 
 
-def gpu_problems(lim) -> list[str]:
+def gpu_problems(lim, cfg=None) -> list[str]:
     out = []
+    if lim.gpus and cfg is not None and cfg.backend == "modal":
+        # Modal's GPUs, not this machine's: no driver, engine or device spec here to check.
+        mem = make_sandbox(cfg).gpus_available()
+        if len(mem) < lim.gpus:
+            out.append(f"This task needs {lim.gpus} GPUs in one container; Modal gives at most {len(mem)}.")
+        elif lim.gpu_memory_gb and min(mem) < lim.gpu_memory_gb:
+            out.append(f"This task needs {lim.gpu_memory_gb} GB of GPU memory; {cfg.modal.gpu} has {min(mem)} GB.")
+        return out
     if lim.gpus:
         mem = gpus_here()
         if mem and (d := nvidia_driver()) and d[1] < MIN_NVIDIA_DRIVER:
@@ -542,15 +568,24 @@ def _connect(args, steps: SetupSteps) -> None:
         print(f"✓ Split {how}: {split_counts[0]:,} validation rows (scored during "
               f"the benchmark), {split_counts[1]:,} test rows (held out for final evaluations)")
 
+    if cfg.backend == "modal":
+        # The model runs on Modal: the data it may see goes up now, so the self-test below
+        # runs against exactly what will be approved.
+        from .modal_sync import sync
+        steps.at("modal_sync")
+        t0 = progress.step("Uploading the prepared data to this node's Modal volumes", "minutes for large data")
+        sync(cfg)
+        progress.done(t0, "Data on Modal")
+
     steps.at("hardware_check")
-    if problems := hardware_problems(cfg.tasks[task].contract.limits, root) + engine_problems(cfg.backend):
+    if problems := hardware_problems(cfg.tasks[task].contract.limits, root, cfg) + engine_problems(cfg.backend):
         print("\nThis machine isn't quite ready for this task:")
         for p in problems:
             print(f"  • {p}")
         raise SystemExit("\nPlease send this message to BioModelBench; we'll help sort it out.")
 
     final_lim = cfg.tasks[task].contract.limits_for("test")
-    for p in gpu_problems(final_lim):
+    for p in gpu_problems(final_lim, cfg):
         # Not a blocker: validation runs on CPU; GPUs are needed by the final evaluations.
         print(f"  Note: {p} Final evaluations need it; everything else runs now.")
     if note := disk_note(final_lim, root):
@@ -666,7 +701,9 @@ def cmd_update(args) -> None:
 CHECKIN_WAIT_S = 120     # the node's first hello is immediate; a black-holed connection gives up at 60 s
 # What the connecting shell may need to reach the hub, which a systemd user service wouldn't inherit.
 SERVICE_ENV = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
-               "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+               "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+               # A Modal node's credentials stay in ~/.modal.toml; these only say which profile.
+               "MODAL_PROFILE", "MODAL_CONFIG_PATH")
 
 
 def _install_service(cfg) -> tuple[bool, str]:
@@ -677,7 +714,8 @@ def _install_service(cfg) -> tuple[bool, str]:
     exe = shutil.which("bmb-eval") or f"{sys.executable} -m bmb_eval.cli"
     env = "".join(f'Environment="{k}={os.environ[k]}"\n' for k in SERVICE_ENV
                   if os.environ.get(k) and not any(c in os.environ[k] for c in '"\n'))
-    unit = Path.home() / ".config/systemd/user/bmb-eval.service"
+    name = cfg.service_name
+    unit = Path.home() / f".config/systemd/user/{name}.service"
     unit.parent.mkdir(parents=True, exist_ok=True)
     unit.write_text(f"""[Unit]
 Description=BioModelBench evaluation node
@@ -694,10 +732,10 @@ RestartSec=10
 WantedBy=default.target
 """)
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-    r = subprocess.run(["systemctl", "--user", "enable", "--now", "bmb-eval"], capture_output=True, text=True)
+    r = subprocess.run(["systemctl", "--user", "enable", "--now", name], capture_output=True, text=True)
     if r.returncode != 0:
         return False, (r.stderr or r.stdout or "").strip()
-    subprocess.run(["systemctl", "--user", "restart", "bmb-eval"], capture_output=True)
+    subprocess.run(["systemctl", "--user", "restart", name], capture_output=True)
     user = os.environ.get("USER", "")
     if subprocess.run(["loginctl", "enable-linger", user], capture_output=True).returncode != 0:
         print(f"  NOTE: so the node keeps running after you log out, run once:\n"
@@ -726,17 +764,17 @@ def _audit_events_since(cfg, offset: int) -> list[dict]:
     return out
 
 
-def _service_state() -> str:
+def _service_state(name: str = "bmb-eval") -> str:
     if not shutil.which("systemctl"):
         return "unknown"
-    r = subprocess.run(["systemctl", "--user", "is-active", "bmb-eval"], capture_output=True, text=True)
+    r = subprocess.run(["systemctl", "--user", "is-active", name], capture_output=True, text=True)
     return r.stdout.strip() or "unknown"
 
 
-def _service_log(n: int = 20) -> str:
+def _service_log(n: int = 20, name: str = "bmb-eval") -> str:
     if not shutil.which("journalctl"):
         return ""
-    r = subprocess.run(["journalctl", "--user", "-u", "bmb-eval", "-n", str(n), "--no-pager"],
+    r = subprocess.run(["journalctl", "--user", "-u", name, "-n", str(n), "--no-pager"],
                        capture_output=True, text=True)
     return r.stdout.strip()
 
@@ -775,24 +813,25 @@ def _wait_for_checkin(cfg, since: float, audit_from: int) -> tuple[str, str, str
                 "If this machine reaches the internet through a proxy, set HTTPS_PROXY in this shell "
                 "and run the same command again; the service takes the setting from here. Otherwise "
                 f"this machine needs outbound HTTPS to {(cfg.hub or {}).get('url', 'the hub')}.")
-    state = _service_state()
+    state = _service_state(cfg.service_name)
     if state != "active":
-        log = _service_log()
+        log = _service_log(name=cfg.service_name)
         return ("crashed", "service_exited",
                 f"\nThe background service isn't running (systemd says: {state})."
                 + (f" Its last log lines:\n{log}" if log else "")
                 + "\nPlease send this message to BioModelBench.")
     return ("stopped", "no_checkin",
             f"\nThe background service is running, but hasn't checked in with BioModelBench after "
-            f"{CHECKIN_WAIT_S} seconds. Its log:  journalctl --user -u bmb-eval -n 30\n"
+            f"{CHECKIN_WAIT_S} seconds. Its log:  journalctl --user -u {cfg.service_name} -n 30\n"
             "Please send it to BioModelBench.")
 
 
 def cmd_install_service(args) -> None:
-    ok, why = _install_service(_cfg(args))
+    cfg = _cfg(args)
+    ok, why = _install_service(cfg)
     if not ok:
         raise SystemExit(f"could not install a systemd user service ({why}); use `bmb-eval run`")
-    print("service installed; logs: journalctl --user -u bmb-eval -f")
+    print(f"service installed; logs: journalctl --user -u {cfg.service_name} -f")
 
 
 def cmd_run(args) -> None:
@@ -808,7 +847,7 @@ def cmd_status(args) -> None:
     cfg = _cfg(args)
     ok, n, msg = audit.verify(cfg.state_dir)
     drift = approval.diff(cfg)
-    running = subprocess.run(["systemctl", "--user", "is-active", "bmb-eval"],
+    running = subprocess.run(["systemctl", "--user", "is-active", cfg.service_name],
                              capture_output=True, text=True).stdout.strip() if shutil.which("systemctl") else "?"
     from . import release
     print(f"version     {release.describe(cfg.path.parent)}")
@@ -819,7 +858,9 @@ def cmd_status(args) -> None:
         print(f"update      task {task} has a new version ({version}) from BioModelBench: "
               "run `bmb-eval update` to review it")
     print(f"accepting   {'NO: stopped (bmb-eval resume)' if paused_path(cfg).exists() else 'NO: settings changed (bmb-eval approve)' if drift else 'yes'}")
-    print(f"sandbox     {cfg.backend}{' + gVisor' if cfg.runtime else ''}")
+    print(f"sandbox     {cfg.backend}{' + gVisor' if cfg.runtime else ''}"
+          + (f" (environment {cfg.modal.environment}, up to {cfg.modal.max_gpus} {cfg.modal.gpu}s)"
+             if cfg.backend == "modal" else ""))
     print(f"audit log   {n} entries, {msg}")
     counts = Store(cfg.state_dir).summary()
     for task in cfg.tasks:
@@ -864,6 +905,12 @@ def cmd_check(args) -> None:
     errors, warnings = [], []
     if cfg.backend == "local":
         errors.append("sandbox.backend is local: submitted code would NOT be isolated")
+    elif cfg.backend == "modal":
+        from .modal_sync import drift, verify
+        if stale := stale_image_message(cfg):
+            errors.append(stale)
+        else:
+            errors += [f"Modal: {p}" for p in verify(cfg) + drift(cfg)]
     elif (r := engine_query([cfg.backend, "info"])) is None or r.returncode != 0:
         errors.append(f"{cfg.backend} is not running" + (" (it didn't answer within a minute)" if r is None else ""))
     elif make_sandbox(cfg).image_id() == "missing":
@@ -905,6 +952,35 @@ def cmd_selftest(args) -> None:
         print(f"\n{failed} check(s) failed. Please send this output to BioModelBench.")
         sys.exit(1)
     print("\nall checks passed")
+
+
+def cmd_modal_deploy(args) -> None:
+    from .modal_backend import deploy
+    cfg = _cfg(args)
+    if cfg.backend != "modal":
+        raise SystemExit("this node's sandbox.backend isn't modal")
+    t0 = progress.step(f"Building the sandbox image on Modal (environment {cfg.modal.environment})",
+                       "a few minutes")
+    rec = deploy(cfg)
+    progress.done(t0, f"Modal image {rec['image_id']} (stamp {rec['stamp']})")
+    print("Run `bmb-eval approve` (the image id is part of what you approve).")
+
+
+def cmd_modal_sync(args) -> None:
+    from .modal_sync import drift, sync, verify
+    cfg = _cfg(args)
+    if cfg.backend != "modal":
+        raise SystemExit("this node's sandbox.backend isn't modal")
+    if not args.verify:
+        sync(cfg)
+        print("Synced. Run `bmb-eval approve` to accept the uploaded data.")
+    problems = verify(cfg) + drift(cfg)
+    for p in problems:
+        print("  ", p)
+    if args.verify and problems:
+        sys.exit(1)
+    if args.verify:
+        print("The volumes on Modal match the approved manifest.")
 
 
 def cmd_eval(args) -> None:
@@ -1020,7 +1096,7 @@ def main(argv=None) -> None:
 
     # Setup and troubleshooting
     p = sub.add_parser("init", help="(setup) write config.yaml")
-    p.add_argument("--engine", default="auto", choices=["auto", *ENGINES, "local"])
+    p.add_argument("--engine", default="auto", choices=["auto", *ENGINES, "local", "modal"])
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_init)
     p = sub.add_parser("build-image", help="(setup) get or build the sandbox image")
@@ -1034,6 +1110,11 @@ def main(argv=None) -> None:
     p = sub.add_parser("selftest", help="(troubleshoot) run attack bundles against the sandbox")
     p.add_argument("--task")
     p.set_defaults(fn=cmd_selftest)
+    sub.add_parser("modal-deploy", help="(Modal node) build the sandbox image on Modal"
+                   ).set_defaults(fn=cmd_modal_deploy)
+    p = sub.add_parser("modal-sync", help="(Modal node) upload prepared task data to Modal volumes")
+    p.add_argument("--verify", action="store_true", help="only check the volumes against the manifest")
+    p.set_defaults(fn=cmd_modal_sync)
     p = sub.add_parser("eval", help="(troubleshoot) evaluate a bundle locally")
     p.add_argument("task")
     p.add_argument("bundle")

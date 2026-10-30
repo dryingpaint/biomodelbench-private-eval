@@ -23,7 +23,7 @@ from . import alerts, audit, bundle as bundle_mod
 from .config import Config, TaskBinding
 from .contract import Contract, gate_metrics
 from .errors import PREDICTION_REASONS, EvalError
-from .sandbox import Mount, make
+from .sandbox import Mount, SandboxLost, make
 from .sandbox_entry.predict import EXIT_DEPS, EXIT_IMPORT, EXIT_MEMORY, EXIT_RUNTIME
 from .sandbox_entry.validate import EXIT_INVALID
 
@@ -79,6 +79,14 @@ class Runner:
             payload = self._payload(run_id, t, sha, STATUS_OK, metrics=metrics)
             if split != "test":
                 payload = self._ladder(payload, t.contract, submitter)
+        except SandboxLost as e:
+            # The sandbox's infrastructure failed, not the model: no result, so the node can
+            # hand the job back uncounted (node.py). Kept in the provider-only run record.
+            internal["error_internal"] = f"sandbox lost: {e}"[:2000]
+            (run_dir / "internal.json").write_text(json.dumps(internal, indent=2))
+            audit.record(self.cfg.state_dir, "run_sandbox_lost", run_id=run_id, task=task_id, split=split,
+                         submitter=submitter, bundle_sha256=sha)
+            raise
         except EvalError as e:
             internal["error_internal"] = e.internal
             payload = self._payload(run_id, t, sha, STATUS_ERROR, error=e.public())

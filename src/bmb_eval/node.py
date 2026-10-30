@@ -20,12 +20,19 @@ from .blobs import BlobCache, check_manifest
 from .config import Config
 from .errors import EvalError
 from .runner import Runner
-from .sandbox import gpus_here, stale_image_message
+from .sandbox import SandboxLost, stale_image_message
 from .store import Store
 
 POLL_S = 5
 HELLO_S = 60
 HUB_ALERT_AFTER = 60   # consecutive failed hub calls (~5 minutes) before alerting
+# A job whose sandbox infrastructure failed goes back to the hub uncounted at most this
+# many times; after that it is finished as a counted infra_error. Requeues are not
+# reported to the agent, but bounding them bounds what a model that could make its
+# own sandbox look lost (rather than fail) could signal through them.
+MAX_INFRA_REQUEUES = 2
+INFRA_BACKOFF_S = (60, 300, 900, 1800)   # no new work for this long after each lost sandbox in a row
+MODAL_VERIFY_S = 3600  # full check of a Modal node's volumes against its manifest
 
 
 class HubError(Exception):
@@ -132,13 +139,21 @@ def mem_bytes(spec: str | int) -> int:
     return int(float(s[:-1]) * units[s[-1]]) if s and s[-1] in units else int(float(s or 0))
 
 
-def machine_capacity() -> tuple[float, int, int]:
-    """This machine's CPUs, memory (bytes) and GPUs."""
+def machine_capacity(cfg: Config | None = None, sandbox=None) -> tuple[float, int, int]:
+    """CPUs, memory (bytes) and GPUs this node's jobs share: this machine's, or for a
+    Modal node, the GPU budget in its config (CPUs and memory come with each container)."""
+    if cfg is not None and cfg.backend == "modal":
+        return float("inf"), 1 << 62, int(cfg.modal.max_gpus)
     try:
         mem = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (ValueError, OSError, AttributeError):
         mem = 0
-    return float(os.cpu_count() or 1), int(mem), len(gpus_here())
+    if sandbox is None:
+        from .sandbox import gpus_here
+        gpus = gpus_here()
+    else:
+        gpus = sandbox.gpus_available()
+    return float(os.cpu_count() or 1), int(mem), len(gpus)
 
 
 def paused_path(cfg: Config):
@@ -183,7 +198,10 @@ class Worker:
         # Evaluations in flight (max_parallel > 1): sid -> (thread, cpus, memory bytes, gpus).
         self._jobs: dict[str, tuple[threading.Thread, float, int, int]] = {}
         self.parallel = 1 if cfg.sealed else cfg.max_parallel
-        self.capacity = machine_capacity()
+        self.capacity = machine_capacity(cfg, self.runner.sandbox)
+        self._modal_verified = 0.0
+        self._infra_pause_until = 0.0     # after a lost sandbox: don't take new work until then
+        self._modal_alerted: str | None = None
 
     # ------------------------------------------------------------- gates
 
@@ -202,12 +220,32 @@ class Worker:
             return False
         self._stale_alerted = False
         drift = approval.diff(self.cfg)
+        if not drift and self.cfg.backend == "modal" and (why := self._modal_drift()):
+            # The data on Modal must be what was approved. A local config that drifts gets
+            # the usual alert below; data drift on Modal gets its own.
+            if self._modal_alerted != why[0]:
+                audit.record(self.cfg.state_dir, "modal_drift", problems=why[:5])
+                alerts.send(self.cfg, "config", "the task data on Modal differs from what you approved; "
+                            "no new work until it matches", first=why[0][:200])
+                self._modal_alerted = why[0]
+            self._accepting = (time.time(), False)
+            return False
+        self._modal_alerted = None
         self._accepting = (time.time(), not drift)
         if drift and not self._unapproved_alerted:
             alerts.send(self.cfg, "config", "configuration differs from what you approved; "
                         "no new work until you run `bmb-eval approve`", changes=len(drift))
         self._unapproved_alerted = bool(drift)
         return not drift
+
+    def _modal_drift(self) -> list[str]:
+        from . import modal_sync
+        out = modal_sync.drift(self.cfg)
+        if not out and time.time() - self._modal_verified > MODAL_VERIFY_S:
+            out = modal_sync.verify(self.cfg)
+            if not out:
+                self._modal_verified = time.time()
+        return out
 
     # -------------------------------------------------------------- loop
 
@@ -259,7 +297,7 @@ class Worker:
         if local:
             self._dispatch(*local, self._need(local[0], local[1]))
             return True
-        if not accepting:
+        if not accepting or time.time() < self._infra_pause_until:
             return did
         job = self.api.next()
         if job:
@@ -291,6 +329,9 @@ class Worker:
         if not self._jobs:
             return True              # always run one job, whatever this machine is
         c, m, g = self._free()
+        if self.cfg.backend == "modal":
+            # Each job gets its own containers with exactly its GPUs: they share the budget.
+            return need[2] <= g
         gpu_busy = any(j[3] for j in self._jobs.values())
         # The sandbox gives a GPU job every GPU, so GPU jobs never share.
         return need[0] <= c and need[1] <= m and (not need[2] or (not gpu_busy and need[2] <= g))
@@ -354,6 +395,15 @@ class Worker:
         return len(lost)
 
     def run_forever(self) -> None:
+        if self.cfg.backend == "modal":
+            # Sandboxes and job volumes of a previous run of this node are orphans now.
+            from .modal_backend import cleanup_jobs
+            try:
+                killed = self.runner.sandbox.kill_all()
+                volumes = cleanup_jobs(self.cfg)
+                audit.record(self.cfg.state_dir, "modal_cleanup", sandboxes=killed, volumes=volumes)
+            except Exception as e:
+                audit.record(self.cfg.state_dir, "modal_cleanup_failed", error=type(e).__name__)
         self.drop_lost_jobs()
         n = self.store.requeue_running()
         audit.record(self.cfg.state_dir, "node_start", requeued=n)
@@ -407,7 +457,7 @@ class Worker:
             # provider approved (leakage counts both). A node on code from before kinds
             # ignores the field and counts every final against final_evaluations.
             refusal = EvalError("final_quota_exceeded")
-        elif split == "test" and lim.gpus and len(gpus_here()) < lim.gpus:
+        elif split == "test" and lim.gpus and len(self.runner.sandbox.gpus_available()) < lim.gpus:
             # Refused before it counts, so the final can run once GPUs are added.
             refusal = EvalError("final_hardware_missing")
         elif split == "validation" and (
@@ -460,8 +510,35 @@ class Worker:
             finally:
                 if not self.cfg.retain_bundles:
                     shutil.rmtree(bundle, ignore_errors=True)
+        except SandboxLost as e:
+            if self._requeue_lost(sid, task, e):
+                return
+            result = {"run_id": sid, "status": "error", "error": EvalError("infra_error").public()}
         except Exception as e:
             audit.record(self.cfg.state_dir, "worker_error", run_id=sid, error=type(e).__name__)
             result = {"run_id": sid, "status": "error", "error": EvalError("infra_error").public()}
         self.store.finish(sid, result)
         path.unlink(missing_ok=True)
+        if result.get("status") == "ok" or (result.get("error") or {}).get("code") != "infra_error":
+            self.store.bump("consecutive_sandbox_lost", reset=True)
+
+    def _requeue_lost(self, sid: str, task: str, e: SandboxLost) -> bool:
+        """The sandbox infrastructure failed (after the backend's retries): hand the job back
+        to the hub without counting it against the agent, like a job a restart lost. True if
+        it was handed back; False once this job has used up its requeues."""
+        n = self.store.bump(f"infra_requeues:{sid}")
+        lost = self.store.bump("consecutive_sandbox_lost")
+        # Modal is failing: stop taking work for a while rather than burn the job's requeues.
+        self._infra_pause_until = time.time() + INFRA_BACKOFF_S[min(lost, len(INFRA_BACKOFF_S)) - 1]
+        if lost == self.cfg.infra_failure_threshold:
+            alerts.send(self.cfg, "infra", f"{lost} evaluations in a row lost to sandbox infrastructure "
+                        "failures (Modal); jobs go back to the hub uncounted", last_run_id=sid, task=task)
+        if n > MAX_INFRA_REQUEUES:
+            audit.record(self.cfg.state_dir, "job_infra_failed", run_id=sid, task=task, requeues=n - 1)
+            return False
+        self.store.forget(sid)
+        (self.queue_dir / f"{sid}.json").unlink(missing_ok=True)
+        audit.record(self.cfg.state_dir, "job_requeued_infra", run_id=sid, task=task, attempt=n,
+                     error=str(e)[:300])
+        self._last_hello = 0.0        # tell the hub on the next step, so it hands the job out again
+        return True

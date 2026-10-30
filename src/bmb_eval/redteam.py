@@ -84,11 +84,38 @@ ATTACKS = [
         def _gpu_driver_mount(target, opts):
             # Podman's GPU spec mounts the host's driver files at their system paths: read-only
             # NVIDIA/CUDA libraries, tools and firmware. Anything else there is still an escape.
+            # Modal's GPU containers mount NVIDIA's Vulkan/EGL vendor files the same way.
             name = os.path.basename(target)
             return ("ro" in opts.split(",")
                     and target.startswith(("/usr/lib/", "/usr/lib64/", "/lib/", "/lib64/", "/usr/bin/",
-                                           "/etc/OpenCL/vendors/"))
-                    and (name.startswith(("libcuda", "libnvidia", "nvidia")) or "/firmware/nvidia/" in target))
+                                           "/etc/OpenCL/vendors/", "/etc/vulkan/icd.d/",
+                                           "/usr/share/glvnd/egl_vendor.d/",
+                                           "/usr/share/egl/egl_external_platform.d/"))
+                    and (name.startswith(("libcuda", "libnvidia", "nvidia")) or "/firmware/nvidia/" in target
+                         or (name.endswith(".json") and "nvidia" in name)))
+
+        def _modal_volumes(inputs_dir):
+            # Modal: every volume of the sandbox is under /__modal/volumes, reached through a
+            # symlink at its mount path. Each must be one this stage was given: the bundle,
+            # the inputs, or a shared file linked from the inputs.
+            root = "/__modal/volumes"
+            if not os.path.isdir(root):
+                return []
+            given = {os.path.realpath(os.environ["BMB_BUNDLE"]), inputs_dir}
+            for d in (os.environ.get("BMB_INPUTS_DIR"), os.path.dirname(_inputs_path())):
+                for base, dirs, files in os.walk(d or "/nonexistent"):
+                    for n in dirs + files:
+                        p = os.path.join(base, n)
+                        if os.path.islink(p):
+                            given.add(os.path.realpath(p))
+                    if base.count(os.sep) > 8:
+                        break
+            hits = []
+            for v in os.listdir(root):
+                path = os.path.join(root, v)
+                if not any(g == path or g.startswith(path + os.sep) for g in given):
+                    hits.append(f"volume:{v}")
+            return hits
 
         def load_model():
             hits = [k for k in os.environ if "ANSWER" in k.upper() or "TOKEN" in k.upper()]
@@ -106,9 +133,13 @@ ATTACKS = [
                     if (fstype in private or target == "/" or target.startswith(ALLOWED)
                             or _gpu_driver_mount(target, fields[5])):
                         continue
+                    if target.startswith("/__modal/"):   # Modal's runtime; its volumes: below
+                        continue
                     hits.append(f"mount:{target} ({fstype})")
-            # 2. Data files outside the inputs and the image's own libraries.
-            inputs_dir = os.path.realpath(os.path.dirname(_inputs_path()))
+            # 2. Data files outside the inputs and the image's own libraries. (The real
+            #    folder of the samples table: on Modal the inputs are behind symlinks.)
+            inputs_dir = os.path.dirname(os.path.realpath(_inputs_path()))
+            hits += _modal_volumes(inputs_dir)
             skip = (inputs_dir + os.sep, sys.prefix + os.sep, "/usr/")
             t0, seen = time.time(), 0
             for root, dirs, files in os.walk("/"):

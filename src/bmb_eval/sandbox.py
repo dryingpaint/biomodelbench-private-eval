@@ -22,6 +22,9 @@ filesystem (system files read-only plus exactly the mounted files), private
 /tmp, process and file limits. Mounted files are made readable to the
 sandbox user only for the stage that mounts them.
 
+ModalSandbox (modal_backend.py) runs each stage in a Modal Sandbox on Modal's
+GPUs, with the task's data on read-only Modal Volumes.
+
 LocalSandbox runs the same entrypoints as plain subprocesses. It is NOT
 isolated and exists for tests and for agents dry-running bundles on
 synthetic data.
@@ -48,6 +51,12 @@ class Mount:
     env: str           # env var the entrypoint reads the path from
     host: Path
     container: str
+
+
+class SandboxLost(Exception):
+    """The sandbox's infrastructure failed (Modal: API errors or a sandbox that vanished
+    without its result), after the backend's own retries. Never raised for anything the
+    model did. The node hands the job back to the hub without counting it."""
 
 
 @dataclass
@@ -87,6 +96,9 @@ def sandbox_stamp(root: Path) -> str | None:
 
 def stale_image_message(cfg) -> str | None:
     """Why this node's container image can't run its code, or None."""
+    if cfg.backend == "modal":
+        from .modal_backend import stale_message
+        return stale_message(cfg)
     if cfg.backend not in ENGINES:
         return None
     root = next((d for d in Path(__file__).resolve().parents if (d / "sandbox" / "Dockerfile").is_file()), None)
@@ -214,6 +226,10 @@ class ContainerSandbox:
             subprocess.run([self.engine, "kill", *ids], capture_output=True)
         return len(ids)
 
+    def gpus_available(self) -> list[int]:
+        """Memory (GB) of each GPU a job could be given."""
+        return gpus_here()
+
     def image_label(self, key: str) -> str | None:
         try:
             r = subprocess.run([self.engine, "image", "inspect", "-f",
@@ -250,6 +266,9 @@ class LocalSandbox:
 
     def kill_all(self) -> int:
         return 0
+
+    def gpus_available(self) -> list[int]:
+        return gpus_here()
 
     def image_id(self) -> str:
         return "local-unisolated"
@@ -388,6 +407,9 @@ class BwrapSandbox:
         return int(subprocess.run(["pkill", "-KILL", "-u", str(SANDBOX_UID)],
                                   capture_output=True).returncode == 0)
 
+    def gpus_available(self) -> list[int]:
+        return gpus_here()
+
     def image_id(self) -> str:
         return self._image_id
 
@@ -500,7 +522,11 @@ def _run(cmd: list[str], timeout_s: int, stdout_cap: int, stdin: bytes,
     )
 
 
-def make(cfg) -> ContainerSandbox | BwrapSandbox | LocalSandbox:
+def make(cfg):
+    """The sandbox backend this node's config names."""
+    if cfg.backend == "modal":
+        from .modal_backend import ModalSandbox
+        return ModalSandbox(cfg)
     if cfg.backend in ENGINES:
         return ContainerSandbox(cfg.backend, cfg.image, cfg.runtime)
     if cfg.backend == "bwrap":

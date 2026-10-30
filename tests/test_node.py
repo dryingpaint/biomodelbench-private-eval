@@ -1326,7 +1326,7 @@ def test_final_candidate_skips_validation_and_runs_under_final_limits(hub, node_
 
 
 def test_final_refused_until_the_gpus_are_there(hub, node_dir, provider_files, tmp_path, monkeypatch):
-    from bmb_eval import node as node_mod
+    from bmb_eval import sandbox as sandbox_mod
     store, url = hub
     data, _ = provider_files
     code, _ = store.add_enrollment(_split_task(tmp_path, name="gpu_final", final_limits="gpus: 2"))
@@ -1336,7 +1336,7 @@ def test_final_refused_until_the_gpus_are_there(hub, node_dir, provider_files, t
     w = Worker(cfg)
     w.drain()
     assert agent.status(sid)["result"]["status"] == "ok"
-    monkeypatch.setattr(node_mod, "gpus_here", lambda: [80])
+    monkeypatch.setattr(sandbox_mod, "gpus_here", lambda: [80])
     fid = store.request_final(sid)
     w.drain()
     r = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
@@ -1789,7 +1789,7 @@ def test_connect_reports_a_node_that_never_checks_in(hub, node_dir, provider_fil
     data, task_dir = provider_files
     code, _ = store.add_enrollment(task_dir)
     monkeypatch.setattr(cli, "CHECKIN_WAIT_S", 1)
-    monkeypatch.setattr(cli, "_service_state", lambda: "active")
+    monkeypatch.setattr(cli, "_service_state", lambda name="bmb-eval": "active")
     # The service "started" but nothing ever reached the hub.
     _fake_service(monkeypatch)
     with pytest.raises(SystemExit) as e:
@@ -1810,8 +1810,8 @@ def test_connect_reports_a_node_that_never_checks_in(hub, node_dir, provider_fil
     assert _reports(store)[-1] == ("start_service", "tls", "certificate")
     # The service kept dying.
     _fake_service(monkeypatch)
-    monkeypatch.setattr(cli, "_service_state", lambda: "failed")
-    monkeypatch.setattr(cli, "_service_log", lambda n=20: "Traceback: boom")
+    monkeypatch.setattr(cli, "_service_state", lambda name="bmb-eval": "failed")
+    monkeypatch.setattr(cli, "_service_log", lambda n=20, name="bmb-eval": "Traceback: boom")
     with pytest.raises(SystemExit) as e:
         _connect_with_service(node_dir, url, code, data)
     assert "isn't running" in str(e.value) and "boom" in str(e.value)

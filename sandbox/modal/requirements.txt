@@ -1,0 +1,29 @@
+# Packages of the Modal backend's sandbox image (sandbox/modal/Dockerfile): what
+# sandbox/requirements.txt gives every node, plus what the genomic tasks need, on the
+# Python and PyTorch the genomic suite was built with (3.11, torch 2.5.1 + CUDA 12.4).
+# A separate image so the container nodes' image and stamp stay as they are.
+# After editing: sandbox/modal/lock.sh, then commit both files and run `bmb-eval modal-deploy`.
+numpy>=1.26,<2.2
+pandas>=2
+pyarrow>=14
+scipy>=1.11
+scikit-learn>=1.4
+pyyaml>=6
+torch==2.5.1          # the standard Linux wheel: CUDA 12.4 libraries included
+transformers==4.46.3
+safetensors>=0.4
+accelerate>=0.33
+peft>=0.12
+einops>=0.8
+anndata>=0.10
+pillow>=10
+rdkit>=2024.9
+lightgbm>=4.3
+xgboost>=2.0
+# genomics
+pyfaidx>=0.8
+pysam>=0.22
+pyBigWig>=0.3.22
+biopython>=1.84
+tqdm>=4.66
+pip>=24               # offline installs of a bundle's own wheels

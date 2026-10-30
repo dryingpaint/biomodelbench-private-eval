@@ -64,6 +64,10 @@ def test_selftest_accepts_readonly_driver_mounts_and_nothing_else():
     assert ok("/usr/bin/nvidia-smi", "ro,nosuid")
     assert ok("/usr/lib/firmware/nvidia/580.1/gsp_ga10x.bin", "ro")
     assert ok("/etc/OpenCL/vendors/nvidia.icd", "ro")
+    assert ok("/etc/vulkan/icd.d/nvidia_icd.json", "ro,nosuid,noexec")              # Modal's GPU containers
+    assert ok("/usr/share/glvnd/egl_vendor.d/10_nvidia.json", "ro,nosuid,noexec")
+    assert not ok("/etc/vulkan/icd.d/nvidia_icd.json", "rw,nosuid")
+    assert not ok("/usr/share/glvnd/egl_vendor.d/answers.json", "ro")
     assert not ok(f"{LIB}/libcuda.so.1", "rw,nosuid")             # writable: an escape
     assert not ok("/data/answers.parquet", "ro")                  # not a driver file
     assert not ok(f"{LIB}/libssl.so.3", "ro")

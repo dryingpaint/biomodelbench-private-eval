@@ -53,7 +53,8 @@ def _tree_hash(d: Path) -> str:
     return h.hexdigest()
 
 
-def fingerprint(cfg: Config) -> dict:
+def fingerprint_tasks(cfg: Config) -> dict:
+    """Each task's contract, scorer and data hashes (also what a Modal node's MANIFEST records)."""
     tasks = {}
     for tid, t in sorted(cfg.tasks.items()):
         tasks[tid] = {
@@ -65,14 +66,20 @@ def fingerprint(cfg: Config) -> dict:
             "inputs": _file_hash(t.inputs) if t.inputs.exists() else "missing",
             "answers": _file_hash(t.answers) if t.answers.exists() else "missing",
         }
+    return tasks
+
+
+def fingerprint(cfg: Config) -> dict:
+    sb = {"backend": cfg.backend, "image_id": sandbox.make(cfg).image_id(), "runtime": cfg.runtime}
+    if cfg.backend == "modal":
+        # Where the data lives, and exactly what was uploaded there (modal_sync's manifest).
+        from .modal_sync import local_manifest_hash
+        sb["modal"] = {"environment": cfg.modal.environment, "app": cfg.modal.app,
+                       "manifest": local_manifest_hash(cfg)}
     return {
         "node_code": _dir_hash(PKG, "*.py"),
-        "sandbox": {
-            "backend": cfg.backend,
-            "image_id": sandbox.make(cfg).image_id(),
-            "runtime": cfg.runtime,
-        },
-        "tasks": tasks,
+        "sandbox": sb,
+        "tasks": fingerprint_tasks(cfg),
     }
 
 

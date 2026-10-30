@@ -254,6 +254,13 @@ class HubStore:
                                  ("submissions", "kind", "TEXT NOT NULL DEFAULT 'agent'")]:
             if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        # Each submission row carries its bundle's manifest (up to a few MB), and the columns
+        # added above sit after it: without indexes, every status poll and job hand-out read
+        # every manifest (5,708 rows, 425 MB on 2026-10-30) under the store's one lock.
+        for name, cols in [("group", "group_id, split"), ("agent", "agent, split"),
+                           ("queue", "status, created"), ("node", "node_id, status"),
+                           ("task", "task, status")]:
+            self.db.execute(f"CREATE INDEX IF NOT EXISTS submissions_{name} ON submissions ({cols})")
         self.db.commit()
         self.lock = threading.Lock()
 

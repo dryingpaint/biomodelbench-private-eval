@@ -31,6 +31,7 @@ REPO = Path(__file__).resolve().parents[1]
 def fm(tmp_path, monkeypatch):
     monkeypatch.setattr(modal_backend, "EXIT_POLLS", 1)
     monkeypatch.setattr(modal_backend, "RETRY_BACKOFF_S", (0,))
+    monkeypatch.setattr(modal_sync, "LIST_BACKOFF_S", 0.0)
     return fake_modal.install(monkeypatch, tmp_path / "modal")
 
 
@@ -241,12 +242,12 @@ def test_manifest_drift_stops_accepting(modal_connected):
     m = json.loads(meta.read_text())
     m["tasks"]["split_task"]["answers"] = "0" * 64
     meta.write_text(json.dumps(m))
-    w._accepting = (0.0, False)
+    w._accepting, w._modal_next_check = (0.0, False), 0.0
     assert not w.accepting()
     assert modal_sync.drift(cfg)
     # Restored by a sync of the approved data.
     modal_sync.sync(cfg, say=lambda *a: None)
-    w._accepting = (0.0, False)
+    w._accepting, w._modal_next_check = (0.0, False), 0.0
     assert w.accepting()
 
 
@@ -255,7 +256,7 @@ def test_volume_changed_behind_the_manifest_is_found(modal_connected):
     assert modal_sync.verify(cfg) == []
     ans = fm.volume_dir("bmb-eval", modal_backend.vol_name(cfg.modal.volume_prefix, "split_task", "ans"))
     (ans / "extra.csv").write_text("x")
-    assert any("1 unexpected" in p for p in modal_sync.verify(cfg))
+    assert any("1 unexpected" in p for p in modal_sync.verify(cfg, max_age_s=0))
     w = Worker(cfg)
     assert not w.accepting()
 
@@ -383,3 +384,108 @@ def test_second_node_has_its_own_service_unit(modal_connected, tmp_path, monkeyp
     assert f"--config {cfg.path} run" in unit and 'Environment="MODAL_PROFILE=biomodelbench"' in unit
     assert ["systemctl", "--user", "enable", "--now", "bmb-eval-modal"] in calls
     assert not (tmp_path / "home" / ".config/systemd/user/bmb-eval.service").exists()
+
+
+# ------------------------------------------- Modal's rate limits aren't drift
+
+def _events(cfg, name):
+    return [e for e in (json.loads(x) for x in (cfg.state_dir / "audit.jsonl").read_text().splitlines())
+            if e["event"] == name]
+
+
+def _due(w):
+    """Let the cached accepting answer and the check schedule expire."""
+    w._accepting, w._modal_next_check = (0.0, False), 0.0
+
+
+def test_rate_limits_keep_the_last_good_check_and_back_off(modal_connected):
+    cfg, *_, fm = modal_connected
+    w = Worker(cfg)
+    assert w.accepting()                                   # a full, successful check
+    fm.rate_limit = 10 ** 6                                # Modal says ResourceExhausted to everything
+    w._modal_verified = 0.0                                # the hourly volume check is due too
+    _due(w)
+    assert w.accepting()                                   # couldn't check: the last answer stands
+    assert not _events(cfg, "modal_drift") and len(_events(cfg, "modal_check_failed")) == 1
+    assert w._modal_next_check - time.time() >= 60 * 0.75  # backs off rather than retrying at once
+    calls = fm.api_calls
+    for _ in range(5):                                     # the node loop asks again and again
+        w._accepting = (0.0, False)
+        assert w.accepting()
+    assert fm.api_calls == calls                           # without asking Modal before the back-off ends
+    _due(w)
+    w.accepting()
+    first, second = w._modal_check_failures, w._modal_next_check - time.time()
+    assert first == 2 and second >= 120 * 0.75             # longer each time
+    fm.rate_limit = 0                                      # Modal answers again
+    _due(w)
+    assert w.accepting() and w._modal_check_failures == 0
+    assert _events(cfg, "modal_check_recovered") and not _events(cfg, "modal_drift")
+    assert w._modal_next_check - time.time() > 200         # then the regular interval
+    calls = fm.api_calls
+    w._accepting = (0.0, False)
+    assert w.accepting() and fm.api_calls == calls
+
+
+def test_no_check_yet_means_no_work_but_no_drift(modal_connected):
+    cfg, *_, fm = modal_connected
+    fm.rate_limit = 10 ** 6
+    w = Worker(cfg)
+    assert not w.accepting()                               # never checked: don't run anything
+    assert not _events(cfg, "modal_drift")
+    fm.rate_limit = 0
+    _due(w)
+    assert w.accepting()
+
+
+def test_rate_limited_listings_are_retried_and_paced(modal_connected, monkeypatch):
+    cfg, *_, fm = modal_connected
+    seen, peak, lock = [0], [0], threading.Lock()
+    real = fake_modal.FakeVolume.listdir
+
+    def counting(self, path, recursive=False):
+        with lock:
+            seen[0] += 1
+            peak[0] = max(peak[0], seen[0])
+        try:
+            time.sleep(0.02)
+            return real(self, path, recursive)
+        finally:
+            with lock:
+                seen[0] -= 1
+    monkeypatch.setattr(fake_modal.FakeVolume, "listdir", counting)
+    fm.rate_limit = 5                                      # a burst of rate limits, then answers
+    assert modal_sync.verify(cfg, max_age_s=0) == []
+    assert fm.rate_limit == 0 and peak[0] <= modal_sync.LIST_CONCURRENCY
+
+
+def test_a_cut_short_verification_resumes_and_real_drift_still_counts(modal_connected, monkeypatch):
+    cfg, *_, fm = modal_connected
+    monkeypatch.setattr(modal_sync, "LIST_TRIES", 1)
+    monkeypatch.setattr(modal_sync, "LIST_CONCURRENCY", 1)
+    vols = json.loads((modal_backend.modal_dir(cfg) / "MANIFEST.json").read_text())["volumes"]
+    fm.rate_limit = 2                                      # the first two listings fail
+    with pytest.raises(modal_sync.ModalCheckError):
+        modal_sync.verify(cfg, max_age_s=0)
+    calls = fm.api_calls
+    assert modal_sync.verify(cfg) == []                    # only the two that failed are listed again
+    assert fm.api_calls - calls == 2 < len(vols)
+    # A listing that answers and differs is drift, even when others couldn't be listed
+    # (here the first volume, -ans, is rate-limited; -val has changed).
+    val = fm.volume_dir("bmb-eval", modal_backend.vol_name(cfg.modal.volume_prefix, "split_task", "val"))
+    (val / "extra.csv").write_text("x")
+    fm.rate_limit = 1
+    problems = modal_sync.verify(cfg, max_age_s=0)
+    assert problems == [f"{modal_backend.vol_name(cfg.modal.volume_prefix, 'split_task', 'val')}: "
+                        "1 unexpected, 0 missing, 0 changed file(s)"]
+    w = Worker(cfg)
+    fm.rate_limit = 0
+    assert not w.accepting() and _events(cfg, "modal_drift")
+
+
+def test_modal_sync_verify_reports_couldnt_check_not_drift(modal_connected, capsys):
+    cfg, *_, fm = modal_connected
+    fm.rate_limit = 10 ** 6
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--config", str(cfg.path), "modal-sync", "--verify"])
+    assert e.value.code == 2 and "Couldn't check" in capsys.readouterr().out

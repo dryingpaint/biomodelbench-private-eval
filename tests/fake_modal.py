@@ -38,6 +38,10 @@ class NotFoundError(Error):
     pass
 
 
+class ResourceExhaustedError(Error):
+    pass
+
+
 class FakeModal:
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -45,10 +49,13 @@ class FakeModal:
         self.sandboxes: list[FakeSandbox] = []
         self.fail_creates = 0
         self.lose_execs = 0
+        self.rate_limit = 0        # that many volume listings/reads raise ResourceExhaustedError
+        self.api_calls = 0         # volume listings/reads made
         self._ids = itertools.count()
         self._lock = threading.Lock()
         fm = self
-        self.exception = SimpleNamespace(Error=Error, NotFoundError=NotFoundError)
+        self.exception = SimpleNamespace(Error=Error, NotFoundError=NotFoundError,
+                                         ResourceExhaustedError=ResourceExhaustedError)
         self.App = SimpleNamespace(lookup=lambda name, create_if_missing=False, environment_name=None:
                                    SimpleNamespace(app_id=f"ap-{environment_name}-{name}", name=name))
         self.Image = SimpleNamespace(
@@ -131,6 +138,11 @@ class FakeVolume:
         return self
 
     def _need(self):
+        with self.fm._lock:
+            self.fm.api_calls += 1
+            if self.fm.rate_limit:
+                self.fm.rate_limit -= 1
+                raise ResourceExhaustedError("fake: rate limit exceeded")
         if not self.dir.exists():
             raise NotFoundError(self.name)
 

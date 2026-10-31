@@ -59,6 +59,16 @@ WATCHDOG_GRACE_S = 120           # the launcher enforces the stage timeout; this
 OOM_CODE = 137                   # what Modal reports for a sandbox killed for memory
 EXIT_POLLS = 20                  # polls (0.5 s apart) for a vanished sandbox's exit code
 RETRY_BACKOFF_S = (2, 6, 18, 30)  # between attempts of a stage after a Modal failure
+# Modal has no GPU (or container) free for this workspace: the stage waits for one, polling,
+# rather than failing. Without the wait, a node allowed to run every queued job at once
+# turned capacity refusals into hand-backs, half-hour pauses and, on a third, a counted
+# infra_error (2026-10-31).
+CAPACITY_WAIT_S = 6 * 3600
+CAPACITY_POLL_S = (15, 30, 60, 120)
+
+
+def _no_capacity(e: Exception) -> bool:
+    return "Insufficient capacity" in str(e)
 MODAL_IMAGE_FILES = ("sandbox/modal/Dockerfile", "sandbox/modal/requirements.lock")
 
 
@@ -313,23 +323,34 @@ class ModalSandbox:
         t0 = time.time()
         job_vol = None
         errors = []
+        attempt = waits = 0
         try:
-            for attempt in range(1 + max(0, self.s.retries)):
+            while True:
                 try:
                     if plan.bundle is not None and job_vol is None:
                         job_vol = self._stage_bundle(plan.bundle, name)
                     r = self._attempt(plan, job_vol, entry, env, limits, timeout_s, stdout_cap, stdin, gpus)
+                    if waits:
+                        audit.record(self.cfg.state_dir, "modal_capacity_ready", stage=name,
+                                     waited_s=round(time.time() - t0))
                     r.seconds = round(time.time() - t0, 2)
                     return r
                 except PermissionError:
                     raise
                 except Exception as e:       # Modal's errors, connection failures, a lost sandbox
+                    if _no_capacity(e) and time.time() - t0 < CAPACITY_WAIT_S:
+                        if not waits:
+                            audit.record(self.cfg.state_dir, "modal_capacity_wait", stage=name, gpus=gpus)
+                        time.sleep(CAPACITY_POLL_S[min(waits, len(CAPACITY_POLL_S) - 1)])
+                        waits += 1
+                        continue
                     errors.append(f"{type(e).__name__}: {str(e)[:200]}")
                     audit.record(self.cfg.state_dir, "modal_infra_failure", stage=name, attempt=attempt + 1,
                                  error=type(e).__name__)
-                    if attempt < self.s.retries:
-                        time.sleep(RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)])
-            raise SandboxLost(f"{name}: " + " | ".join(errors))
+                    if attempt >= self.s.retries:
+                        raise SandboxLost(f"{name}: " + " | ".join(errors))
+                    time.sleep(RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)])
+                    attempt += 1
         finally:
             if job_vol is not None:
                 self._delete_volume(job_vol)

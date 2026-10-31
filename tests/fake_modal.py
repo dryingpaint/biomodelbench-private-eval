@@ -48,6 +48,7 @@ class FakeModal:
         self.created: list[dict] = []
         self.sandboxes: list[FakeSandbox] = []
         self.fail_creates = 0
+        self.no_capacity = 0       # that many Sandbox.create calls find no GPU free (Modal's message)
         self.lose_execs = 0
         self.rate_limit = 0        # that many volume listings/reads raise ResourceExhaustedError
         self.api_calls = 0         # volume listings/reads made
@@ -85,6 +86,9 @@ class FakeModal:
     def _create(self, *cmd, app=None, image=None, volumes=None, gpu=None, cpu=None, memory=None,
                 timeout=None, block_network=False, tags=None, **kw):
         with self._lock:
+            if self.no_capacity:
+                self.no_capacity -= 1
+                raise ResourceExhaustedError("Insufficient capacity to create sandbox.")
             if self.fail_creates:
                 self.fail_creates -= 1
                 raise Error("fake: no capacity")

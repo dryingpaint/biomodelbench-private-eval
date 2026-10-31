@@ -188,6 +188,19 @@ def test_no_capacity_waits_instead_of_failing(modal_connected, monkeypatch):
     assert "modal_infra_failure" not in events
 
 
+def test_rate_limited_staging_waits_instead_of_failing(modal_connected, monkeypatch):
+    """Modal asking us to slow down (volume listings while staging a bundle) is waited
+    out like missing capacity, not spent as retries."""
+    from bmb_eval import modal_backend
+    monkeypatch.setattr(modal_backend, "CAPACITY_POLL_S", (0.01,))
+    cfg, *_, fm = modal_connected
+    fm.rate_limit = 5                                              # more than the 2 retries
+    p = Runner(cfg, send_alerts=False).evaluate("split_task", pack_dir(EXAMPLE_BUNDLE))
+    assert p["status"] == "ok"
+    events = [json.loads(line)["event"] for line in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert "modal_capacity_wait" in events and "modal_infra_failure" not in events
+
+
 def test_lost_sandbox_after_retries_raises(modal_connected):
     cfg, *_, fm = modal_connected
     fm.lose_execs = 3                                              # gone, no exit code, every try

@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -65,10 +66,15 @@ RETRY_BACKOFF_S = (2, 6, 18, 30)  # between attempts of a stage after a Modal fa
 # infra_error (2026-10-31).
 CAPACITY_WAIT_S = 6 * 3600
 CAPACITY_POLL_S = (15, 30, 60, 120)
+# Bundles staged at once. Staging lists and polls volumes, and Modal rate-limits that API:
+# 117 jobs staging together failed with "VolumeListFiles rate limit exceeded" (2026-10-31).
+# Only staging waits its turn; staged jobs all run at once.
+STAGE_CONCURRENCY = 8
 
 
-def _no_capacity(e: Exception) -> bool:
-    return "Insufficient capacity" in str(e)
+def _must_wait(e: Exception) -> bool:
+    """Modal has no capacity free, or asks us to slow down: wait, don't fail the stage."""
+    return "Insufficient capacity" in str(e) or "rate limit exceeded" in str(e)
 MODAL_IMAGE_FILES = ("sandbox/modal/Dockerfile", "sandbox/modal/requirements.lock")
 
 
@@ -220,6 +226,8 @@ class ModalSandbox:
         self._app = None
         self._image = None
         self._lock = threading.Lock()
+        self._stage_slots = threading.Semaphore(STAGE_CONCURRENCY)
+        self._blobs_known: dict[str, int] = {}     # sha -> size, on the shared blobs volume
 
     # Modal handles, made on first use (the node can start, and be approved, offline).
     @property
@@ -338,10 +346,13 @@ class ModalSandbox:
                 except PermissionError:
                     raise
                 except Exception as e:       # Modal's errors, connection failures, a lost sandbox
-                    if _no_capacity(e) and time.time() - t0 < CAPACITY_WAIT_S:
+                    if _must_wait(e) and time.time() - t0 < CAPACITY_WAIT_S:
                         if not waits:
-                            audit.record(self.cfg.state_dir, "modal_capacity_wait", stage=name, gpus=gpus)
-                        time.sleep(CAPACITY_POLL_S[min(waits, len(CAPACITY_POLL_S) - 1)])
+                            audit.record(self.cfg.state_dir, "modal_capacity_wait", stage=name, gpus=gpus,
+                                         reason=str(e)[:120])
+                        # Jittered, so jobs refused together don't all ask again together.
+                        time.sleep(CAPACITY_POLL_S[min(waits, len(CAPACITY_POLL_S) - 1)]
+                                   * (0.5 + random.random()))
                         waits += 1
                         continue
                     errors.append(f"{type(e).__name__}: {str(e)[:200]}")
@@ -486,18 +497,31 @@ class ModalSandbox:
 
     def _upload_blobs(self, files: list[dict], only: set[str] | None = None) -> None:
         vol = self.volume(vol_name(self.s.volume_prefix, "blobs"), create=True)
-        have = {} if only else {e.path.strip("/"): e.size for e in vol.listdir("/")}
+        # The volume is listed only when this bundle has a file not already known to be there:
+        # the 26 datasets of a family share one bundle, and each listing pages through every blob.
+        known = self._blobs_known
+        if only or all(known.get(f["sha256"]) == f["size"] for f in files):
+            have = known
+        else:
+            have = {e.path.strip("/"): e.size for e in vol.listdir("/")}
+            known.update(have)
         todo = {f["sha256"]: f for f in files
                 if (only and f["sha256"] in only) or (not only and have.get(f["sha256"]) != f["size"])}
         if todo:
             with vol.batch_upload(force=True) as up:
                 for sha, f in todo.items():
                     up.put_file(f["local"], "/" + sha)
+            known.update({sha: f["size"] for sha, f in todo.items()})
             audit.record(self.cfg.state_dir, "modal_blobs_uploaded", files=len(todo),
                          bytes=sum(f["size"] for f in todo.values()))
 
     def _stage_bundle(self, bundle: Path, name: str) -> str:
-        """Copy one job's files into a volume of its own, in a trusted sandbox."""
+        """Copy one job's files into a volume of its own, in a trusted sandbox
+        (STAGE_CONCURRENCY at a time)."""
+        with self._stage_slots:
+            return self._stage_bundle_now(bundle, name)
+
+    def _stage_bundle_now(self, bundle: Path, name: str) -> str:
         files = self._bundle_files(bundle)
         self._upload_blobs(files)
         job = vol_name(self.s.volume_prefix, "job", hashlib.sha256(name.encode()).hexdigest()[:20])

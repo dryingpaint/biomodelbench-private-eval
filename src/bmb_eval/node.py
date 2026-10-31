@@ -397,7 +397,7 @@ class Worker:
     def _dispatch(self, sid: str, task: str, submitter: str, need: tuple[float, int, int]) -> None:
         if self.parallel <= 1:
             self._run(sid, task, submitter)
-            self.cache.evict(self.cfg.cache_gb << 30)
+            self._evict()
             return
         th = threading.Thread(target=self._run, args=(sid, task, submitter), daemon=True,
                               name=f"eval-{sid}")
@@ -408,10 +408,21 @@ class Worker:
         done = [sid for sid, j in self._jobs.items() if not j[0].is_alive()]
         for sid in done:
             self._jobs.pop(sid)
-        if done and not self._jobs:
-            # Evict only when nothing runs: a job assembling its bundle needs its files cached.
-            self.cache.evict(self.cfg.cache_gb << 30)
+        if done:
+            self._evict()
         return bool(done)
+
+    def _evict(self) -> None:
+        """Keep the cache within cache_gb, sparing every file of a job this node still
+        holds (running or waiting). Evicting only when no job ran never happened on a
+        busy node: on 2026-10-30 its 100 GB cache had grown to 176 GB and the disk to 99%."""
+        keep: set[str] = set()
+        for p in self.queue_dir.glob("*.json"):
+            try:
+                keep |= {f["sha256"] for f in json.loads(p.read_text())["files"]}
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        self.cache.evict(self.cfg.cache_gb << 30, keep=keep)
 
     def wait_jobs(self, timeout: float | None = None) -> None:
         for th, *_ in list(self._jobs.values()):

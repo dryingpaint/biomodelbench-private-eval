@@ -24,6 +24,7 @@ import json
 import os
 import resource
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -35,6 +36,19 @@ PR_SET_NO_NEW_PRIVS = 38
 # From the image's own environment: where bmb_eval is, and what the GPU stack needs.
 PASS_ENV = ("PYTHONPATH", "LD_LIBRARY_PATH", "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES", "CUDA_VISIBLE_DEVICES",
             "LANG")
+
+
+def _sandbox_pythonpath(value: str) -> str:
+    """PYTHONPATH without the entries uid 65534 can't list. Modal's runtime appends /pkg
+    and /root (root-only) to the image's /opt/bmb; pip, listing every sys.path entry,
+    then failed every bundle with wheels/ (PermissionError on /root, 2026-10-30)."""
+    def listable(p: str) -> bool:
+        try:
+            mode = os.stat(p).st_mode
+        except OSError:
+            return False
+        return stat.S_ISDIR(mode) and mode & stat.S_IROTH and mode & stat.S_IXOTH
+    return os.pathsep.join(p for p in value.split(os.pathsep) if p and listable(p))
 
 
 def _no_new_privs() -> None:
@@ -149,6 +163,8 @@ def main(spec_path: str) -> int:
     if spec.get("mirror"):
         mirror_inputs(spec["mirror"])
     env = {k: os.environ[k] for k in PASS_ENV if k in os.environ}
+    if "PYTHONPATH" in env:
+        env["PYTHONPATH"] = _sandbox_pythonpath(env["PYTHONPATH"])
     env.update(spec["env"])
     stdin_path = run / "in.bin"
     out_path, err_path = run / "out.bin", run / "err.log"

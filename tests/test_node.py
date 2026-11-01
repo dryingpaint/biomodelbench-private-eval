@@ -639,6 +639,22 @@ def test_cache_evicts_least_recently_used(tmp_path):
     assert not c.path(shas[0]).exists() and c.path(shas[2]).exists()
 
 
+def test_cache_eviction_spares_files_of_held_jobs(tmp_path):
+    """A busy node evicts around the files of jobs it still holds, rather than only
+    when idle (which a busy node never is)."""
+    import hashlib
+    c = BlobCache(tmp_path)
+    shas = []
+    for i in range(3):
+        data = bytes([i]) * 1000
+        sha = hashlib.sha256(data).hexdigest()
+        c.put(sha, 1000, io.BytesIO(data).read)
+        os.utime(c.path(sha), (i, i))
+        shas.append(sha)
+    c.evict(2000, keep={shas[0]})                  # oldest, but a held job needs it
+    assert c.path(shas[0]).exists() and not c.path(shas[1]).exists() and c.path(shas[2]).exists()
+
+
 def test_gcs_signed_urls_offline():
     """The Cloud Storage path signs per-agent PUT/GET links (checked offline
     with a throwaway service-account key; no network)."""

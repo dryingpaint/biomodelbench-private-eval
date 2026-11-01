@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -59,6 +60,21 @@ WATCHDOG_GRACE_S = 120           # the launcher enforces the stage timeout; this
 OOM_CODE = 137                   # what Modal reports for a sandbox killed for memory
 EXIT_POLLS = 20                  # polls (0.5 s apart) for a vanished sandbox's exit code
 RETRY_BACKOFF_S = (2, 6, 18, 30)  # between attempts of a stage after a Modal failure
+# Modal has no GPU (or container) free for this workspace: the stage waits for one, polling,
+# rather than failing. Without the wait, a node allowed to run every queued job at once
+# turned capacity refusals into hand-backs, half-hour pauses and, on a third, a counted
+# infra_error (2026-10-31).
+CAPACITY_WAIT_S = 6 * 3600
+CAPACITY_POLL_S = (15, 30, 60, 120)
+# Bundles staged at once. Staging lists and polls volumes, and Modal rate-limits that API:
+# 117 jobs staging together failed with "VolumeListFiles rate limit exceeded" (2026-10-31).
+# Only staging waits its turn; staged jobs all run at once.
+STAGE_CONCURRENCY = 8
+
+
+def _must_wait(e: Exception) -> bool:
+    """Modal has no capacity free, or asks us to slow down: wait, don't fail the stage."""
+    return "Insufficient capacity" in str(e) or "rate limit exceeded" in str(e)
 MODAL_IMAGE_FILES = ("sandbox/modal/Dockerfile", "sandbox/modal/requirements.lock")
 
 
@@ -210,6 +226,8 @@ class ModalSandbox:
         self._app = None
         self._image = None
         self._lock = threading.Lock()
+        self._stage_slots = threading.Semaphore(STAGE_CONCURRENCY)
+        self._blobs_known: dict[str, int] = {}     # sha -> size, on the shared blobs volume
 
     # Modal handles, made on first use (the node can start, and be approved, offline).
     @property
@@ -313,23 +331,37 @@ class ModalSandbox:
         t0 = time.time()
         job_vol = None
         errors = []
+        attempt = waits = 0
         try:
-            for attempt in range(1 + max(0, self.s.retries)):
+            while True:
                 try:
                     if plan.bundle is not None and job_vol is None:
                         job_vol = self._stage_bundle(plan.bundle, name)
                     r = self._attempt(plan, job_vol, entry, env, limits, timeout_s, stdout_cap, stdin, gpus)
+                    if waits:
+                        audit.record(self.cfg.state_dir, "modal_capacity_ready", stage=name,
+                                     waited_s=round(time.time() - t0))
                     r.seconds = round(time.time() - t0, 2)
                     return r
                 except PermissionError:
                     raise
                 except Exception as e:       # Modal's errors, connection failures, a lost sandbox
+                    if _must_wait(e) and time.time() - t0 < CAPACITY_WAIT_S:
+                        if not waits:
+                            audit.record(self.cfg.state_dir, "modal_capacity_wait", stage=name, gpus=gpus,
+                                         reason=str(e)[:120])
+                        # Jittered, so jobs refused together don't all ask again together.
+                        time.sleep(CAPACITY_POLL_S[min(waits, len(CAPACITY_POLL_S) - 1)]
+                                   * (0.5 + random.random()))
+                        waits += 1
+                        continue
                     errors.append(f"{type(e).__name__}: {str(e)[:200]}")
                     audit.record(self.cfg.state_dir, "modal_infra_failure", stage=name, attempt=attempt + 1,
                                  error=type(e).__name__)
-                    if attempt < self.s.retries:
-                        time.sleep(RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)])
-            raise SandboxLost(f"{name}: " + " | ".join(errors))
+                    if attempt >= self.s.retries:
+                        raise SandboxLost(f"{name}: " + " | ".join(errors))
+                    time.sleep(RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)])
+                    attempt += 1
         finally:
             if job_vol is not None:
                 self._delete_volume(job_vol)
@@ -465,18 +497,31 @@ class ModalSandbox:
 
     def _upload_blobs(self, files: list[dict], only: set[str] | None = None) -> None:
         vol = self.volume(vol_name(self.s.volume_prefix, "blobs"), create=True)
-        have = {} if only else {e.path.strip("/"): e.size for e in vol.listdir("/")}
+        # The volume is listed only when this bundle has a file not already known to be there:
+        # the 26 datasets of a family share one bundle, and each listing pages through every blob.
+        known = self._blobs_known
+        if only or all(known.get(f["sha256"]) == f["size"] for f in files):
+            have = known
+        else:
+            have = {e.path.strip("/"): e.size for e in vol.listdir("/")}
+            known.update(have)
         todo = {f["sha256"]: f for f in files
                 if (only and f["sha256"] in only) or (not only and have.get(f["sha256"]) != f["size"])}
         if todo:
             with vol.batch_upload(force=True) as up:
                 for sha, f in todo.items():
                     up.put_file(f["local"], "/" + sha)
+            known.update({sha: f["size"] for sha, f in todo.items()})
             audit.record(self.cfg.state_dir, "modal_blobs_uploaded", files=len(todo),
                          bytes=sum(f["size"] for f in todo.values()))
 
     def _stage_bundle(self, bundle: Path, name: str) -> str:
-        """Copy one job's files into a volume of its own, in a trusted sandbox."""
+        """Copy one job's files into a volume of its own, in a trusted sandbox
+        (STAGE_CONCURRENCY at a time)."""
+        with self._stage_slots:
+            return self._stage_bundle_now(bundle, name)
+
+    def _stage_bundle_now(self, bundle: Path, name: str) -> str:
         files = self._bundle_files(bundle)
         self._upload_blobs(files)
         job = vol_name(self.s.volume_prefix, "job", hashlib.sha256(name.encode()).hexdigest()[:20])

@@ -42,6 +42,10 @@ class ResourceExhaustedError(Error):
     pass
 
 
+class InvalidError(Error):
+    pass
+
+
 class FakeModal:
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -52,11 +56,15 @@ class FakeModal:
         self.lose_execs = 0
         self.rate_limit = 0        # that many volume listings/reads raise ResourceExhaustedError
         self.api_calls = 0         # volume listings/reads made
+        # Modal's request limits (InvalidError past them), as measured on 2026-11-01.
+        self.max_cpus = 64
+        self.cpu_max_memory_mib = 344064
         self._ids = itertools.count()
         self._lock = threading.Lock()
         fm = self
         self.exception = SimpleNamespace(Error=Error, NotFoundError=NotFoundError,
-                                         ResourceExhaustedError=ResourceExhaustedError)
+                                         ResourceExhaustedError=ResourceExhaustedError,
+                                         InvalidError=InvalidError)
         self.App = SimpleNamespace(lookup=lambda name, create_if_missing=False, environment_name=None:
                                    SimpleNamespace(app_id=f"ap-{environment_name}-{name}", name=name))
         self.Image = SimpleNamespace(
@@ -85,6 +93,12 @@ class FakeModal:
     # sandboxes
     def _create(self, *cmd, app=None, image=None, volumes=None, gpu=None, cpu=None, memory=None,
                 timeout=None, block_network=False, tags=None, **kw):
+        cpu_hi = max(cpu) if isinstance(cpu, tuple) else (cpu or 0)
+        mem_hi = max(memory) if isinstance(memory, tuple) else (memory or 0)
+        if cpu_hi > self.max_cpus:
+            raise InvalidError(f"CPU request must be <= {int(self.max_cpus * 1000)} mCPU (got {int(cpu_hi * 1000)})")
+        if gpu is None and mem_hi > self.cpu_max_memory_mib:
+            raise InvalidError(f"memory request must be <= {self.cpu_max_memory_mib} MiB (got {mem_hi})")
         with self._lock:
             if self.no_capacity:
                 self.no_capacity -= 1

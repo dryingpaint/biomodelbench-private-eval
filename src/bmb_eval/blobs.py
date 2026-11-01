@@ -142,8 +142,9 @@ class BlobCache:
             os.utime(src)  # mark recently used
         return dest
 
-    def evict(self, max_bytes: int) -> int:
-        """Delete least-recently-used files until the cache fits; returns bytes freed."""
+    def evict(self, max_bytes: int, keep: set[str] = frozenset()) -> int:
+        """Delete least-recently-used files, except those in `keep`, until the cache
+        fits (or only kept files are left); returns bytes freed."""
         entries = sorted((p.stat().st_mtime, p.stat().st_size, p)
                          for p in self.root.iterdir() if SHA_RE.match(p.name))
         total = sum(e[1] for e in entries)
@@ -151,6 +152,8 @@ class BlobCache:
         for _, size, p in entries:
             if total - freed <= max_bytes:
                 break
+            if p.name in keep:
+                continue
             p.unlink(missing_ok=True)
             freed += size
         return freed

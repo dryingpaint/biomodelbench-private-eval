@@ -160,8 +160,10 @@ deploy/gcp/hub alerts --webhook https://hooks.slack.com/… # where setup alerts
    once the upload is in); a service that can't start or can't get out is reported
    as `start_service: ...` on the spot. A code that was used but whose setup still
    hasn't finished an hour later shows as STALLED and alerts once, with what to
-   ask the provider for (`~/bmb-eval/bmb-eval status`, `journalctl --user -u
-   bmb-eval -n 30`). The hub's journal records each activation and each node's
+   ask the provider for (`~/bmb-eval/bmb-eval status`, `~/bmb-eval/bmb-eval logs`,
+   `journalctl --user -u bmb-eval -n 30`). `status` ends with the node's last few
+   events; `logs` prints its audit log readably (`-f` to follow, `--event run`
+   for one kind). The hub's journal records each activation and each node's
    first check-in. Either way, the fix is usually to ask the provider for the
    message they saw and have them run the same command again.
 

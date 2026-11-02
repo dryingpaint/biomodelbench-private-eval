@@ -1,16 +1,17 @@
-"""Operator tooling: check-task, the disk and cache defaults."""
+"""Operator tooling: check-task, the disk and cache defaults, and the node's logs."""
 from __future__ import annotations
 
 import collections
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from bmb_eval import cli, config as config_mod, taskcheck
+from bmb_eval import audit, cli, config as config_mod, taskcheck
 from bmb_eval.config import Config
 
 EX = Path(__file__).resolve().parents[1] / "examples" / "tasks"
@@ -146,3 +147,35 @@ def test_check_warns_about_a_cache_bigger_than_its_disk(tmp_path, monkeypatch, c
     with pytest.raises(SystemExit):                     # the local backend is an error
         cli.main(["--config", str(_node_config(tmp_path, cache_gb=300)), "check"])
     assert "WARN  cache_gb is 300 but the disk holding" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ logs
+
+def test_logs_and_status_show_recent_audit_events_readably(tmp_path, monkeypatch, capsys):
+    cfg_path = _node_config(tmp_path)
+    cfg = Config.load(cfg_path)
+    audit.record(cfg.state_dir, "node_start", requeued=0)
+    for i in range(3):
+        audit.record(cfg.state_dir, "run", run_id=f"r{i}", task="t", status="ok", bundle_sha256="ab" * 32)
+    audit.record(cfg.state_dir, "hub_unreachable", error="timed out")
+    cli.main(["--config", str(cfg_path), "logs", "-n", "2"])
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2 and "run_id=r2" in lines[0] and "hub_unreachable" in lines[1]
+    assert lines[0].endswith("bundle_sha256=abababababab") and '"hash"' not in lines[0] and "prev=" not in lines[0]
+    cli.main(["--config", str(cfg_path), "logs", "--event", "run", "-n", "2"])
+    assert [ln.split("run_id=")[1].split()[0] for ln in capsys.readouterr().out.splitlines()] == ["r1", "r2"]
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)       # no systemd here
+    cli.main(["--config", str(cfg_path), "status"])
+    out = capsys.readouterr().out
+    assert "recent" in out and "hub_unreachable" in out and "error=timed out" in out
+
+
+def test_service_unit_sends_output_to_the_journal_unbuffered(tmp_path, monkeypatch):
+    cfg = Config.load(_node_config(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", ""))
+    assert cli._install_service(cfg)[0]
+    unit = (tmp_path / "home" / ".config/systemd/user/bmb-eval.service").read_text()
+    assert "Environment=PYTHONUNBUFFERED=1\n" in unit

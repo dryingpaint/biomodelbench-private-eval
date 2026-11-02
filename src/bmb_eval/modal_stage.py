@@ -1,10 +1,10 @@
 """Trusted bundle stager inside a Modal sandbox (no submitted code runs here).
 
-Copies one job's model files from the node's content-addressed blob volume
-(mounted read-only at <blobs>) into that job's own bundle volume (<out>), by the
-manifest the controller wrote, then flushes the volume. Predict then mounts the
-job's volume read-only and never sees the blob volume, so a model can't read
-other submissions' files.
+Copies one bundle's model files from the node's content-addressed blob volume
+(mounted read-only at <blobs>) into that bundle's own volume (<out>), by the
+manifest the controller wrote, then flushes the volume. Predict, in every job of
+that bundle, then mounts the bundle's volume read-only and never sees the blob
+volume, so a model can't read other submissions' files.
 
 Usage: python -m bmb_eval.modal_stage <stage.json>
 stage.json: {"blobs": dir, "out": dir, "files": [{"path", "sha256", "size", "executable"?}]}

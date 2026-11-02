@@ -11,8 +11,10 @@ while the node loop (queue, quotas, audit log, approval lock) stays on the node'
                       <p>-<task>-task                 contract.yaml + score.py
                       <p>-sh-<sha16>                  one large shared file (the genome),
                                                       stored once, linked into inputs
-                      <p>-job-<id>                    one job's model files (predict only),
-                                                      deleted after the stage
+                      <p>-bun-<digest>-<n>            one bundle's model files (predict only),
+                                                      staged once and shared read-only by
+                                                      every job of that bundle; deleted
+                                                      BUNDLE_IDLE_S after its last job
                       <p>-blobs                       model files by sha256; only the trusted
                                                       stager mounts it
                       <p>-meta                        MANIFEST.json (what `modal-sync` uploaded)
@@ -32,9 +34,12 @@ timeouts, too much output, out of memory) are never retried.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import random
+import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
@@ -66,10 +71,12 @@ RETRY_BACKOFF_S = (2, 6, 18, 30)  # between attempts of a stage after a Modal fa
 # infra_error (2026-10-31).
 CAPACITY_WAIT_S = 6 * 3600
 CAPACITY_POLL_S = (15, 30, 60, 120)
-# Bundles staged at once. Staging lists and polls volumes, and Modal rate-limits that API:
-# 117 jobs staging together failed with "VolumeListFiles rate limit exceeded" (2026-10-31).
-# Only staging waits its turn; staged jobs all run at once.
-STAGE_CONCURRENCY = 8
+# A staged bundle outlives its last job by this long, so a family's next datasets (26
+# genomic, 45 molprop, one bundle) and its final mount it as is. Staging it per job made
+# 117 concurrent jobs list volumes until Modal refused ("VolumeListFiles rate limit
+# exceeded", 2026-10-31).
+BUNDLE_IDLE_S = 30 * 60
+VISIBLE_POLL_S = (1, 2, 4, 8)    # between listings of a newly staged volume, jittered
 
 
 def _must_wait(e: Exception) -> bool:
@@ -195,6 +202,16 @@ class Plan:
     task: str | None = None
 
 
+@dataclass
+class _Staged:
+    """One bundle staged into a volume, which every job of that bundle mounts read-only."""
+    volume: str
+    ready: threading.Event = field(default_factory=threading.Event)   # staged, or failed
+    error: str | None = None
+    users: int = 0                                                    # stages holding it
+    idle_since: float = 0.0
+
+
 def load_mounts(cfg) -> list[dict]:
     try:
         return json.loads((modal_dir(cfg) / "mounts.json").read_text())["entries"]
@@ -226,8 +243,14 @@ class ModalSandbox:
         self._app = None
         self._image = None
         self._lock = threading.Lock()
-        self._stage_slots = threading.Semaphore(STAGE_CONCURRENCY)
         self._blobs_known: dict[str, int] = {}     # sha -> size, on the shared blobs volume
+        self._staged: dict[str, _Staged] = {}      # bundle digest -> its staged volume
+        self._staged_lock = threading.Lock()
+        self._sweep_timer: threading.Timer | None = None
+        # Each staging gets a volume name never used before, so a volume being deleted (idle,
+        # or failed) is never the one a new staging writes, and two processes of one node
+        # (the node, a selftest) never share one.
+        self._volume_names = (f"{secrets.token_hex(3)}{n}" for n in itertools.count())
 
     # Modal handles, made on first use (the node can start, and be approved, offline).
     @property
@@ -329,15 +352,16 @@ class ModalSandbox:
         if gpus > self.s.max_gpus_per_job:
             raise PermissionError(f"{gpus} GPUs is more than one Modal container has")
         t0 = time.time()
-        job_vol = None
+        held = None                              # (digest, _Staged) of the bundle this stage mounts
         errors = []
         attempt = waits = 0
         try:
             while True:
                 try:
-                    if plan.bundle is not None and job_vol is None:
-                        job_vol = self._stage_bundle(plan.bundle, name)
-                    r = self._attempt(plan, job_vol, entry, env, limits, timeout_s, stdout_cap, stdin, gpus)
+                    if plan.bundle is not None and held is None:
+                        held = self._hold_bundle(plan.bundle, name)
+                    r = self._attempt(plan, held and held[1].volume, entry, env, limits, timeout_s,
+                                      stdout_cap, stdin, gpus)
                     if waits:
                         audit.record(self.cfg.state_dir, "modal_capacity_ready", stage=name,
                                      waited_s=round(time.time() - t0))
@@ -363,16 +387,16 @@ class ModalSandbox:
                     time.sleep(RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)])
                     attempt += 1
         finally:
-            if job_vol is not None:
-                self._delete_volume(job_vol)
+            if held is not None:
+                self._release_bundle(*held)
 
     # -------------------------------------------------------------- one try
 
-    def _attempt(self, plan: Plan, job_vol: str | None, entry: str, env: dict, limits: Limits,
+    def _attempt(self, plan: Plan, bundle_vol: str | None, entry: str, env: dict, limits: Limits,
                  timeout_s: int, stdout_cap: int, stdin: bytes, gpus: int) -> Result:
         vols = {path: self.volume(v).read_only() for path, v in plan.volumes.items()}
-        if job_vol is not None:
-            vols[MOUNT_AT["bundle"]] = self.volume(job_vol).read_only()
+        if bundle_vol is not None:
+            vols[MOUNT_AT["bundle"]] = self.volume(bundle_vol).read_only()
         mem_mib = (_bytes(limits.memory) >> 20) + self.s.memory_headroom_mb
         sb_timeout = timeout_s + COLD_START_S
         try:
@@ -515,23 +539,80 @@ class ModalSandbox:
             audit.record(self.cfg.state_dir, "modal_blobs_uploaded", files=len(todo),
                          bytes=sum(f["size"] for f in todo.values()))
 
-    def _stage_bundle(self, bundle: Path, name: str) -> str:
-        """Copy one job's files into a volume of its own, in a trusted sandbox
-        (STAGE_CONCURRENCY at a time)."""
-        with self._stage_slots:
-            return self._stage_bundle_now(bundle, name)
-
-    def _stage_bundle_now(self, bundle: Path, name: str) -> str:
+    def _hold_bundle(self, bundle: Path, name: str) -> tuple[str, _Staged]:
+        """The volume holding this bundle's files, staged by the first job of the bundle;
+        later jobs wait for it, then share it. Held until _release_bundle."""
         files = self._bundle_files(bundle)
-        self._upload_blobs(files)
-        job = vol_name(self.s.volume_prefix, "job", hashlib.sha256(name.encode()).hexdigest()[:20])
-        self.volume(job, create=True).hydrate()
         manifest = [{k: f[k] for k in ("path", "sha256", "size", "executable") if k in f} for f in files]
+        digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        with self._staged_lock:
+            st = self._staged.get(digest)
+            mine = st is None
+            if mine:
+                st = self._staged[digest] = _Staged(
+                    vol_name(self.s.volume_prefix, "bun", digest[:16], next(self._volume_names)))
+            st.users += 1
+        try:
+            if mine:
+                try:
+                    t0 = time.time()
+                    self._stage_bundle(files, manifest, st.volume)
+                    audit.record(self.cfg.state_dir, "modal_bundle_staged", stage=name, volume=st.volume,
+                                 files=len(files), bytes=sum(f["size"] for f in files),
+                                 seconds=round(time.time() - t0, 1))
+                except Exception as e:
+                    # Out of the registry before anyone is woken: a half-staged volume is never
+                    # handed out, and the next job of this bundle stages it afresh.
+                    st.error = f"{type(e).__name__}: {e}"
+                    with self._staged_lock:
+                        if self._staged.get(digest) is st:
+                            del self._staged[digest]
+                    self._delete_volume(st.volume)
+                    raise
+                finally:
+                    st.ready.set()
+            else:
+                st.ready.wait()
+                if st.error is not None:
+                    raise _Infra(f"staging the bundle failed in another job: {st.error}")
+        except BaseException:
+            self._release_bundle(digest, st)
+            raise
+        return digest, st
+
+    def _release_bundle(self, digest: str, st: _Staged) -> None:
+        with self._staged_lock:
+            st.users -= 1
+            if not st.users:
+                st.idle_since = time.time()
+        self._sweep()
+
+    def _sweep(self) -> None:
+        """Delete staged volumes no job has held for BUNDLE_IDLE_S; check again when the
+        next one comes due."""
+        now = time.time()
+        with self._staged_lock:
+            self._sweep_timer = None
+            idle = [d for d, s in self._staged.items() if not s.users and now - s.idle_since >= BUNDLE_IDLE_S]
+            gone = [self._staged.pop(d).volume for d in idle]
+            due = [s.idle_since + BUNDLE_IDLE_S for s in self._staged.values() if not s.users]
+            if due:
+                self._sweep_timer = threading.Timer(max(1.0, min(due) - now), self._sweep)
+                self._sweep_timer.daemon = True
+                self._sweep_timer.start()
+        for v in gone:
+            self._delete_volume(v)
+
+    def _stage_bundle(self, files: list[dict], manifest: list[dict], vol: str) -> None:
+        """Copy a bundle's files into its volume, in a trusted sandbox, and wait until
+        they are all visible."""
+        self._upload_blobs(files)
+        self.volume(vol, create=True).hydrate()
         for attempt in range(2):
             sb = self.m.Sandbox.create(
                 "sleep", "7200", app=self.app(), image=self.image(),
                 volumes={"/blobs": self.volume(vol_name(self.s.volume_prefix, "blobs")).read_only(),
-                         "/out": self.volume(job)},
+                         "/out": self.volume(vol)},
                 cpu=(2.0, 4.0), memory=(4096, 8192), timeout=7200, block_network=True, tags=self.tags())
             try:
                 root = getattr(sb, "fake_root", "")
@@ -549,28 +630,34 @@ class ModalSandbox:
                 except Exception:
                     pass
             if status.get("ok"):
-                self._wait_visible(job, manifest)
-                return job
+                self._wait_visible(vol, manifest)
+                return
             if status.get("missing") and attempt == 0:
                 self._upload_blobs(files, only=set(status["missing"]))
                 continue
             raise RuntimeError(f"staging failed (exit {code}): {status}")
         raise RuntimeError("staging failed")
 
-    def _wait_visible(self, job: str, manifest: list[dict], timeout_s: float = 120) -> None:
-        """Wait until the job volume shows every staged file. Seen live: a sandbox started
+    def _wait_visible(self, vol: str, manifest: list[dict], timeout_s: float = 120) -> None:
+        """Wait until the volume shows every staged file. Seen live: a sandbox started
         right after the stager could find the volume still empty, which would charge the
-        model for a missing predict.py."""
+        model for a missing predict.py. Polled with a growing, jittered interval, and a
+        rate-limited listing is just another poll: these listings are the API that ran
+        out (2026-10-31)."""
         want = {f["path"]: f["size"] for f in manifest}
         deadline = time.time() + timeout_s
-        while True:
-            have = {e.path.strip("/"): e.size for e in self.volume(job).listdir("/", recursive=True)
-                    if getattr(getattr(e, "type", None), "name", "FILE") == "FILE"}
-            if all(have.get(p) == n for p, n in want.items()):
-                return
+        for n in itertools.count():
+            try:
+                have = {e.path.strip("/"): e.size for e in self.volume(vol).listdir("/", recursive=True)
+                        if getattr(getattr(e, "type", None), "name", "FILE") == "FILE"}
+                if all(have.get(p) == size for p, size in want.items()):
+                    return
+            except Exception as e:
+                if "rate limit exceeded" not in str(e):
+                    raise
             if time.time() > deadline:
-                raise RuntimeError(f"staged files not visible on {job} after {timeout_s:.0f}s")
-            time.sleep(2)
+                raise RuntimeError(f"staged files not visible on {vol} after {timeout_s:.0f}s")
+            time.sleep(VISIBLE_POLL_S[min(n, len(VISIBLE_POLL_S) - 1)] * (0.5 + random.random()))
 
     def _delete_volume(self, name: str) -> None:
         try:
@@ -580,13 +667,15 @@ class ModalSandbox:
 
 
 def cleanup_jobs(cfg, modal_mod=None) -> int:
-    """Delete job volumes a crash left behind (at node start)."""
+    """Delete bundle volumes a previous run of the node left behind (at node start),
+    and per-job volumes from before bundles were staged once (-job-)."""
     sb = ModalSandbox(cfg, modal_mod)
-    prefix = vol_name(cfg.modal.volume_prefix, "job", "")
+    # By the whole name, not a prefix: a task called "bun" or "job" has volumes <p>-bun-val, ...
+    ours = re.compile(re.escape(vol_name(cfg.modal.volume_prefix, "")) + r"(bun-[0-9a-f]{16}-[0-9a-f]{6}\d+|job-[0-9a-f]{20})")
     n = 0
     for v in sb.m.Volume.objects.list(environment_name=cfg.modal.environment):
         name = getattr(v, "name", None) or ""
-        if name.startswith(prefix):
+        if ours.fullmatch(name):
             sb._delete_volume(name)
             n += 1
     return n

@@ -117,6 +117,19 @@ def cmd_build_image(args) -> None:
     if engine not in ENGINES:
         print("local backend: no image needed")
         return
+    # One build at a time per machine and user: two `podman build`s of the same image at once
+    # failed ("read/write on closed pipe") when tests connected nodes in parallel (2026-11-02);
+    # the second waits, then finds the image current and skips.
+    import fcntl
+    lock = open(Path(tempfile.gettempdir()) / f"bmb-eval-image-{os.getuid()}.lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        _get_or_build_image(cfg, engine, args)
+    finally:
+        lock.close()
+
+
+def _get_or_build_image(cfg, engine: str, args) -> None:
     # Updates (setup.sh) call this every time; skip the multi-GB download when the
     # image here was built from this very code (stamp label == SANDBOX_FILES digest).
     if make_sandbox(cfg).image_id() != "missing" and not stale_image_message(cfg):

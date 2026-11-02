@@ -136,6 +136,7 @@ returns your most extreme label directly.
 | Modal node: data on Modal changed after approval | `modal-sync` records what it uploaded (tree hashes as in the approval fingerprint, and every file's size and sha256); the fingerprint holds the manifest's hash; the node accepts no work while the manifest on Modal differs, or (checked hourly) a volume's files differ from it | `modal_sync.py`, `node.py` | Someone in the `bmb-eval` environment could change a file without changing its size between hourly checks |
 | Modal node: answers readable outside the node | The data lives in the restricted `bmb-eval` Modal environment; agent runs execute in `main` and can't open it (`deploy/modal/isolation_probe.py` checks) | Modal RBAC | **Members of the `bmb-eval` environment and workspace admins can read the labels. Modal (and its cloud providers) process the data as a sub-processor.** Use it for public-data tasks, or with the provider's consent |
 | Modal node: concurrent jobs on shared hosts | Each stage is its own gVisor sandbox with its own GPUs; jobs never share a container | Modal | Concurrent jobs (this node's and other Modal customers') may share a physical host: cache-timing or GPU-contention covert channels between two submissions are not closed. Set `modal.max_jobs: 1` to remove the ones between our own jobs |
+| Family batching: one model sees several tasks' inputs (`batch_families`, off by default) | Only on a node that opted in (in its approval fingerprint; refused on the sealed node), only for that node's tasks, one half, GPU or CPU tasks apart. Batched predict still never mounts answers, a task folder or the other half; validate and score stay one sandbox per task | `sandbox.py:check_mounts`, `modal_backend.py`, `runner.py`, `node.py` | See "Family batching" below: inputs cross between the batched tasks. For public data only |
 | Modal node: faking an infrastructure failure for free retries | Only Modal's own errors and a sandbox that vanished without its launcher's report count as infrastructure; a sandbox killed for memory (exit 137) is the model's `predict_resource_limit`, and a launcher that doesn't report in time is the model's timeout. A job is handed back uncounted at most twice | `modal_backend.py`, `node.py` | A model that could make its sandbox vanish gets at most two extra, unreported runs per submission |
 
 `bmb-eval selftest` runs the first half of this table as real attack bundles
@@ -161,6 +162,34 @@ it runs as uid 65534:
 | `--log-driver none` | Stage output goes to files in the sandbox and to the controller, never to Modal's logs |
 | Files bind-mounted one by one | Whole volumes, one per task and kind: validate and score also see the rest of their half's inputs folder (predict sees it anyway) |
 | Image built and pinned per release, its stamp checked | A separate image (`sandbox/modal/`), its Modal id in the approval fingerprint; the node refuses work when the image is older than its code |
+
+### Family batching
+
+A family submission scores one model on many datasets, one job per dataset. On a
+node with `batch_families: true` the jobs of one bundle, split and agent share one
+predict sandbox: the model loads once and predicts each dataset in turn (its own
+inputs folder at `/data/inputs/<i>`). What changes:
+
+- **The model sees every batched task's inputs together.** It can carry what it read
+  in one task's inputs into another task's predictions, and so out through that
+  task's metrics; each task's leakage budget then bounds what leaves about the
+  batched tasks together, not about itself alone. It never sees any task's answers,
+  the scorer, or the other half. This is why batching is for our own public-data
+  nodes and never a provider's: a provider approved its task's budget, not the
+  family's. Turning it on changes the approval fingerprint.
+- **Timing across tasks.** A batched task's result is ready when the batch is, which
+  depends on how long the model took on the tasks before it. Results are still
+  released no earlier than each task's own `release_after_s`; a batch that runs past
+  that releases results at a time other tasks' data could influence.
+- **Per-task outcomes come from inside the sandbox.** Each task's status (ok, its
+  error code, too large, out of time) is a frame the batched process writes, not the
+  process's exit code. The model chooses those as it chooses an exit code, from the
+  same fixed list; the controller parses frames without parsing any parquet, and caps
+  each at its task's output limit. Each task's time limit is a timer in that process
+  the model could defeat, gaining at most the batch's whole limit (the sum of its
+  tasks' limits, at most `batch_max_predict_s`).
+- **No extra runs.** If the batch dies, the tasks it hadn't finished run again, each
+  alone, as they would have without batching; each job is evaluated and counted once.
 
 ## What this design does not protect
 

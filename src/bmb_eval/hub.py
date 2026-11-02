@@ -10,7 +10,10 @@ gated results nodes send back. Never sees provider data.
              GET  /v1/submissions/<id>            {status: pending|done, result?} (validation runs only)
              GET  /v1/tasks                       public contracts + node status
     nodes    POST /v1/node/hello                  report tasks/contracts, recover jobs
-             GET  /v1/node/next                   claim a job: manifest + download urls
+             GET  /v1/node/next                   claim a job: manifest + download urls, and how many
+                                                  siblings (same bundle, split, agent) are queued for
+                                                  this node; ?bundle_id=&split=&submitter=&tasks=
+                                                  claims one of them (family batching)
              POST /v1/node/results/<id>           deliver the gated payload
     enroll   GET  /v1/enroll/<code>               task package (contract, scorer, ...)
              POST /v1/enroll/<code>               activate: bind task to a node
@@ -1206,7 +1209,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if m := re.fullmatch(r"/v1/blobs/([0-9a-f]{64})", p):
                 return self._blob_get(m.group(1))
             if p.startswith("/v1/node/"):
-                return self._node_get(p)
+                return self._node_get(p, qs)
             if p.startswith("/v1/operator/"):
                 return self._operator("GET", p)
             agent = store.agent(self._bearer())
@@ -1424,25 +1427,48 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 store.q("UPDATE nodes SET last_seen=? WHERE id=?", (time.time(), node))
             return node
 
-        def _node_get(self, p: str) -> None:
+        def _node_get(self, p: str, qs: dict) -> None:
             node = self._node()
             if node is None:
                 return
             if p != "/v1/node/next":
                 return self._err(404, "not_found", "No such endpoint.")
+            # A sibling of a job the node holds (family batching): only that bundle, split and
+            # agent, on the tasks it names.
+            only = {k: urllib.parse.unquote_plus(qs[k]) for k in ("bundle_id", "split", "submitter", "tasks")
+                    if k in qs}
+            where, args = "", []
+            if only:
+                if set(only) != {"bundle_id", "split", "submitter", "tasks"}:
+                    return self._err(400, "invalid", "A sibling claim names bundle_id, split, submitter, tasks.")
+                tasks = [t for t in only["tasks"].split(",") if t][:500]
+                where = (" AND s.manifest_id=? AND s.split=? AND s.agent=? AND s.task IN ("
+                         + ",".join("?" * len(tasks)) + ")")
+                args = [only["bundle_id"], only["split"], only["submitter"], *tasks]
+                if not tasks:
+                    return self._send(204)
             # Claimed in one statement under the write lock: two polls never get one job.
             with store.tx() as db:
                 rows = db.execute(
                     "UPDATE submissions SET status='assigned', node_id=? WHERE id = (SELECT s.id "
                     "FROM submissions s JOIN node_tasks t ON t.task = s.task WHERE t.node_id=? "
-                    "AND s.status='queued' ORDER BY s.created LIMIT 1) "
-                    "RETURNING id, task, agent, manifest_id, split, kind", (node, node)).fetchall()
+                    "AND s.status='queued'" + where + " ORDER BY s.created LIMIT 1) "
+                    "RETURNING id, task, agent, manifest_id, split, kind, group_id",
+                    (node, node, *args)).fetchall()
+                if rows:
+                    # What a node that batches families may claim with it, counted now: a
+                    # family's jobs are queued together when it is committed.
+                    siblings = db.execute(
+                        "SELECT COUNT(*) FROM submissions s JOIN node_tasks t ON t.task = s.task "
+                        "WHERE t.node_id=? AND s.status='queued' AND s.manifest_id=? AND s.split=? "
+                        "AND s.agent=?", (node, rows[0][3], rows[0][4], rows[0][2])).fetchone()[0]
             if not rows:
                 return self._send(204)
-            sid, task, agent, mid, split, kind = rows[0]
+            sid, task, agent, mid, split, kind, gid = rows[0]
             manifest = store.manifest(mid)
             self._send(200, {"submission_id": sid, "task": task, "submitter": agent,
                              "split": split, "kind": kind, "manifest": manifest, "bundle_id": mid,
+                             "group_id": gid, "siblings": siblings,
                              "downloads": sign_all(blobs, agent, manifest["files"])})
 
         def _node_post(self, p: str) -> None:

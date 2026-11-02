@@ -160,8 +160,8 @@ def mirror_inputs(m: dict) -> None:
 def main(spec_path: str) -> int:
     spec = json.loads(Path(spec_path).read_text())
     run = Path(spec["run_dir"])
-    if spec.get("mirror"):
-        mirror_inputs(spec["mirror"])
+    for m in spec.get("mirror") or []:      # one per inputs folder (several in a batched predict)
+        mirror_inputs(m)
     env = {k: os.environ[k] for k in PASS_ENV if k in os.environ}
     if "PYTHONPATH" in env:
         env["PYTHONPATH"] = _sandbox_pythonpath(env["PYTHONPATH"])

@@ -12,6 +12,8 @@ from .contract import Contract
 
 PKG = Path(__file__).resolve().parent  # the bmb_eval package directory
 CACHE_GB = 300     # model-file cache when config.yaml doesn't say, on a disk of 600 GB or more
+# A Modal sandbox lives at most 24 h; a batch's predict also needs its cold start and margin.
+BATCH_MAX_PREDICT_S = 23 * 3600
 
 
 def default_cache_gb(blob_dir: Path) -> int:
@@ -96,6 +98,15 @@ class Config:
     # evaluations it is running to finish before stopping anyway. GPU evaluations run up
     # to hours; the systemd unit's TimeoutStopSec is set from it (install-service).
     drain_timeout_s: int = 7200
+    # Family batching (off by default; for our own public-data nodes, never a provider's):
+    # jobs of one bundle and split on several of this node's tasks share one predict
+    # sandbox, which loads the model once and so sees every batched task's inputs together
+    # (docs/THREAT_MODEL.md). Validate and score stay per task.
+    batch_families: bool = False
+    batch_max_tasks: int = 32
+    # The whole batch's predict time limit: the sum of its tasks' limits, at most this.
+    # Tasks a batch cut off still run, each alone (Modal's sandboxes live at most 24 h).
+    batch_max_predict_s: int = 6 * 3600
     tasks: dict[str, TaskBinding] = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
@@ -132,6 +143,9 @@ class Config:
             blob_dir=blob_dir,
             service_name=str(raw.get("service_name") or "bmb-eval"),
             drain_timeout_s=max(0, int(raw.get("drain_timeout_s", 7200))),
+            batch_families=bool(raw.get("batch_families", False)),
+            batch_max_tasks=max(2, int(raw.get("batch_max_tasks", 32))),
+            batch_max_predict_s=min(BATCH_MAX_PREDICT_S, max(60, int(raw.get("batch_max_predict_s", 6 * 3600)))),
             raw=raw,
         )
         if not cfg.service_name.replace("-", "").replace("_", "").isalnum():
@@ -151,6 +165,9 @@ class Config:
             cfg.modal = ModalSettings.parse(raw.get("modal"), cfg.node_name)
             # Evaluations run side by side, each in its own Modal container.
             cfg.max_parallel = max(1, cfg.modal.max_jobs)
+        if cfg.batch_families and cfg.sealed:
+            # A provider's data: a batched model sees every task's inputs at once.
+            raise SystemExit("batch_families is for public-data nodes; the sealed node can't batch")
         if cfg.backend == "local" and not cfg.allow_unisolated:
             raise SystemExit("sandbox.backend local is NOT isolated; set "
                              "sandbox.i_understand_local_backend_is_not_isolated: true "

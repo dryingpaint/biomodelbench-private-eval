@@ -76,6 +76,20 @@ class Result:
     seconds: float
 
 
+def check_mounts(entry: str, mounts: list[Mount], env: dict[str, str], batch_ok: bool) -> None:
+    """Refuse a stage given more than it may see, before it starts: predict never gets
+    answers, and a stage gets one task's inputs, except a batched predict (BMB_BATCH) on
+    a node that opted in (batch_families), which gets each batched task's. The Modal
+    backend checks its volumes again (modal_backend.ModalSandbox.plan)."""
+    batched = "BMB_BATCH" in env
+    if batched and not (entry == "predict" and batch_ok):
+        raise PermissionError(f"{entry}: batched, on a node that doesn't batch families")
+    if entry == "predict" and any(m.env.startswith("BMB_ANSWERS") or m.env == "BMB_TASK" for m in mounts):
+        raise PermissionError("predict may not mount answers or the task folder")
+    if sum(m.env.startswith("BMB_INPUTS") for m in mounts) > 1 and not batched:
+        raise PermissionError(f"{entry} mounts more than one task's inputs")
+
+
 ENGINES = ("docker", "podman")
 
 # What goes into the sandbox image; deploy/gcp/hub-deploy.sh stamps the image it

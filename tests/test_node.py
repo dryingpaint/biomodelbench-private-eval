@@ -496,7 +496,8 @@ def test_result_held_on_node_until_release(connected):
     cfg.tasks["binding"].contract.limits.release_after_s = 3600
     w = Worker(cfg)
     sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
-    w.step()                                     # runs it
+    w.step()                                     # takes it; it runs in its own thread
+    w.wait_jobs()
     w.step()
     assert agent.status(sid)["status"] == "pending"
     with w.store.lock, w.store.db:
@@ -2257,7 +2258,8 @@ def test_task_served_by_two_nodes_shares_its_queue(hub, tmp_path, provider_files
     a.step(), b.step()
     assert [t["contract"]["id"] for t in agent.tasks()["tasks"]] == ["binding"]
     sids = [agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"] for _ in range(4)]
-    for _ in range(20):
+    deadline = time.time() + 120
+    while time.time() < deadline:
         a.step(), b.step()
         a.wait_jobs(0.05), b.wait_jobs(0.05)
         if all(agent.status(s)["status"] == "done" for s in sids):

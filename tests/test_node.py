@@ -1272,6 +1272,39 @@ def test_second_task_connects_with_bare_code_on_same_machine(hub, connected, pro
     assert "second" in Config.load(cfg.path).tasks
 
 
+def test_running_node_takes_up_a_task_connected_while_it_runs(hub, connected, provider_files, tmp_path):
+    """`connect` adds a task to the config and approves it; the running service used to
+    compare that approval against the config it started with and stop taking work until a
+    restart (7 hours on 2026-11-02). It now takes up the approved task list in place."""
+    cfg, store, url, agent = connected
+    data, _ = provider_files
+    w = Worker(cfg)
+    assert w.accepting()
+    d = scaffold.write_task("second", tmp_path / "authored_second",
+                            [("variant_id", "string", False), ("sequence", "string", False)],
+                            [("variant_id", "string", False), ("fitness", "float", False)],
+                            ["variant_id"], "regression", "fitness")
+    code, _ = store.add_enrollment(d)
+    cli.main(["--config", str(cfg.path), "connect", code, "--data", str(data), "--yes", "--no-service"])
+    w._accepting = (0.0, False)                          # the 30 s cache has expired
+    assert w.accepting() and "second" in w.cfg.tasks and "second" in w.runner.cfg.tasks
+    w.step()                                             # hello publishes the new task
+    sid = agent.submit_async("second", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain()
+    assert agent.status(sid)["result"]["status"] == "ok"
+
+
+def test_running_node_still_waits_for_a_restart_on_other_changes(connected):
+    cfg, *_ = connected
+    w = Worker(cfg)
+    raw = yaml.safe_load(cfg.path.read_text())
+    raw["batch_families"] = True                         # approved, but not a task: needs a restart
+    cfg.path.write_text(yaml.safe_dump(raw))
+    cli.main(["--config", str(cfg.path), "approve"])
+    w._accepting = (0.0, False)
+    assert not w.accepting() and not w.cfg.batch_families
+
+
 # ------------------------------------------------------- final-only metrics
 
 def _final_only_task(tmp_path, name="fo_task"):

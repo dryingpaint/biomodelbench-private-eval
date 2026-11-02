@@ -94,22 +94,29 @@ ATTACKS = [
                     and (name.startswith(("libcuda", "libnvidia", "nvidia")) or "/firmware/nvidia/" in target
                          or (name.endswith(".json") and "nvidia" in name)))
 
-        def _modal_volumes(inputs_dir):
+        def _linked_from_inputs():
+            # Real paths of everything the inputs link to. On Modal a large file both halves of
+            # a task share (e.g. a perturbation task's controls.h5ad) lives once in a volume of
+            # its own and is linked into the inputs: given to this stage, not an escape.
+            linked = set()
+            for d in (os.environ.get("BMB_INPUTS_DIR"), os.path.dirname(_inputs_path())):
+                for base, dirs, files in os.walk(d or "/nonexistent"):
+                    for n in dirs + files:
+                        p = os.path.join(base, n)
+                        if os.path.islink(p):
+                            linked.add(os.path.realpath(p))
+                    if base.count(os.sep) > 8:
+                        break
+            return linked
+
+        def _modal_volumes(inputs_dir, linked):
             # Modal: every volume of the sandbox is under /__modal/volumes, reached through a
             # symlink at its mount path. Each must be one this stage was given: the bundle,
             # the inputs, or a shared file linked from the inputs.
             root = "/__modal/volumes"
             if not os.path.isdir(root):
                 return []
-            given = {os.path.realpath(os.environ["BMB_BUNDLE"]), inputs_dir}
-            for d in (os.environ.get("BMB_INPUTS_DIR"), os.path.dirname(_inputs_path())):
-                for base, dirs, files in os.walk(d or "/nonexistent"):
-                    for n in dirs + files:
-                        p = os.path.join(base, n)
-                        if os.path.islink(p):
-                            given.add(os.path.realpath(p))
-                    if base.count(os.sep) > 8:
-                        break
+            given = {os.path.realpath(os.environ["BMB_BUNDLE"]), inputs_dir} | linked
             hits = []
             for v in os.listdir(root):
                 path = os.path.join(root, v)
@@ -139,7 +146,8 @@ ATTACKS = [
             # 2. Data files outside the inputs and the image's own libraries. (The real
             #    folder of the samples table: on Modal the inputs are behind symlinks.)
             inputs_dir = os.path.dirname(os.path.realpath(_inputs_path()))
-            hits += _modal_volumes(inputs_dir)
+            linked = _linked_from_inputs()
+            hits += _modal_volumes(inputs_dir, linked)
             skip = (inputs_dir + os.sep, sys.prefix + os.sep, "/usr/")
             t0, seen = time.time(), 0
             for root, dirs, files in os.walk("/"):
@@ -147,7 +155,8 @@ ATTACKS = [
                 for f in files:
                     seen += 1
                     p = os.path.realpath(os.path.join(root, f))
-                    if f.endswith((".parquet", ".csv", ".h5ad")) and not p.startswith(skip):
+                    if (f.endswith((".parquet", ".csv", ".h5ad")) and not p.startswith(skip)
+                            and p not in linked):
                         hits.append(p)
                 if seen > 300_000 or time.time() - t0 > 60:
                     break

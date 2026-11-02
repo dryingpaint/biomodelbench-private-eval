@@ -13,6 +13,7 @@ Vector columns may be given as one list column, or as one column per label
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
@@ -292,6 +293,54 @@ def synth_files(c: Contract, n: int, dest: Path, seed: int = 0) -> pd.DataFrame:
             p.touch()   # unknown format: the agent gets an empty placeholder
     df.to_parquet(dest / "samples.parquet", index=False)
     return df
+
+
+def synth_column(f: Field, inputs: pd.DataFrame, rng, constant: bool = False) -> list:
+    """Fake values of an output or answer field, one per row of `inputs`: random within
+    the declared type, bounds and allowed values, or the same value on every row
+    (constant=True: predictions with no skill, or answers that are all one class).
+    List items that must come from an input column (in_input) are drawn from that
+    row's candidates. For `bmb-eval check-task`, which runs scorers on them."""
+    n = len(inputs)
+
+    def scalars(g: Field, k: int) -> list:
+        if g.allowed:
+            v = [g.allowed[0]] * k if constant else list(rng.choice(np.array(g.allowed, dtype=object), k))
+        elif g.type == "bool":
+            v = [True] * k if constant else list(rng.random(k) < 0.5)
+        elif g.type == "string":
+            # The pool synth_inputs gives candidate columns, so answers can overlap them.
+            v = ["C0"] * k if constant else [f"C{j}" for j in rng.integers(0, 50, k)]
+        else:
+            lo = g.min if g.min is not None else (g.max - 1 if g.max is not None else 0.0)
+            hi = g.max if g.max is not None else lo + (100.0 if g.type == "int" else 1.0)
+            x = np.full(k, (lo + hi) / 2) if constant else rng.uniform(lo, hi, k)
+            v = list(np.clip(np.round(x), np.ceil(lo), np.floor(hi)).astype(int)) if g.type == "int" else list(x)
+        if g.nullable and not constant:
+            v = [None if r < 0.05 else x for r, x in zip(rng.random(k), v)]
+        return v
+
+    if f.type == "vector":
+        g = dataclasses.replace(f, type="float", nullable=False)
+        return [np.asarray(scalars(g, f.length), dtype=float) for _ in range(n)]
+    if f.type == "list":
+        out = []
+        k_const = min(f.max_items, 5)
+        for r in range(n):
+            k = k_const if constant else int(rng.integers(0, min(f.max_items, 10) + 1))
+            pool = next((list(inputs[i.in_input].iloc[r]) for i in f.items if i.in_input), None)
+            if pool is not None:
+                k = min(k, len(pool))
+            item = {}
+            for i in f.items:
+                if i.in_input:
+                    item[i.name] = pool[:k] if constant else list(rng.choice(np.array(pool, dtype=object),
+                                                                             k, replace=False))
+                else:
+                    item[i.name] = scalars(dataclasses.replace(i, nullable=False), k)
+            out.append(item)
+        return out
+    return scalars(f, n)
 
 
 def _synth_table(c: Contract, fields: list, samples: pd.DataFrame, rng, per_sample: int = 5):

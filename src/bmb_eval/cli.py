@@ -1006,6 +1006,12 @@ def cmd_contract(args) -> None:
     print(json.dumps(_cfg(args).tasks[args.task].contract.public(), indent=2))
 
 
+def cmd_check_task(args) -> None:
+    from .taskcheck import check
+    if check(Path(args.task_dir), _user_path(args.data) if args.data else None, n=args.n, seed=args.seed):
+        sys.exit(1)
+
+
 def cmd_audit(args) -> None:
     ok, n, msg = audit.verify(_cfg(args).state_dir)
     print(f"{n} entries: {msg}")
@@ -1132,6 +1138,13 @@ def main(argv=None) -> None:
     p = sub.add_parser("audit", help="(troubleshoot) verify the audit log")
     p.add_argument("action", choices=["verify"])
     p.set_defaults(fn=cmd_audit)
+    p = sub.add_parser("check-task", help="(operator) run a task folder's scorer on synthetic data "
+                       "and edge cases before any provider connects")
+    p.add_argument("task_dir", help="folder with contract.yaml and score.py")
+    p.add_argument("--data", help="a provider-style table or folder to use instead of synthetic rows")
+    p.add_argument("-n", type=int, default=300, help="synthetic rows (default 300)")
+    p.add_argument("--seed", type=int, default=0)
+    p.set_defaults(fn=cmd_check_task)
     p = sub.add_parser("contract", help="(operator) print a task's public contract")
     p.add_argument("task")
     p.set_defaults(fn=cmd_contract)

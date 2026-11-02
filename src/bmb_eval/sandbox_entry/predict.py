@@ -276,7 +276,5 @@ def main_batch(pred_out, bundle: Path, n: int) -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except MemoryError:            # e.g. importing torch under a tight memory limit
-        sys.exit(EXIT_MEMORY)
+    from bmb_eval.sandbox_entry import run
+    run(main, {MemoryError: (EXIT_MEMORY, False)})   # e.g. importing torch under a tight memory limit

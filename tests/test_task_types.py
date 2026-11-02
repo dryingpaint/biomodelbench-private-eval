@@ -351,3 +351,22 @@ def test_many_rows_can_share_one_file(tmp_path):
     df.to_csv(raw / "spots.csv", index=False)
     inputs_dir, _, n = prepare(c, raw, tmp_path / "out")
     assert n == N and (inputs_dir / "files" / "patches" / "s0.npy").exists()
+
+
+@pytest.mark.parametrize("body,code,out", [
+    ("print('x', end='')", 0, "x"),                       # unflushed output still arrives
+    ("import sys; sys.exit(11)", 11, ""),
+    ("raise MemoryError", 12, ""),                        # mapped, no traceback
+    ("raise KeyError('k')", 1, ""),                       # unmapped: traceback, exit 1
+])
+def test_stage_entry_exit_codes_survive_skipping_teardown(body, code, out):
+    """Entry points leave with os._exit (a native library aborting at interpreter shutdown
+    failed finished stages); exit codes and output must come through unchanged."""
+    import subprocess
+    import sys
+    prog = ("from bmb_eval.sandbox_entry import run\n"
+            f"def main():\n    {body}\n"
+            "run(main, {MemoryError: (12, False)})\n")
+    r = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True)
+    assert r.returncode == code and r.stdout == out
+    assert ("Traceback" in r.stderr) == (code == 1)

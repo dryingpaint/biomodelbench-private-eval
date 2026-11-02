@@ -52,11 +52,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except BaseException:
-        import traceback
-        traceback.print_exc()
-        sys.exit(EXIT_SCORER)
+    from bmb_eval.sandbox_entry import run
+    run(main, {BaseException: (EXIT_SCORER, True)})

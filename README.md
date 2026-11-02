@@ -57,6 +57,7 @@ predict.py     def predict(df[, inputs_dir]) -> DataFrame   (one row per sample)
                def load_model([inputs_dir])                  (optional, called once)
 weights/       anything predict.py loads (safetensors, a LoRA adapter, ...)
 wheels/        optional *.whl, installed offline
+BMB_BATCHABLE  optional, empty: this model may predict a family's datasets in one process
 ```
 
 `df` holds the task's input columns, with file columns as absolute paths.
@@ -67,9 +68,12 @@ a fixed-length `vector`, or a `list` (a dict of equal-length lists, e.g.
 transformers, peft, safetensors, scikit-learn, anndata and pandas. There is
 no network, so everything must be in the bundle.
 
-The datasets of a family submission may share one process, one dataset after
-another: `load_model()` then runs once for all of them, `load_model(inputs_dir)`
-once per dataset. Don't keep state from one dataset's `predict` to the next.
+With a `BMB_BATCHABLE` file, the datasets of a family submission may share one
+process, one dataset after another (on nodes that batch): `load_model()` then runs
+once for all of them, `load_model(inputs_dir)` once per dataset. During each
+dataset, `BMB_CONTRACT_FILE` names that dataset's contract, so read it in
+`predict` (or `load_model(inputs_dir)`), not at import. Don't keep state from one
+dataset's `predict` to the next. Without the file, every dataset runs alone.
 
 ```bash
 pip install git+https://github.com/dryingpaint/biomodelbench-private-eval

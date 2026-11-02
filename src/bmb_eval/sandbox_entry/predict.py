@@ -19,8 +19,13 @@ load_model() or load_model(inputs_dir). File columns arrive as absolute paths.
 
 Batch mode (BMB_BATCH=<n>, family batching on nodes that opt in): one process
 predicts n tasks with the same bundle, so the model is imported and loaded once.
-BMB_CONTRACT_FILE then holds a list of {"contract", "timeout_s", "max_bytes"},
-one per task, and task i's inputs are BMB_INPUTS_DIR_<i> (or BMB_INPUTS_<i>).
+The node's BMB_CONTRACT_FILE then holds a list of {"contract", "timeout_s",
+"max_bytes"}, one per task, and task i's inputs are BMB_INPUTS_DIR_<i> (or
+BMB_INPUTS_<i>). The model never sees that list: while task i loads and predicts,
+BMB_CONTRACT_FILE names a file holding task i's contract alone, as when it runs
+by itself (the first task's during import and a shared load_model()). Only bundles
+that opt in with a BMB_BATCHABLE file are batched (node.py): a model that reads its
+contract once at import would otherwise predict every task as the first.
 load_model() runs once; load_model(inputs_dir) depends on the task, so it runs
 before each task's predict. Each task's outcome leaves as one frame on stdout,
 in task order and flushed as it completes, so tasks finished before the process
@@ -207,6 +212,15 @@ def main_batch(pred_out, bundle: Path, n: int) -> None:
     specs = json.loads(Path(os.environ["BMB_CONTRACT_FILE"]).read_text())
     if len(specs) != n:
         raise SystemExit(f"batch of {n} tasks with {len(specs)} contracts")
+    # Each task's own contract where the model looks for it: on 2026-11-02 models that read
+    # BMB_CONTRACT_FILE found the batch's list and failed 80 tasks (c["id"] on a list).
+    tmp = Path(os.environ.get("TMPDIR", "/tmp"))
+    own = []
+    for i, spec in enumerate(specs):
+        f = tmp / f"bmb_contract_{i}.json"
+        f.write_text(json.dumps(spec["contract"]))
+        own.append(str(f))
+    os.environ["BMB_CONTRACT_FILE"] = own[0]
     done = 0
 
     def frame(status: int, data: bytes = b"") -> None:
@@ -247,6 +261,7 @@ def main_batch(pred_out, bundle: Path, n: int) -> None:
         inputs_dir = Path(os.environ[f"BMB_INPUTS_DIR_{i}"]) if os.environ.get(f"BMB_INPUTS_DIR_{i}") else None
         inputs_path = Path(os.environ.get(f"BMB_INPUTS_{i}") or inputs_dir / "samples.parquet")
         print(f"# ---- batch task {i}: {spec['contract']['id']}", file=sys.stderr, flush=True)
+        os.environ["BMB_CONTRACT_FILE"] = own[i]
         _seed()                          # each task's predictions don't depend on the ones before
         stage = EXIT_IMPORT
         try:

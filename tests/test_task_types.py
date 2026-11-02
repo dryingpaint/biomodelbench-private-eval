@@ -120,6 +120,14 @@ def evaluate(cfg, task, bundle_dir):
     return Runner(cfg, send_alerts=False).evaluate(task, pack_dir(bundle_dir))
 
 
+def _why(cfg, p) -> str:
+    """The run's provider-only record and logs, for a failure message (the agent-facing
+    error says only predict_runtime_error for an unexpected exit)."""
+    d = cfg.state_dir / "runs" / p["run_id"]
+    return "\n".join(f"--- {f.name}\n{f.read_text()[-3000:]}" for f in sorted(d.glob("*"))
+                     if f.suffix in (".json", ".log"))
+
+
 # ---------------------------------------------------------------- end to end
 
 @pytest.mark.parametrize("task", sorted(RAW))
@@ -192,7 +200,7 @@ def _bundle(tmp_path, body: str) -> Path:
 def test_bad_structured_outputs_rejected(node, tmp_path, task, body, reason):
     cfg, _ = node(task)
     p = evaluate(cfg, task, _bundle(tmp_path, body))
-    assert p["status"] == "error" and p["error"]["code"] == "predictions_invalid", p
+    assert p["status"] == "error" and p["error"]["code"] == "predictions_invalid", _why(cfg, p)
     assert p["error"]["detail"]["reason"] == reason
 
 
@@ -312,7 +320,7 @@ def test_scorer_only_files_reach_scorer_never_model(tmp_path):
     b = _bundle(tmp_path, "def load_model(d):\n    global C\n    C = np.load(d / 'control.npy').mean(0)\n"
                           "def predict(df):\n    return pd.DataFrame({'shift': [list(C)] * len(df)})\n")
     p = evaluate(cfg, "perturb_pop", b)
-    assert p["status"] == "ok" and set(p["metrics"]) == {"mae"}, p
+    assert p["status"] == "ok" and set(p["metrics"]) == {"mae"}, _why(cfg, p)
     # A model probing for the scorer-only files finds nothing.
     spy = _bundle(tmp_path, "import os\ndef predict(df):\n    d = os.environ['BMB_INPUTS_DIR']\n"
                             "    found = [f for _, _, fs in os.walk(d) for f in fs if f.startswith('q')]\n"

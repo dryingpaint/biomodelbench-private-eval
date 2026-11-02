@@ -69,6 +69,7 @@ if [ -z "${BMB_SKIP_SELFTEST:-}" ]; then
   ./bmb-eval selftest && ./bmb-eval approve >/dev/null
   # Updating: restart the background service so it runs the new code.
   if systemctl --user is-enabled bmb-eval >/dev/null 2>&1; then
+    echo "Restarting the node once the evaluations it is running finish..."
     systemctl --user restart bmb-eval && echo "Updated and restarted."
   fi
 fi

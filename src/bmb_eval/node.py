@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import threading
 import time
 import urllib.error
@@ -37,6 +38,9 @@ MODAL_DRIFT_S = 300    # the manifest on Modal against the approved one (one API
 MODAL_DRIFT_RETRY_S = 60   # sooner while drifted, to notice the fix
 MODAL_CHECK_BACKOFF_S = (60, 120, 300, 600, 1800)   # after checks Modal couldn't answer
 MODAL_CHECK_ALERT_AFTER = 3   # failed checks in a row before alerting
+# Model files fetched at once across all jobs. Each job downloads in its own thread, so a
+# node taking hundreds of jobs would otherwise open hundreds of multi-GB streams.
+MAX_DOWNLOADS = 8
 
 
 class HubError(Exception):
@@ -212,11 +216,20 @@ class Worker:
         self._modal_lock_mtime: float | None = None
         self._infra_pause_until = 0.0     # after a lost sandbox: don't take new work until then
         self._modal_alerted: str | None = None
+        # Model files being downloaded: sha256 -> set once that download ends, so a second
+        # job needing the same file waits for it rather than fetching it again.
+        self._fetching: dict[str, threading.Event] = {}
+        self._fetch_lock = threading.Lock()
+        self._download_slots = threading.Semaphore(MAX_DOWNLOADS)
+        self._download_failures = 0       # in a row, across jobs
+        # Set by SIGTERM/SIGINT (run_forever): when draining began. A second signal forces exit.
+        self._draining: float | None = None
+        self._force_exit = False
 
     # ------------------------------------------------------------- gates
 
     def accepting(self) -> bool:
-        if paused_path(self.cfg).exists():
+        if self._draining is not None or paused_path(self.cfg).exists():
             return False
         checked, ok = self._accepting
         if time.time() - checked < 30:
@@ -326,6 +339,9 @@ class Worker:
                                 "BioModelBench fixes it", status=e.status)
                     self._hello_rejected = str(e)
             self._last_hello = time.time()
+        # Reaped before results are posted, so a job seen finished here has its result
+        # delivered in this same step (a draining node exits once nothing is left running).
+        did = self._reap()
         for sid, payload in self.store.released_unposted():
             try:
                 self.api.result(sid, payload)
@@ -337,13 +353,13 @@ class Worker:
                 audit.record(self.cfg.state_dir, "result_dropped", run_id=sid, error=str(e)[:200])
             self.store.mark_posted(sid)
             did = True
-        did = self._reap() or did
-        if not self._room_for_any():
+        if self._draining is not None or not self._room_for_any():
             return did
         # Finish anything interrupted by a restart before taking new work.
         local = self.store.next_queued()
         if local:
-            self._dispatch(*local, self._need(local[0], local[1]))
+            # No download links: a file evicted since is fetched by handing the job back.
+            self._dispatch(*local, self._need(local[0], local[1]), {})
             return True
         if not accepting or time.time() < self._infra_pause_until:
             return did
@@ -394,12 +410,12 @@ class Worker:
         needs = [self._need("", tid) for tid in self.cfg.tasks] or [(1.0, 0, 0)]
         return self._fits(tuple(max(n[i] for n in needs) for i in range(3)))
 
-    def _dispatch(self, sid: str, task: str, submitter: str, need: tuple[float, int, int]) -> None:
-        if self.parallel <= 1:
-            self._run(sid, task, submitter)
-            self._evict()
-            return
-        th = threading.Thread(target=self._run, args=(sid, task, submitter), daemon=True,
+    def _dispatch(self, sid: str, task: str, submitter: str, need: tuple[float, int, int],
+                  downloads: dict) -> None:
+        # Every job runs in its own thread, a serial node's too (it just runs one at a
+        # time): the loop keeps checking in and posting results while a job downloads its
+        # model or runs, and can stop taking work at any moment (SIGTERM drains).
+        th = threading.Thread(target=self._run, args=(sid, task, submitter, downloads), daemon=True,
                               name=f"eval-{sid}")
         self._jobs[sid] = (th, *need)
         th.start()
@@ -453,7 +469,7 @@ class Worker:
             audit.record(self.cfg.state_dir, "job_lost", run_id=sid)
         return len(lost)
 
-    def run_forever(self) -> None:
+    def run_forever(self) -> bool:
         if self.cfg.backend == "modal":
             # Sandboxes and job volumes of a previous run of this node are orphans now.
             from .modal_backend import cleanup_jobs
@@ -466,7 +482,32 @@ class Worker:
         self.drop_lost_jobs()
         n = self.store.requeue_running()
         audit.record(self.cfg.state_dir, "node_start", requeued=n)
-        print(f"bmb-eval node running; connected to {self.api.url}. Ctrl-C to stop.")
+        print(f"bmb-eval node running; connected to {self.api.url}. Ctrl-C to stop "
+              "(after running evaluations finish; twice to stop at once).", flush=True)
+        prev = {s: signal.signal(s, self._on_signal) for s in (signal.SIGTERM, signal.SIGINT)}
+        try:
+            return self.serve()
+        finally:
+            for s, h in prev.items():
+                signal.signal(s, h)
+
+    def _on_signal(self, signum, frame) -> None:
+        """SIGTERM/SIGINT: drain. Every deploy (systemctl restart) used to throw away the
+        evaluations in flight, up to an hour of GPU time each; now the node finishes them
+        first. A second signal stops it at once, as before."""
+        if self._draining is None:
+            self._draining = time.time()
+            self._last_hello = 0.0        # tell the hub now that this node takes no more work
+            print(f"stopping: no new work; waiting for {len(self._jobs)} running evaluation(s), "
+                  f"at most {self.cfg.drain_timeout_s} s. Signal again to stop at once.", flush=True)
+        else:
+            self._force_exit = True
+
+    def serve(self) -> bool:
+        """The node's loop, until a drain started by _on_signal ends: True once every job
+        it was running has finished and its result is stored (posted if released), False
+        when a second signal or drain_timeout_s cut it short. Jobs cut short run again when
+        the node next starts, as after any interruption."""
         while True:
             try:
                 busy = self.step()
@@ -478,13 +519,25 @@ class Worker:
                     alerts.send(self.cfg, "infra", "cannot reach the BioModelBench hub",
                                 failures=self._hub_failures)
                 busy = False
+            if self._draining is not None:
+                if not self._jobs:
+                    audit.record(self.cfg.state_dir, "node_drained",
+                                 seconds=round(time.time() - self._draining))
+                    return True
+                if self._force_exit or time.time() - self._draining > self.cfg.drain_timeout_s:
+                    audit.record(self.cfg.state_dir, "node_stop_forced", running=sorted(self._jobs),
+                                 reason="signal" if self._force_exit else "drain_timeout")
+                    return False
+                busy = False              # nothing to take: wait for the running jobs
             if not busy:
                 time.sleep(POLL_S)
 
     def drain(self, max_s: float = 300) -> None:
         """Process until idle (tests and one-shot use)."""
         deadline = time.time() + max_s
-        self.store.requeue_running()
+        if not self._jobs:
+            # Only jobs no thread is running: requeuing one in flight would run it twice.
+            self.store.requeue_running()
         while time.time() < deadline:
             if not self.step() and not self.store.released_unposted() and not self._jobs:
                 break
@@ -526,39 +579,101 @@ class Worker:
         else:
             try:
                 files = check_manifest(job.get("manifest"), lim.max_bundle_gb << 30)
-                # Fetch only what this machine hasn't cached. A network failure
-                # raises HubError before anything is recorded, so the hub
-                # re-queues the job and it is retried later.
-                fetched = 0
-                for f in {f["sha256"]: f for f in files}.values():
-                    if not self.cache.has(f["sha256"], f["size"]):
-                        self.api.download(job["downloads"][f["sha256"]], self.cache,
-                                          f["sha256"], f["size"])
-                        fetched += f["size"]
-            except EvalError as e:   # bad manifest, or a file that fails its hash
+            except EvalError as e:   # bad manifest
                 refusal = e
         if refusal:
-            # Data-independent refusal: answer immediately, never run anything.
-            # A refused test job isn't counted as a final evaluation.
-            self.store.add(sid, task, submitter, 0, "test_refused" if split == "test" else split, kind)
-            self.store.finish(sid, {"run_id": sid, "task": task, "status": "error",
-                                    "error": refusal.public()})
+            self._refuse(sid, task, submitter, split, kind, refusal, new=True)
             return
+        # Taking a job is cheap: record it (so the next hello reports it held) and start its
+        # thread, which downloads what this machine hasn't cached and then runs it. A
+        # multi-GB download here used to stall the whole node: no new jobs, no results
+        # posted, no check-ins.
         (self.queue_dir / f"{sid}.json").write_text(json.dumps(
-            {"files": files, "bundle_id": job.get("bundle_id"), "split": split}))
+            {"files": files, "bundle_id": job.get("bundle_id"), "split": split, "kind": kind}))
         self.store.add(sid, task, submitter, lim.release_after_s, split, kind)
         audit.record(self.cfg.state_dir, "job_received", run_id=sid, task=task, split=split, kind=kind,
                      submitter=submitter, bundle_id=job.get("bundle_id"),
-                     bytes=sum(f["size"] for f in files), downloaded=fetched)
+                     bytes=sum(f["size"] for f in files))
         self.store.start(sid)
-        self._dispatch(sid, task, submitter, (float(lim.cpus), mem_bytes(lim.memory), int(lim.gpus)))
+        self._dispatch(sid, task, submitter, (float(lim.cpus), mem_bytes(lim.memory), int(lim.gpus)),
+                       job.get("downloads") or {})
 
-    def _run(self, sid: str, task: str, submitter: str) -> None:
+    def _refuse(self, sid: str, task: str, submitter: str, split: str, kind: str,
+                refusal: EvalError, new: bool) -> None:
+        """Data-independent refusal: answer immediately, never run anything. A refused
+        test job isn't counted as a final evaluation. `new`: not recorded yet; otherwise
+        the recorded job (taken, then a file failed its hash) becomes the refusal."""
+        refused = "test_refused" if split == "test" else split
+        result = {"run_id": sid, "task": task, "status": "error", "error": refusal.public()}
+        if new:
+            self.store.add(sid, task, submitter, 0, refused, kind)
+            self.store.finish(sid, result)
+        else:
+            self.store.refuse(sid, refused, result)
+            (self.queue_dir / f"{sid}.json").unlink(missing_ok=True)
+
+    def _fetch(self, files: list[dict], downloads: dict) -> int:
+        """Download every file of a job that isn't cached; returns the bytes fetched.
+        HubError when one can't be fetched; EvalError when one fails its hash."""
+        fetched = 0
+        for f in {f["sha256"]: f for f in files}.values():
+            sha, size = f["sha256"], f["size"]
+            while not self.cache.has(sha, size):
+                with self._fetch_lock:
+                    pending = self._fetching.get(sha)
+                    if pending is None:
+                        mine = self._fetching[sha] = threading.Event()
+                if pending is not None:
+                    # Another job is fetching this file: wait, then look again (and fetch it
+                    # ourselves if that download failed).
+                    pending.wait()
+                    continue
+                try:
+                    if sha not in downloads:
+                        # A job resumed after a restart has no links (signed, short-lived).
+                        raise HubError(f"no download link for {sha[:12]}")
+                    with self._download_slots:
+                        self.api.download(downloads[sha], self.cache, sha, size)
+                    fetched += size
+                finally:
+                    with self._fetch_lock:
+                        del self._fetching[sha]
+                    mine.set()
+        return fetched
+
+    def _hand_back(self, sid: str, task: str, e: HubError) -> None:
+        """A model file couldn't be downloaded: give the job back to the hub uncounted, as
+        when the download ran before the job was recorded and the hub re-queued it."""
+        self.store.forget(sid)
+        (self.queue_dir / f"{sid}.json").unlink(missing_ok=True)
+        with self._fetch_lock:
+            self._download_failures += 1
+            n = self._download_failures
+        audit.record(self.cfg.state_dir, "job_download_failed", run_id=sid, task=task,
+                     error=str(e)[:300])
+        if n == HUB_ALERT_AFTER:
+            alerts.send(self.cfg, "infra", f"{n} model downloads in a row failed; jobs go back to "
+                        "the hub uncounted", error=str(e)[:200])
+        # Don't take the job straight back: the hub hands it out again at once.
+        self._infra_pause_until = max(self._infra_pause_until, time.time() + POLL_S)
+        self._last_hello = 0.0        # tell the hub on the next step, so it hands the job out again
+
+    def _run(self, sid: str, task: str, submitter: str, downloads: dict) -> None:
         path = self.queue_dir / f"{sid}.json"
         try:
             job = json.loads(path.read_text())
-            if not all(self.cache.has(f["sha256"], f["size"]) for f in job["files"]):
-                raise EvalError("infra_error", internal="cached files missing")
+            t0 = time.time()
+            try:
+                if fetched := self._fetch(job["files"], downloads):
+                    audit.record(self.cfg.state_dir, "job_downloaded", run_id=sid, bytes=fetched,
+                                 seconds=round(time.time() - t0, 1))
+            except HubError as e:
+                return self._hand_back(sid, task, e)
+            except EvalError as e:   # a file that fails its hash
+                return self._refuse(sid, task, submitter, job.get("split", "validation"),
+                                    job.get("kind", "agent"), e, new=False)
+            with self._fetch_lock:
+                self._download_failures = 0
             # Assembled next to the cache (hard links, same filesystem): the
             # confidential node keeps its state in memory but models on disk.
             bundle = self.cache.assemble(job["files"], self.cfg.blob_dir.parent / "bundles" / sid)

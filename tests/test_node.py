@@ -1649,6 +1649,185 @@ def test_serial_node_is_unchanged_by_default(connected):
     w.drain()
     assert not w._jobs and agent.status(sid)["result"]["status"] == "ok"
 
+
+def _sub_status(store, sid):
+    return store.q("SELECT status FROM submissions WHERE id=?", (sid,), one=True)[0]
+
+
+def test_loop_keeps_serving_while_a_model_downloads(connected, tmp_path, monkeypatch):
+    # Taking a job used to download its whole bundle on the loop thread: a multi-GB model
+    # stopped the node taking other jobs, posting results and checking in meanwhile.
+    cfg, store, url, agent = connected
+    cfg.max_parallel = 4
+    w = Worker(cfg)
+    w.capacity = (1e6, 1 << 50, 0)
+    release, real = threading.Event(), w.api.download
+
+    def download(info, cache, sha, size):
+        if size == 3 << 20:                                  # the big job's "base model"
+            assert release.wait(30)
+        real(info, cache, sha, size)
+    monkeypatch.setattr(w.api, "download", download)
+    big = agent.submit_async("binding", _big_bundle(tmp_path))["submission_id"]
+    t0 = time.time()
+    w.step()                                                 # takes it; its thread downloads
+    assert time.time() - t0 < 5 and big in w._jobs
+    small = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    deadline = time.time() + 60
+    while agent.status(small)["status"] != "done" and time.time() < deadline:
+        w.step()
+        time.sleep(0.05)
+    assert agent.status(small)["result"]["status"] == "ok"   # taken, run and posted meanwhile
+    w._last_hello = 0
+    w.step()                                                 # the check-in reports the big one held
+    assert _sub_status(store, big) == "assigned" and agent.status(big)["status"] == "pending"
+    release.set()
+    w.drain(max_s=60)
+    assert agent.status(big)["result"]["status"] == "ok", agent.status(big)
+
+
+def test_jobs_sharing_a_model_file_download_it_once(connected, tmp_path, monkeypatch):
+    cfg, store, url, agent = connected
+    cfg.max_parallel = 4
+    w = Worker(cfg)
+    w.capacity = (1e6, 1 << 50, 0)
+    gets, real = [], w.api.download
+
+    def slow(info, cache, sha, size):
+        gets.append(sha)
+        time.sleep(0.3)                                      # both jobs are taken meanwhile
+        real(info, cache, sha, size)
+    monkeypatch.setattr(w.api, "download", slow)
+    bundle = _big_bundle(tmp_path)
+    sids = [agent.submit_async("binding", bundle)["submission_id"] for _ in range(3)]
+    w.drain(max_s=60)
+    assert sorted(gets) == sorted({f["sha256"] for f in manifest_for(bundle)["files"]})
+    assert all(agent.status(s)["result"]["status"] == "ok" for s in sids)
+    assert not [p for p in cfg.blob_dir.iterdir() if p.name.startswith(".incoming-")]
+
+
+def test_failed_download_hands_the_job_back_uncounted(connected, monkeypatch):
+    cfg, store, url, agent = connected
+    w = Worker(cfg)
+    real = w.api.download
+
+    def down(*a):
+        raise HubError("download failed: connection reset")
+    monkeypatch.setattr(w.api, "download", down)
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain(max_s=30)
+    # Not counted, not held: the check-in after it gave it back to the hub's queue.
+    assert not w.store.has(sid) and w.store.count_today("agent-1", "binding") == 0
+    assert _sub_status(store, sid) == "queued" and agent.status(sid)["status"] == "pending"
+    assert not list(w.queue_dir.glob("*.json"))
+    events = [json.loads(l)["event"] for l in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert "job_download_failed" in events
+    monkeypatch.setattr(w.api, "download", real)
+    w._infra_pause_until = 0                                 # (the short back-off has passed)
+    w.drain(max_s=30)
+    assert agent.status(sid)["result"]["status"] == "ok"
+    assert w.store.count_today("agent-1", "binding") == 1
+
+
+def test_resumed_job_whose_files_are_gone_goes_back_to_the_hub(connected):
+    # A restart re-runs held jobs locally, but download links aren't kept (they're signed
+    # and short-lived): a job whose files were evicted meanwhile is handed back.
+    cfg, store, url, agent = connected
+    w = Worker(cfg)
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w._dispatch = lambda *a: None                            # the node stops right after taking it
+    w._take(w.api.next())
+    assert not any(cfg.blob_dir.iterdir())                   # nothing downloaded yet
+    w2 = Worker(cfg)
+    w2.drain(max_s=30)
+    assert not w2.store.has(sid) and _sub_status(store, sid) == "queued"
+
+
+def _blocking_evaluate(w, gate):
+    started = threading.Event()
+
+    def evaluate(task, bundle, run_id, submitter, bundle_id=None, split="validation"):
+        started.set()
+        assert gate.wait(30)
+        return {"run_id": run_id, "status": "ok", "metrics": {"spearman": 0.9}}
+    w.runner.evaluate = evaluate
+    return started
+
+
+def test_sigterm_drains_running_jobs_and_takes_no_new_work(connected, monkeypatch):
+    import signal
+    from bmb_eval import node
+    monkeypatch.setattr(node, "POLL_S", 0.05)
+    cfg, store, url, agent = connected
+    w = Worker(cfg)
+    gate = threading.Event()
+    started = _blocking_evaluate(w, gate)
+    running = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w.step()
+    assert started.wait(30)
+    w._on_signal(signal.SIGTERM, None)                       # what systemctl restart sends
+    later = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    out = []
+    t = threading.Thread(target=lambda: out.append(w.serve()), daemon=True)
+    t.start()
+    deadline = time.time() + 10
+    while store.q("SELECT accepting FROM nodes", one=True)[0] and time.time() < deadline:
+        time.sleep(0.05)
+    assert store.q("SELECT accepting FROM nodes", one=True)[0] == 0   # told the hub at once
+    assert t.is_alive() and agent.status(running)["status"] == "pending"
+    gate.set()
+    t.join(30)
+    assert out == [True]
+    assert agent.status(running)["result"]["status"] == "ok"           # finished and posted
+    assert _sub_status(store, later) == "queued" and not w.store.has(later)
+    events = [json.loads(l)["event"] for l in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert "node_drained" in events
+
+
+@pytest.mark.parametrize("how", ["timeout", "second_signal"])
+def test_drain_is_cut_short_and_the_job_reruns_on_restart(connected, monkeypatch, how):
+    import signal
+    from bmb_eval import node
+    monkeypatch.setattr(node, "POLL_S", 0.05)
+    cfg, store, url, agent = connected
+    cfg.drain_timeout_s = 0 if how == "timeout" else 3600
+    w = Worker(cfg)
+    gate = threading.Event()
+    started = _blocking_evaluate(w, gate)
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w.step()
+    assert started.wait(30)
+    w._on_signal(signal.SIGTERM, None)
+    if how == "second_signal":
+        w._on_signal(signal.SIGINT, None)
+    t0 = time.time()
+    assert w.serve() is False and time.time() - t0 < 10
+    events = [json.loads(l) for l in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    forced = [e for e in events if e["event"] == "node_stop_forced"]
+    assert forced[0]["running"] == [sid] and forced[0]["reason"] == ("drain_timeout" if how == "timeout"
+                                                                     else "signal")
+    # The next start runs it again, counted once.
+    w2 = Worker(cfg)
+    w2.drain(max_s=60)
+    assert agent.status(sid)["result"]["status"] == "ok"
+    assert w2.store.count_today("agent-1", "binding") == 1
+    gate.set()
+
+
+def test_run_forever_drains_on_sigterm_and_restores_handlers(connected, monkeypatch):
+    import signal
+    cfg, *_ = connected
+    w = Worker(cfg)
+    before = signal.getsignal(signal.SIGTERM)
+
+    def serve():
+        os.kill(os.getpid(), signal.SIGTERM)                 # handled on this (the main) thread
+        time.sleep(0.1)
+        return w._draining is not None
+    monkeypatch.setattr(w, "serve", serve)
+    assert w.run_forever() is True
+    assert signal.getsignal(signal.SIGTERM) is before
+
 def test_next_bare_code_works_after_a_connect_stops_at_bad_data(hub, node_dir, provider_files,
                                                                  tmp_path):
     """Multi-task email, own machine: the first command (with the hub) hits a data problem;
@@ -1904,6 +2083,8 @@ def test_service_unit_carries_the_shells_proxy_and_certificate_settings(cfg, tmp
     assert ok and why == ""
     assert 'Environment="HTTPS_PROXY=http://proxy.example:3128"' in unit
     assert 'Environment="SSL_CERT_FILE=/etc/ssl/corp.pem"' in unit and "NO_PROXY" not in unit
+    # A restart drains: SIGTERM to the node only, and systemd outwaits its drain timeout.
+    assert "KillMode=mixed" in unit and f"TimeoutStopSec={cfg.drain_timeout_s + 300}" in unit
     assert ["systemctl", "--user", "enable", "--now", "bmb-eval"] in calls
 
 

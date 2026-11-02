@@ -704,6 +704,7 @@ SERVICE_ENV = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_pro
                "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
                # A Modal node's credentials stay in ~/.modal.toml; these only say which profile.
                "MODAL_PROFILE", "MODAL_CONFIG_PATH")
+DRAIN_MARGIN_S = 300     # systemd's stop timeout beyond drain_timeout_s: the node stops itself first
 
 
 def _install_service(cfg) -> tuple[bool, str]:
@@ -727,6 +728,13 @@ Environment=BMB_CONFIG={cfg.path}
 {env}ExecStart={exe} --config {cfg.path} run
 Restart=always
 RestartSec=10
+# A stop or restart drains: the node finishes the evaluations it is running, then exits.
+# SIGTERM goes to the node alone: by default every process of the unit gets it, and the
+# sandboxes running those evaluations would die of it. systemd waits a little longer than
+# the node's own limit, then kills whatever is left.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec={cfg.drain_timeout_s + DRAIN_MARGIN_S}
 
 [Install]
 WantedBy=default.target
@@ -735,6 +743,9 @@ WantedBy=default.target
     r = subprocess.run(["systemctl", "--user", "enable", "--now", name], capture_output=True, text=True)
     if r.returncode != 0:
         return False, (r.stderr or r.stdout or "").strip()
+    if _service_state(name) == "active":
+        print(f"  Restarting {name}: it first finishes the evaluations it is running "
+              f"(at most {cfg.drain_timeout_s // 60} min).", flush=True)
     subprocess.run(["systemctl", "--user", "restart", name], capture_output=True)
     user = os.environ.get("USER", "")
     if subprocess.run(["loginctl", "enable-linger", user], capture_output=True).returncode != 0:
@@ -836,7 +847,11 @@ def cmd_install_service(args) -> None:
 
 def cmd_run(args) -> None:
     from .node import Worker
-    Worker(_cfg(args)).run_forever()
+    if not Worker(_cfg(args)).run_forever():
+        # Stopped before its jobs finished: their threads may be inside Modal or a sandbox
+        # call that interpreter shutdown would wait on. The next start re-runs them.
+        sys.stdout.flush()
+        os._exit(1)
 
 
 # ------------------------------------------------------------- day to day

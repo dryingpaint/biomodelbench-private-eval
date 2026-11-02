@@ -77,6 +77,10 @@ class Config:
     # The systemd user unit the node runs as. A second node on the same machine (e.g. a
     # Modal node beside a container node) needs its own.
     service_name: str = "bmb-eval"
+    # On SIGTERM (a restart) the node takes no new work and waits this long for the
+    # evaluations it is running to finish before stopping anyway. GPU evaluations run up
+    # to hours; the systemd unit's TimeoutStopSec is set from it (install-service).
+    drain_timeout_s: int = 7200
     tasks: dict[str, TaskBinding] = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
@@ -110,6 +114,7 @@ class Config:
             hub=dict(raw.get("hub") or {}),
             blob_dir=rel(raw["blob_dir"]) if raw.get("blob_dir") else None,
             service_name=str(raw.get("service_name") or "bmb-eval"),
+            drain_timeout_s=max(0, int(raw.get("drain_timeout_s", 7200))),
             raw=raw,
         )
         if not cfg.service_name.replace("-", "").replace("_", "").isalnum():

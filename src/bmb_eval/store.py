@@ -98,6 +98,17 @@ class Store:
                 "UPDATE submissions SET status='done', finished=?, result=? WHERE id=?",
                 (time.time(), json.dumps(result), sid))
 
+    def refuse(self, sid: str, split: str, result: dict) -> None:
+        """A recorded job turned out to be refusable (a model file failed its hash while
+        downloading): finish it as a refusal, released at once, under `split` ("test_refused"
+        for a final, so it isn't counted as one). One statement, so no quota count ever
+        sees the job missing."""
+        now = time.time()
+        with self.lock, self.db:
+            self.db.execute(
+                "UPDATE submissions SET status='done', finished=?, result=?, release_at=?, split=? "
+                "WHERE id=?", (now, json.dumps(result), now, split, sid))
+
     def has(self, sid: str) -> bool:
         with self.lock:
             return self.db.execute("SELECT 1 FROM submissions WHERE id=?", (sid,)).fetchone() is not None

@@ -340,3 +340,34 @@ took 24 s. Data into a sandbox moves at about 35 MB/s, but output comes back at
 only about 4 MB/s (Modal's limit, not the network's: 1 GB took 290 s, and
 parallel streams don't help). Predictions near the 512 MB cap therefore spend
 about 2 minutes in transfer per stage that returns them.
+
+## Restart a node without losing work
+
+A node stops gracefully on SIGTERM, which is what `systemctl --user restart` and `stop`
+send. It tells the hub at once that it takes no new work (`accepting: false`), lets the
+evaluations it is running finish and post their results, then exits; a restart then
+starts the new code. So after a code update:
+
+```bash
+systemctl --user restart --no-block bmb-eval-modal    # returns now; the restart waits for the drain
+journalctl --user -u bmb-eval-modal -f                # "stopping: ..." then the new node's start
+```
+
+Without `--no-block`, `systemctl` waits in the shell until the running evaluations finish.
+The node waits at most `drain_timeout_s` (config.yaml, default 7200), then stops anyway.
+To stop at once, as nodes used to, signal it a second time:
+`systemctl --user kill --kill-whom=main -s TERM bmb-eval-modal`. Evaluations cut short
+that way, by the timeout, or by a crash are not lost either: the next start runs them
+again (a Modal node first terminates its leftover sandboxes), counted once.
+
+This needs the unit `install-service` writes (`KillMode=mixed`, so only the node gets
+SIGTERM, not the sandboxes running its evaluations; `TimeoutStopSec` = `drain_timeout_s`
+plus 5 minutes, so systemd doesn't kill it mid-drain). A unit written before 2026-11 has
+neither: run `./bmb-eval install-service` once after updating (it restarts the node; the
+old code it stops doesn't drain yet). Run it again after changing `drain_timeout_s`.
+
+In a terminal (`bmb-eval run`), Ctrl-C drains too, but it reaches the sandbox processes
+of a container node as well; stop such a node with `kill <pid>` instead. A model file
+download no longer holds up the node: each job fetches its files in its own thread (at
+most 8 files at once across jobs), and a download that fails hands the job back to the
+hub uncounted.

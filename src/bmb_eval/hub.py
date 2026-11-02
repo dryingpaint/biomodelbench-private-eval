@@ -44,6 +44,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import yaml
+
 from . import release
 from .blobs import BlobCache, check_manifest, manifest_id
 from .contract import Contract
@@ -57,8 +59,8 @@ CREATE TABLE IF NOT EXISTS families (name TEXT PRIMARY KEY, tasks TEXT NOT NULL)
 CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY, secret_sha256 TEXT NOT NULL, name TEXT NOT NULL,
     created REAL NOT NULL, last_seen REAL, accepting INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS node_tasks (
-    task TEXT PRIMARY KEY, node_id TEXT NOT NULL, contract TEXT);
+CREATE TABLE IF NOT EXISTS node_tasks (     -- a task may be served by several nodes
+    task TEXT NOT NULL, node_id TEXT NOT NULL, contract TEXT, PRIMARY KEY (task, node_id));
 CREATE TABLE IF NOT EXISTS enrollments (
     code TEXT PRIMARY KEY, task TEXT NOT NULL, files TEXT NOT NULL,
     created REAL NOT NULL, used_by TEXT);
@@ -279,6 +281,20 @@ def _move_manifests(db: sqlite3.Connection) -> int:
     return len(moved)
 
 
+def _widen_node_tasks(db: sqlite3.Connection) -> None:
+    """An older hub.db keys node_tasks by task alone (one node per task). Rebuild it keyed by
+    (task, node), so a busy task can be served by several nodes at once. Runs inside the
+    caller's transaction; does nothing on a current database."""
+    pk = {r[1]: r[5] for r in db.execute("PRAGMA table_info(node_tasks)")}
+    if pk.get("node_id"):
+        return
+    db.execute("ALTER TABLE node_tasks RENAME TO node_tasks_old")
+    db.execute("CREATE TABLE node_tasks (task TEXT NOT NULL, node_id TEXT NOT NULL, contract TEXT, "
+               "PRIMARY KEY (task, node_id))")
+    db.execute("INSERT INTO node_tasks SELECT task, node_id, contract FROM node_tasks_old")
+    db.execute("DROP TABLE node_tasks_old")
+
+
 class HubStore:
     """hub.db, shared by the HTTP server's request threads (one per request) and its background
     loops. Each call borrows a pooled connection, and WAL lets reads run alongside a write. On
@@ -313,11 +329,14 @@ class HubStore:
                                      # count against the contract's baseline_final_evaluations.
                                      ("agents", "kind", "TEXT NOT NULL DEFAULT 'agent'"),
                                      ("submissions", "kind", "TEXT NOT NULL DEFAULT 'agent'"),
-                                     ("submissions", "manifest_id", "TEXT")]:
+                                     ("submissions", "manifest_id", "TEXT"),
+                                     # 1: a code that adds another node to a task (add_node_code)
+                                     ("enrollments", "extra", "INTEGER NOT NULL DEFAULT 0")]:
                 if col not in _columns(db, table):
                     db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             if "manifest" in _columns(db, "submissions"):
                 moved = _move_manifests(db)
+            _widen_node_tasks(db)
             # Without indexes every status poll and job hand-out scanned the whole table (5,708
             # rows, 425 MB with the manifests still in it, on 2026-10-30).
             for name, cols in [("group", "group_id, split"), ("agent", "agent, split"),
@@ -535,9 +554,11 @@ class HubStore:
     # ----------------------------------------------------------- enrollment
 
     def code_for(self, task: str) -> str | None:
-        """The task's connect code (one per task, for good), unless revoked."""
-        row = self.q("SELECT code FROM enrollments WHERE task=? AND (used_by IS NULL OR used_by <> 'revoked') "
-                     "ORDER BY created DESC LIMIT 1", (task,), one=True)
+        """The task's connect code (one per task, for good), unless revoked. Codes that add
+        another node to the task (add_node_code) are not it."""
+        row = self.q("SELECT code FROM enrollments WHERE task=? AND extra=0 "
+                     "AND (used_by IS NULL OR used_by <> 'revoked') ORDER BY created DESC LIMIT 1",
+                     (task,), one=True)
         return row[0] if row else None
 
     def add_enrollment(self, task_dir: Path) -> tuple[str, Contract]:
@@ -553,8 +574,9 @@ class HubStore:
         files = self.package_files(task_dir)
         code = self.code_for(c.id)
         if code:
-            self.q("UPDATE enrollments SET files=?, version=version+1 WHERE code=?",
-                   (json.dumps(files), code))
+            # Every node serving the task gets the update, each behind its own code.
+            self.q("UPDATE enrollments SET files=?, version=version+1 WHERE task=? "
+                   "AND (used_by IS NULL OR used_by <> 'revoked')", (json.dumps(files), c.id))
         else:
             code = new_code()
             self.q("INSERT INTO enrollments (code, task, files, created, used_by, version) "
@@ -583,6 +605,26 @@ class HubStore:
                 files[rel.as_posix()] = {"base64": base64.b64encode(raw).decode()}
         return files
 
+    def add_node_code(self, task: str) -> tuple[str, Contract]:
+        """A connect code that adds one more node to an enrolled task, with the same package
+        and version. Jobs then go to whichever of its nodes asks first, so a busy task isn't
+        limited to one machine. Only for a task whose rows are split the same way on every
+        node (no split, or a fixed `by_column` split): a random split is drawn on each node
+        with its own secret seed, so two nodes would score different validation rows."""
+        code = self.code_for(task)
+        if not code:
+            raise KeyError(f"no task {task!r} on this hub")
+        _, files, _, version = self.enrollment(code)
+        c = Contract.from_dict(yaml.safe_load(files["contract.yaml"]))
+        if c.split and not c.split.by_column:
+            raise ValueError(f"task {task} splits its rows at random on each node; a second node "
+                             "would score different validation rows. Use split.by_column to serve "
+                             "it from several nodes.")
+        new = new_code()
+        self.q("INSERT INTO enrollments (code, task, files, created, used_by, version, extra) "
+               "VALUES (?,?,?,?,NULL,?,1)", (new, task, json.dumps(files), time.time(), version))
+        return new, c
+
     def enrollment(self, code: str) -> tuple[str, dict, str | None, int] | None:
         row = self.q("SELECT task, files, used_by, version FROM enrollments WHERE code=?", (code,), one=True)
         return (row[0], json.loads(row[1]), row[2], row[3]) if row else None
@@ -601,7 +643,8 @@ class HubStore:
         if e is None or e[2] == "revoked" or (e[2] is not None and e[2] != node_id):
             raise KeyError("code unknown or already used by another machine")
         task = e[0]
-        owner = self.q("SELECT node_id FROM node_tasks WHERE task=?", (task,), one=True)
+        owners = {r[0] for r in self.q("SELECT node_id FROM node_tasks WHERE task=?", (task,))}
+        extra = self.q("SELECT extra FROM enrollments WHERE code=?", (code,), one=True)[0]
         out = {"task": task}
         if node_id is None:
             node_id = "node_" + secrets.token_hex(6)
@@ -609,7 +652,8 @@ class HubStore:
             self.q("INSERT INTO nodes (id, secret_sha256, name, created, last_seen, accepting) "
                    "VALUES (?,?,?,?,NULL,0)", (node_id, _h(secret), name, time.time()))
             out["secret"] = secret
-        if owner and owner[0] != node_id:
+        # A task's own code binds one node; each further node needs a code made for it.
+        if owners - {node_id} and not extra:
             raise KeyError("task is already served by another node")
         self.q("INSERT OR REPLACE INTO node_tasks VALUES (?,?,NULL)", (task, node_id))
         # Each activation (a provider re-running their command) restarts the stall clock
@@ -1159,12 +1203,15 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 now = time.time()
                 rows = store.q("SELECT t.task, t.contract, n.last_seen, n.accepting FROM node_tasks t "
                                "JOIN nodes n ON n.id = t.node_id WHERE t.contract IS NOT NULL")
+                rank = {"offline": 0, "paused": 1, "online": 2}
+                tasks: dict[str, dict] = {}     # a task served by several nodes is listed once
+                for task, c, seen, acc in rows:
+                    state = ("offline" if not seen or now - seen > ONLINE_S
+                             else "online" if acc else "paused")
+                    if task not in tasks or rank[state] > rank[tasks[task]["node"]]:
+                        tasks[task] = {"contract": json.loads(c), "node": state}
                 cap, used = store.budget(agent)
-                return self._send(200, {"tasks": [{
-                    "contract": json.loads(c),
-                    "node": ("offline" if not seen or now - seen > ONLINE_S
-                             else "online" if acc else "paused"),
-                } for _, c, seen, acc in rows],
+                return self._send(200, {"tasks": list(tasks.values()),
                     "families": [{"name": n, "tasks": t} for n, t in store.families().items()],
                     "budget": {"evaluations": cap, "used": used}})
             if m := re.fullmatch(r"/v1/submissions/([\w-]{1,128})", p):
@@ -1397,8 +1444,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 owned = {r[0] for r in store.q("SELECT task FROM node_tasks WHERE node_id=?", (node,))}
                 for task, contract in (body.get("tasks") or {}).items():
                     if task in owned:
-                        store.q("UPDATE node_tasks SET contract=? WHERE task=?",
-                                (json.dumps(contract), task))
+                        store.q("UPDATE node_tasks SET contract=? WHERE task=? AND node_id=?",
+                                (json.dumps(contract), task, node))
                 store.q("UPDATE nodes SET accepting=? WHERE id=?",
                         (1 if body.get("accepting") else 0, node))
                 st = body.get("status")
@@ -1421,13 +1468,15 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._send(200, {"ok": True})
             if m := re.fullmatch(r"/v1/node/results/([\w-]{1,128})", p):
                 sid = m.group(1)
-                # Accept from the node that serves the task, even if the job was
+                # Accept from a node that serves the task, even if the job was
                 # re-queued while its result was in flight.
                 if not store.q("SELECT 1 FROM submissions s JOIN node_tasks t ON t.task = s.task "
                                "WHERE s.id=? AND t.node_id=?", (sid, node), one=True):
                     return self._err(404, "not_found", "No such job.")
-                store.q("UPDATE submissions SET status='done', node_id=?, result=? WHERE id=?",
-                        (node, json.dumps(body), sid))
+                # The first result stands: a job re-queued to another of the task's nodes
+                # while this one's result was in flight may report twice.
+                store.q("UPDATE submissions SET status='done', node_id=?, result=? "
+                        "WHERE id=? AND status<>'done'", (node, json.dumps(body), sid))
                 return self._send(200, {"ok": True})
             self._err(404, "not_found", "No such endpoint.")
 
@@ -1520,6 +1569,10 @@ def main(argv=None) -> None:
     p.add_argument("--public-url", required=True)
     p.add_argument("--replace", action="store_true",
                    help="replace an existing task's package even though it differs")
+
+    p = sub.add_parser("add-node", help="a connect code that adds another node to an enrolled task")
+    p.add_argument("task")
+    p.add_argument("--public-url", required=True)
 
     p = sub.add_parser("alerts", help="where operator alerts go (failed or stalled provider setups)")
     p.add_argument("--webhook", help="Slack-compatible incoming webhook URL ('' to turn off)")
@@ -1637,6 +1690,13 @@ def main(argv=None) -> None:
                   f"The provider's machine will show an update; they review and approve it with:\n"
                   f"    ~/bmb-eval/bmb-eval update\n"
                   f"Until then it keeps evaluating with the version they approved.")
+    elif args.cmd == "add-node":
+        try:
+            code, c = store.add_node_code(args.task)
+        except (KeyError, ValueError) as e:
+            raise SystemExit(str(e).strip("'\""))
+        print(f"(a code for one more node serving {c.id}; its first node keeps its own code)\n")
+        print(provider_message(args.public_url.rstrip("/"), code, c))
     elif args.cmd == "alerts":
         if args.webhook is not None:
             store.set_setting("alerts", {"webhook": args.webhook} if args.webhook else {})

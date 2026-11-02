@@ -2032,3 +2032,89 @@ def test_connect_refuses_a_conmon_that_drops_output(monkeypatch):
     assert cli.engine_problems("docker") == []
     monkeypatch.setattr(cli, "conmon_version", lambda: (2, 1, 12))
     assert cli.engine_problems("podman") == []
+
+
+# ------------------------------------------------------- one task, several nodes
+
+def test_task_served_by_two_nodes_shares_its_queue(hub, tmp_path, provider_files):
+    """A busy task isn't limited to one machine: a code made with add-node binds a second
+    node, and jobs go to whichever node asks first. Agents see the task once."""
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    a = Worker(_connect(_fresh_node(tmp_path / "node_a"), url, code, data))
+    second, _ = store.add_node_code("binding")
+    assert second != code and store.code_for("binding") == code
+    b = Worker(_connect(_fresh_node(tmp_path / "node_b"), url, second, data))
+    agent = Client(url, store.add_agent("agent-1"))
+    a.step(), b.step()
+    assert [t["contract"]["id"] for t in agent.tasks()["tasks"]] == ["binding"]
+    sids = [agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"] for _ in range(4)]
+    for _ in range(20):
+        a.step(), b.step()
+        a.wait_jobs(0.05), b.wait_jobs(0.05)
+        if all(agent.status(s)["status"] == "done" for s in sids):
+            break
+    assert all(agent.status(s)["result"]["status"] == "ok" for s in sids)
+    by = {r[0] for r in store.q("SELECT node_id FROM submissions WHERE status='done'")}
+    assert len(by) == 2                                      # both machines took work
+
+
+def test_second_node_needs_its_own_code(hub, tmp_path, provider_files):
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    _connect(_fresh_node(tmp_path / "node_a"), url, code, data)
+    with pytest.raises(KeyError, match="already"):
+        store.activate(code, None, "node_b")                 # the task's own code: one machine
+
+
+def test_random_split_task_cannot_get_a_second_node(hub, tmp_path):
+    store, url = hub
+    d = _split_task(tmp_path, name="split_task")            # validation_fraction: drawn per node
+    store.add_enrollment(d)
+    with pytest.raises(ValueError, match="random"):
+        store.add_node_code("split_task")
+
+
+def test_update_reaches_every_node_of_a_task(hub, provider_files):
+    store, url = hub
+    _, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    second, _ = store.add_node_code("binding")
+    (task_dir / "notes.txt").write_text("changed")
+    store.add_enrollment(task_dir)
+    assert store.enrollment(code)[3] == store.enrollment(second)[3] == 2
+
+
+def test_first_result_of_a_job_stands(hub, tmp_path, provider_files):
+    """A job re-queued to another of its task's nodes while the first node's result was in
+    flight may be reported twice; the first report stands."""
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    ca = _connect(_fresh_node(tmp_path / "node_a"), url, code, data)
+    second, _ = store.add_node_code("binding")
+    cb = _connect(_fresh_node(tmp_path / "node_b"), url, second, data)
+    agent = Client(url, store.add_agent("agent-1"))
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    HubAPI(url, ca.hub["secret"]).result(sid, {"status": "ok", "from": "a"})
+    HubAPI(url, cb.hub["secret"]).result(sid, {"status": "ok", "from": "b"})
+    row = store.q("SELECT result FROM submissions WHERE id=?", (sid,), one=True)
+    assert json.loads(row[0])["from"] == "a"
+
+
+def test_old_hub_db_gets_multi_node_bindings(tmp_path):
+    import sqlite3
+    state = tmp_path / "hub_state"
+    state.mkdir()
+    db = sqlite3.connect(state / "hub.db")
+    db.executescript("CREATE TABLE node_tasks (task TEXT PRIMARY KEY, node_id TEXT NOT NULL, contract TEXT);"
+                     "INSERT INTO node_tasks VALUES ('t1', 'node_a', '{}');")
+    db.commit()
+    db.close()
+    store = hub_mod.HubStore(state)
+    store.q("INSERT INTO node_tasks VALUES ('t1', 'node_b', NULL)")
+    assert sorted(store.q("SELECT task, node_id FROM node_tasks")) == [("t1", "node_a"), ("t1", "node_b")]
+    hub_mod.HubStore(state)                                  # a second start changes nothing
+    assert len(store.q("SELECT * FROM node_tasks")) == 2

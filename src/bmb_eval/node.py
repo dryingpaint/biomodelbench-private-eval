@@ -258,6 +258,8 @@ class Worker:
             return False
         self._stale_alerted = False
         drift = approval.diff(self.cfg)
+        if drift and self._reload_approved_tasks():
+            drift = approval.diff(self.cfg)
         why = self._modal_drift() if not drift and self.cfg.backend == "modal" else []
         if why is None:
             # Not checked successfully yet (Modal hasn't answered): no work, but no drift either.
@@ -280,6 +282,26 @@ class Worker:
                         "no new work until you run `bmb-eval approve`", changes=len(drift))
         self._unapproved_alerted = bool(drift)
         return not drift
+
+    def _reload_approved_tasks(self) -> bool:
+        """Take up tasks added (or removed) on disk and approved, e.g. by `bmb-eval connect`
+        while the service runs. The service compared the approval against the config it
+        loaded at start, so every connect stopped it taking work until a restart: 7 hours on
+        2026-11-02, while 63 tasks were added. Only the task list may differ; any other
+        change still waits for a restart."""
+        try:
+            fresh = Config.load(self.cfg.path)
+        except Exception:
+            return False
+        others = lambda c: {k: v for k, v in c.raw.items() if k != "tasks"}
+        if approval.diff(fresh) or others(fresh) != others(self.cfg):
+            return False
+        self.cfg = self.runner.cfg = fresh
+        if getattr(self.runner.sandbox, "cfg", None) is not None:
+            self.runner.sandbox.cfg = fresh
+        audit.record(self.cfg.state_dir, "config_reloaded", tasks=sorted(fresh.tasks))
+        self._last_hello = 0.0        # publish the new tasks' contracts on the next step
+        return True
 
     def _modal_drift(self) -> list[str] | None:
         """The data on Modal against what was approved: [] when it matches, the problems

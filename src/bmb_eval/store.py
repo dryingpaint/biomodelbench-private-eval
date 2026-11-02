@@ -98,6 +98,17 @@ class Store:
                 "UPDATE submissions SET status='done', finished=?, result=? WHERE id=?",
                 (time.time(), json.dumps(result), sid))
 
+    def refuse(self, sid: str, split: str, result: dict) -> None:
+        """A recorded job turned out to be refusable (a model file failed its hash while
+        downloading): finish it as a refusal, released at once, under `split` ("test_refused"
+        for a final, so it isn't counted as one). One statement, so no quota count ever
+        sees the job missing."""
+        now = time.time()
+        with self.lock, self.db:
+            self.db.execute(
+                "UPDATE submissions SET status='done', finished=?, result=?, release_at=?, split=? "
+                "WHERE id=?", (now, json.dumps(result), now, split, sid))
+
     def uncount(self, sid: str) -> None:
         """Keep a finished job, but out of every quota and final-evaluation count (its
         split becomes e.g. "test_refused", as for a refused final)."""
@@ -139,6 +150,13 @@ class Store:
         or final-evaluation cap, and the hub hands it out again."""
         with self.lock, self.db:
             self.db.execute("DELETE FROM submissions WHERE id=?", (sid,))
+
+    def requeue(self, sid: str) -> bool:
+        """A running job goes back to this node's queue, to run again from the start (a
+        batch that didn't predict it). True if it was running."""
+        with self.lock, self.db:
+            return self.db.execute("UPDATE submissions SET status='queued' WHERE id=? AND status='running'",
+                                   (sid,)).rowcount > 0
 
     def requeue_running(self) -> int:
         """On restart, runs interrupted mid-flight go back to the queue."""

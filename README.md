@@ -67,6 +67,10 @@ a fixed-length `vector`, or a `list` (a dict of equal-length lists, e.g.
 transformers, peft, safetensors, scikit-learn, anndata and pandas. There is
 no network, so everything must be in the bundle.
 
+The datasets of a family submission may share one process, one dataset after
+another: `load_model()` then runs once for all of them, `load_model(inputs_dir)`
+once per dataset. Don't keep state from one dataset's `predict` to the next.
+
 ```bash
 pip install git+https://github.com/dryingpaint/biomodelbench-private-eval
 ```

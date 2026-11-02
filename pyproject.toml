@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pytest-xdist>=3"]   # tests run in parallel: pytest -n auto
 hub = ["google-cloud-storage>=2.14", "markdown>=3.5"]   # the hub: Cloud Storage, web pages
 modal = ["modal>=1.6"]   # a node whose sandboxes run on Modal (sandbox.backend: modal)
 # Providers sealing data (confidential mode). cryptography 49+ has no Intel-Mac wheels
@@ -34,6 +34,7 @@ packages = ["src/bmb_eval"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-n auto"   # pytest-xdist: the tests are independent; -n 0 runs them in one process
 
 [tool.ruff]
 line-length = 100

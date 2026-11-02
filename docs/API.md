@@ -105,6 +105,8 @@ Queues the submission once every file is present. Response `202`:
 
 If something is missing: `409` `files_missing`, with
 `"missing": ["<sha256>", …]`. Upload those files, then commit again.
+A submission not committed within 24 hours is deleted (`404` `not_found`);
+it never counted against your evaluations. Submit again.
 
 ### `GET /v1/submissions/<id>`
 Polls a submission. You can only see your own submissions.
@@ -169,7 +171,7 @@ or `false`. When it's `false`, `metrics` repeats your previous best.
 | Endpoint | Body or response |
 |---|---|
 | `POST /v1/node/hello` | `{"tasks": {"<task>": <public contract>}, "accepting": true, "held": ["<submission id>", …]}`, sent every minute. `held` lists jobs the node still holds; the hub re-queues any others assigned to it |
-| `GET /v1/node/next` | `204` if there's no work, else `{"submission_id", "task", "submitter", "split", "kind", "manifest", "bundle_id", "downloads": {"<sha256>": {"url", "headers", "auth"}}}`. `split` is `"validation"` or `"test"`; `kind` is `"agent"` or `"baseline"`. The node refuses agents' test jobs beyond the contract's `final_evaluations` and baselines' beyond its `baseline_final_evaluations` (default 0). Any other kind counts as an agent's |
+| `GET /v1/node/next` | `204` if there's no work, else `{"submission_id", "task", "submitter", "split", "kind", "manifest", "bundle_id", "group_id", "siblings", "downloads": {"<sha256>": {"url", "headers", "auth"}}}`. `split` is `"validation"` or `"test"`; `kind` is `"agent"` or `"baseline"`. `group_id` names the family submission (null otherwise); `siblings` counts the jobs still queued for this node with the same bundle, split and submitter, which a node that batches families claims at once with `?bundle_id=&split=&submitter=&tasks=<task,...>` (only those, on the tasks named; 204 if none). The node refuses agents' test jobs beyond the contract's `final_evaluations` and baselines' beyond its `baseline_final_evaluations` (default 0). Any other kind counts as an agent's |
 | `POST /v1/node/results/<id>` | The payload shown above as `result`, at most 64 KB |
 
 ## Enrollment (used by `bmb-eval connect`)

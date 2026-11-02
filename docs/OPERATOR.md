@@ -52,7 +52,9 @@ Providers get updates by re-running the install command without arguments;
 their node pauses until they approve the new version.
 
 **Backups:** `/home/bmb/hub_state/hub.db` on the VM (tokens, codes, queue,
-results). Snapshot the VM's disk on a schedule.
+results), with its write-ahead log `hub.db-wal` beside it: copy both, or use
+`sqlite3 hub.db ".backup copy.db"`. Snapshot the VM's disk on a schedule.
+Uploads never committed are deleted after 24 hours.
 
 ## Releases: one tag for the three downloads
 
@@ -125,8 +127,26 @@ deploy/gcp/hub alerts --webhook https://hooks.slack.com/… # where setup alerts
    - `per` on a metric reports it per group.
    - `limits` sets time, memory, GPUs (`gpus`, `gpu_memory_gb`), bundle size
      and evaluation caps.
-3. **Check it with fake data:** save the public contract (`Contract.load(...).public()`
-   as JSON), then run `bmb-eval dryrun contract.json <template>/bundle`.
+3. **Check the task folder:** `bmb-eval check-task <task folder>`. It loads the
+   contract (a parse error, or `version: "2.0"` where an integer belongs, is
+   named), then runs `score.py` the way the score stage does on fake answers and
+   predictions that satisfy the contract: random predictions, constant
+   predictions, answers that are all one value (one class), all rows of one
+   group gone (for each input with `allowed` values), and only 3 rows. Each
+   output goes through the node's output gate for validation and final
+   evaluations, and it lists every metric name emitted but not declared (e.g.
+   `mae[source_a|caco2_wang]` against `per:` naming `caco2_wang`), declared but
+   not emitted, None where the metric isn't `nullable`, or out of bounds. Then the
+   leakage budget. It exits non-zero on any problem; a scorer that fails this
+   would fail the provider's first evaluation as `output_contract_violation`.
+   Synthetic rows combine input values at random; for a scorer that accepts only
+   real combinations (e.g. endpoints that belong to one source), pass a few
+   real-shaped rows with `--data <table or folder>` (inputs and answers columns,
+   as the provider would give them). Scorers run with this environment's Python,
+   so a package only the sandbox has (e.g. scikit-learn) has to be installed here.
+   Then check a model against it: save the public contract
+   (`Contract.load(...).public()` as JSON) and run
+   `bmb-eval dryrun contract.json <template>/bundle`.
 4. **Enroll:** `deploy/gcp/hub enroll <task folder>` prints the email. Send it.
    The whole folder is shipped, subfolders and binary files included (e.g. a
    reference `.npy` the scorer loads), up to 16 MB. The example `bundle/`,
@@ -142,8 +162,10 @@ deploy/gcp/hub alerts --webhook https://hooks.slack.com/… # where setup alerts
    once the upload is in); a service that can't start or can't get out is reported
    as `start_service: ...` on the spot. A code that was used but whose setup still
    hasn't finished an hour later shows as STALLED and alerts once, with what to
-   ask the provider for (`~/bmb-eval/bmb-eval status`, `journalctl --user -u
-   bmb-eval -n 30`). The hub's journal records each activation and each node's
+   ask the provider for (`~/bmb-eval/bmb-eval status`, `~/bmb-eval/bmb-eval logs`,
+   `journalctl --user -u bmb-eval -n 30`). `status` ends with the node's last few
+   events; `logs` prints its audit log readably (`-f` to follow, `--event run`
+   for one kind). The hub's journal records each activation and each node's
    first check-in. Either way, the fix is usually to ask the provider for the
    message they saw and have them run the same command again.
 
@@ -207,6 +229,28 @@ per submitter, so each attempt (agent run) gets its own; size it for one
 attempt's budget plus its final scoring, e.g. 60 for a 40-evaluation budget.
 Independent attempts aren't capped together: what all of them can learn grows
 with the number of attempts, so tell providers how many you plan.
+
+## One task, several nodes
+
+A task's jobs go to whichever of its nodes asks first, so a busy task can be spread
+over several machines (e.g. our public VM and a Modal node):
+
+```bash
+deploy/gcp/hub add-node <task> --public-url https://<hub address>   # a code for one more node
+```
+
+Connect the second machine with that code and the same data, as for the first. Updates
+(`enroll` again) reach every node of the task, each behind its own code.
+
+- **Same rows everywhere.** Only tasks without a split, or with a fixed `split.by_column`,
+  can have a second node: a random split is drawn on each node with its own secret seed,
+  so two nodes would score different validation rows. `add-node` refuses those.
+- **Caps are per node.** Each node enforces `submissions_per_day`, `submissions_total` and
+  the final-evaluation caps on its own, so N nodes allow up to N times as many, and the
+  leakage budget a provider approves grows with them. Use several nodes for our own
+  public data; ask before doing it with a provider's.
+- A job re-queued to another node while the first node's result was in flight can be
+  reported twice; the first report stands.
 
 ## Held-out test set and final evaluations
 
@@ -333,6 +377,27 @@ too much output) are never retried. `bmb-eval stop` terminates every sandbox
 tagged with this node; a restarted node also cleans up orphaned sandboxes and
 job volumes.
 
+**Family batching** (our public-data nodes only, never a provider's). A family
+submission is one job per dataset, and each job loads the model in its own predict
+sandbox: a 26-dataset genomic family took 26 H100 containers. With
+
+```yaml
+batch_families: true          # default false; `./bmb-eval approve` after turning it on
+batch_max_tasks: 32           # jobs per batch
+batch_max_predict_s: 21600    # the batch's predict limit: its tasks' limits summed, at most this
+```
+
+the node takes a job's siblings (the hub counts them: same bundle, split and agent on
+this node's tasks) together with it, and runs one predict sandbox for all of them: the
+model loads once and predicts each dataset in turn, each with its own time limit.
+Validate and score still run per dataset, and each job keeps its own quota, result,
+release time and audit record (`internal.json` notes `batched`). GPU and CPU tasks
+are never batched together. A failing dataset gets its own error and the rest go on;
+if the whole batch dies (out of memory, past `batch_max_predict_s`, a Modal failure),
+datasets it had finished keep their predictions and the others run alone, each
+counted once (`job_unbatched` in the audit log). A model in a batch sees every
+batched dataset's inputs at once (docs/THREAT_MODEL.md), hence public data only.
+
 **Timings** (measured 2026-10-29, controller on a laptop). The image builds in
 about 2.5 minutes. A stage's sandbox is ready in about 3 s on CPU and 6 s with
 an H100; the example task's whole evaluation (1×H100 predict, staging included)
@@ -340,3 +405,34 @@ took 24 s. Data into a sandbox moves at about 35 MB/s, but output comes back at
 only about 4 MB/s (Modal's limit, not the network's: 1 GB took 290 s, and
 parallel streams don't help). Predictions near the 512 MB cap therefore spend
 about 2 minutes in transfer per stage that returns them.
+
+## Restart a node without losing work
+
+A node stops gracefully on SIGTERM, which is what `systemctl --user restart` and `stop`
+send. It tells the hub at once that it takes no new work (`accepting: false`), lets the
+evaluations it is running finish and post their results, then exits; a restart then
+starts the new code. So after a code update:
+
+```bash
+systemctl --user restart --no-block bmb-eval-modal    # returns now; the restart waits for the drain
+journalctl --user -u bmb-eval-modal -f                # "stopping: ..." then the new node's start
+```
+
+Without `--no-block`, `systemctl` waits in the shell until the running evaluations finish.
+The node waits at most `drain_timeout_s` (config.yaml, default 7200), then stops anyway.
+To stop at once, as nodes used to, signal it a second time:
+`systemctl --user kill --kill-whom=main -s TERM bmb-eval-modal`. Evaluations cut short
+that way, by the timeout, or by a crash are not lost either: the next start runs them
+again (a Modal node first terminates its leftover sandboxes), counted once.
+
+This needs the unit `install-service` writes (`KillMode=mixed`, so only the node gets
+SIGTERM, not the sandboxes running its evaluations; `TimeoutStopSec` = `drain_timeout_s`
+plus 5 minutes, so systemd doesn't kill it mid-drain). A unit written before 2026-11 has
+neither: run `./bmb-eval install-service` once after updating (it restarts the node; the
+old code it stops doesn't drain yet). Run it again after changing `drain_timeout_s`.
+
+In a terminal (`bmb-eval run`), Ctrl-C drains too, but it reaches the sandbox processes
+of a container node as well; stop such a node with `kill <pid>` instead. A model file
+download no longer holds up the node: each job fetches its files in its own thread (at
+most 8 files at once across jobs), and a download that fails hands the job back to the
+hub uncounted.

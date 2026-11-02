@@ -120,6 +120,14 @@ def evaluate(cfg, task, bundle_dir):
     return Runner(cfg, send_alerts=False).evaluate(task, pack_dir(bundle_dir))
 
 
+def _why(cfg, p) -> str:
+    """The run's provider-only record and logs, for a failure message (the agent-facing
+    error says only predict_runtime_error for an unexpected exit)."""
+    d = cfg.state_dir / "runs" / p["run_id"]
+    return "\n".join(f"--- {f.name}\n{f.read_text()[-3000:]}" for f in sorted(d.glob("*"))
+                     if f.suffix in (".json", ".log"))
+
+
 # ---------------------------------------------------------------- end to end
 
 @pytest.mark.parametrize("task", sorted(RAW))
@@ -143,14 +151,12 @@ def test_model_sees_only_inputs(node, task):
 
 
 @pytest.mark.parametrize("task", sorted(RAW))
-def test_agent_dryrun_on_synthetic_data(task, capsys):
+def test_agent_dryrun_on_synthetic_data(task, capsys, tmp_path):
     pub = Contract.load(EX / task / "contract.yaml").public()
-    path = Path(f"/tmp/bmb_pub_{task}.json")
+    # Not a fixed /tmp name: two test runs at once on one machine would delete each other's.
+    path = tmp_path / f"bmb_pub_{task}.json"
     path.write_text(json.dumps(pub))
-    try:
-        cli.main(["dryrun", str(path), str(EX / task / "bundle"), "-n", "20"])
-    finally:
-        path.unlink()
+    cli.main(["dryrun", str(path), str(EX / task / "bundle"), "-n", "20"])
     assert "pass the contract" in capsys.readouterr().out
 
 
@@ -194,7 +200,7 @@ def _bundle(tmp_path, body: str) -> Path:
 def test_bad_structured_outputs_rejected(node, tmp_path, task, body, reason):
     cfg, _ = node(task)
     p = evaluate(cfg, task, _bundle(tmp_path, body))
-    assert p["status"] == "error" and p["error"]["code"] == "predictions_invalid", p
+    assert p["status"] == "error" and p["error"]["code"] == "predictions_invalid", _why(cfg, p)
     assert p["error"]["detail"]["reason"] == reason
 
 
@@ -314,7 +320,7 @@ def test_scorer_only_files_reach_scorer_never_model(tmp_path):
     b = _bundle(tmp_path, "def load_model(d):\n    global C\n    C = np.load(d / 'control.npy').mean(0)\n"
                           "def predict(df):\n    return pd.DataFrame({'shift': [list(C)] * len(df)})\n")
     p = evaluate(cfg, "perturb_pop", b)
-    assert p["status"] == "ok" and set(p["metrics"]) == {"mae"}, p
+    assert p["status"] == "ok" and set(p["metrics"]) == {"mae"}, _why(cfg, p)
     # A model probing for the scorer-only files finds nothing.
     spy = _bundle(tmp_path, "import os\ndef predict(df):\n    d = os.environ['BMB_INPUTS_DIR']\n"
                             "    found = [f for _, _, fs in os.walk(d) for f in fs if f.startswith('q')]\n"
@@ -345,3 +351,22 @@ def test_many_rows_can_share_one_file(tmp_path):
     df.to_csv(raw / "spots.csv", index=False)
     inputs_dir, _, n = prepare(c, raw, tmp_path / "out")
     assert n == N and (inputs_dir / "files" / "patches" / "s0.npy").exists()
+
+
+@pytest.mark.parametrize("body,code,out", [
+    ("print('x', end='')", 0, "x"),                       # unflushed output still arrives
+    ("import sys; sys.exit(11)", 11, ""),
+    ("raise MemoryError", 12, ""),                        # mapped, no traceback
+    ("raise KeyError('k')", 1, ""),                       # unmapped: traceback, exit 1
+])
+def test_stage_entry_exit_codes_survive_skipping_teardown(body, code, out):
+    """Entry points leave with os._exit (a native library aborting at interpreter shutdown
+    failed finished stages); exit codes and output must come through unchanged."""
+    import subprocess
+    import sys
+    prog = ("from bmb_eval.sandbox_entry import run\n"
+            f"def main():\n    {body}\n"
+            "run(main, {MemoryError: (12, False)})\n")
+    r = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True)
+    assert r.returncode == code and r.stdout == out
+    assert ("Traceback" in r.stderr) == (code == 1)

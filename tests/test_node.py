@@ -491,13 +491,17 @@ def test_total_quota_counts_per_submitter(connected):
 
 def test_result_held_on_node_until_release(connected):
     cfg, store, url, agent = connected
-    cfg.tasks["binding"].contract.limits.release_after_s = 4
+    # Release time is moved by hand, not waited for: with release_after_s = 4 and a sleep,
+    # a run slower than 4 s (a loaded machine) was released before the "pending" check.
+    cfg.tasks["binding"].contract.limits.release_after_s = 3600
     w = Worker(cfg)
     sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
-    w.step()                                     # runs it (well under 4s)
+    w.step()                                     # takes it; it runs in its own thread
+    w.wait_jobs()
     w.step()
     assert agent.status(sid)["status"] == "pending"
-    time.sleep(4)
+    with w.store.lock, w.store.db:
+        w.store.db.execute("UPDATE submissions SET release_at = ? WHERE id = ?", (time.time() - 1, sid))
     w.step()
     assert agent.status(sid)["status"] == "done"
 
@@ -985,7 +989,7 @@ def test_existing_databases_gain_split_column(tmp_path):
                 "created REAL NOT NULL, status TEXT NOT NULL, node_id TEXT, result TEXT, manifest TEXT NOT NULL)")
     hdb.commit()
     hdb.close()
-    assert "split" in {r[1] for r in hub_mod.HubStore(h).db.execute("PRAGMA table_info(submissions)")}
+    assert "split" in {r[1] for r in hub_mod.HubStore(h).q("PRAGMA table_info(submissions)")}
 
 
 def test_existing_databases_gain_kind_columns(tmp_path):
@@ -1623,13 +1627,18 @@ def test_parallel_node_runs_jobs_side_by_side_within_capacity(connected):
     w = Worker(cfg)
     lim = cfg.tasks["binding"].contract.limits
     w.capacity = (lim.cpus * 2, 1 << 50, 0)                 # room for exactly two at once
-    running, peak, lock = [0], [0], threading.Lock()
+    running, peak, lock, two = [0], [0], threading.Lock(), threading.Event()
 
     def evaluate(task, bundle, run_id, submitter, bundle_id=None, split="validation"):
         with lock:
             running[0] += 1
             peak[0] = max(peak[0], running[0])
-        time.sleep(0.3)
+            if running[0] == 2:
+                two.set()
+        # Each job holds its slot until a second one runs beside it (a serial node never
+        # gets there and fails below), rather than for a fixed 0.3 s, which a loaded
+        # machine could spend just taking the second job from the hub.
+        two.wait(timeout=10)
         with lock:
             running[0] -= 1
         return {"run_id": run_id, "status": "ok", "metrics": {"spearman": 0.9}}
@@ -1648,6 +1657,185 @@ def test_serial_node_is_unchanged_by_default(connected):
     sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
     w.drain()
     assert not w._jobs and agent.status(sid)["result"]["status"] == "ok"
+
+
+def _sub_status(store, sid):
+    return store.q("SELECT status FROM submissions WHERE id=?", (sid,), one=True)[0]
+
+
+def test_loop_keeps_serving_while_a_model_downloads(connected, tmp_path, monkeypatch):
+    # Taking a job used to download its whole bundle on the loop thread: a multi-GB model
+    # stopped the node taking other jobs, posting results and checking in meanwhile.
+    cfg, store, url, agent = connected
+    cfg.max_parallel = 4
+    w = Worker(cfg)
+    w.capacity = (1e6, 1 << 50, 0)
+    release, real = threading.Event(), w.api.download
+
+    def download(info, cache, sha, size):
+        if size == 3 << 20:                                  # the big job's "base model"
+            assert release.wait(30)
+        real(info, cache, sha, size)
+    monkeypatch.setattr(w.api, "download", download)
+    big = agent.submit_async("binding", _big_bundle(tmp_path))["submission_id"]
+    t0 = time.time()
+    w.step()                                                 # takes it; its thread downloads
+    assert time.time() - t0 < 5 and big in w._jobs
+    small = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    deadline = time.time() + 60
+    while agent.status(small)["status"] != "done" and time.time() < deadline:
+        w.step()
+        time.sleep(0.05)
+    assert agent.status(small)["result"]["status"] == "ok"   # taken, run and posted meanwhile
+    w._last_hello = 0
+    w.step()                                                 # the check-in reports the big one held
+    assert _sub_status(store, big) == "assigned" and agent.status(big)["status"] == "pending"
+    release.set()
+    w.drain(max_s=60)
+    assert agent.status(big)["result"]["status"] == "ok", agent.status(big)
+
+
+def test_jobs_sharing_a_model_file_download_it_once(connected, tmp_path, monkeypatch):
+    cfg, store, url, agent = connected
+    cfg.max_parallel = 4
+    w = Worker(cfg)
+    w.capacity = (1e6, 1 << 50, 0)
+    gets, real = [], w.api.download
+
+    def slow(info, cache, sha, size):
+        gets.append(sha)
+        time.sleep(0.3)                                      # both jobs are taken meanwhile
+        real(info, cache, sha, size)
+    monkeypatch.setattr(w.api, "download", slow)
+    bundle = _big_bundle(tmp_path)
+    sids = [agent.submit_async("binding", bundle)["submission_id"] for _ in range(3)]
+    w.drain(max_s=60)
+    assert sorted(gets) == sorted({f["sha256"] for f in manifest_for(bundle)["files"]})
+    assert all(agent.status(s)["result"]["status"] == "ok" for s in sids)
+    assert not [p for p in cfg.blob_dir.iterdir() if p.name.startswith(".incoming-")]
+
+
+def test_failed_download_hands_the_job_back_uncounted(connected, monkeypatch):
+    cfg, store, url, agent = connected
+    w = Worker(cfg)
+    real = w.api.download
+
+    def down(*a):
+        raise HubError("download failed: connection reset")
+    monkeypatch.setattr(w.api, "download", down)
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain(max_s=30)
+    # Not counted, not held: the check-in after it gave it back to the hub's queue.
+    assert not w.store.has(sid) and w.store.count_today("agent-1", "binding") == 0
+    assert _sub_status(store, sid) == "queued" and agent.status(sid)["status"] == "pending"
+    assert not list(w.queue_dir.glob("*.json"))
+    events = [json.loads(l)["event"] for l in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert "job_download_failed" in events
+    monkeypatch.setattr(w.api, "download", real)
+    w._infra_pause_until = 0                                 # (the short back-off has passed)
+    w.drain(max_s=30)
+    assert agent.status(sid)["result"]["status"] == "ok"
+    assert w.store.count_today("agent-1", "binding") == 1
+
+
+def test_resumed_job_whose_files_are_gone_goes_back_to_the_hub(connected):
+    # A restart re-runs held jobs locally, but download links aren't kept (they're signed
+    # and short-lived): a job whose files were evicted meanwhile is handed back.
+    cfg, store, url, agent = connected
+    w = Worker(cfg)
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w._dispatch = lambda *a: None                            # the node stops right after taking it
+    w._take(w.api.next())
+    assert not any(cfg.blob_dir.iterdir())                   # nothing downloaded yet
+    w2 = Worker(cfg)
+    w2.drain(max_s=30)
+    assert not w2.store.has(sid) and _sub_status(store, sid) == "queued"
+
+
+def _blocking_evaluate(w, gate):
+    started = threading.Event()
+
+    def evaluate(task, bundle, run_id, submitter, bundle_id=None, split="validation"):
+        started.set()
+        assert gate.wait(30)
+        return {"run_id": run_id, "status": "ok", "metrics": {"spearman": 0.9}}
+    w.runner.evaluate = evaluate
+    return started
+
+
+def test_sigterm_drains_running_jobs_and_takes_no_new_work(connected, monkeypatch):
+    import signal
+    from bmb_eval import node
+    monkeypatch.setattr(node, "POLL_S", 0.05)
+    cfg, store, url, agent = connected
+    w = Worker(cfg)
+    gate = threading.Event()
+    started = _blocking_evaluate(w, gate)
+    running = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w.step()
+    assert started.wait(30)
+    w._on_signal(signal.SIGTERM, None)                       # what systemctl restart sends
+    later = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    out = []
+    t = threading.Thread(target=lambda: out.append(w.serve()), daemon=True)
+    t.start()
+    deadline = time.time() + 10
+    while store.q("SELECT accepting FROM nodes", one=True)[0] and time.time() < deadline:
+        time.sleep(0.05)
+    assert store.q("SELECT accepting FROM nodes", one=True)[0] == 0   # told the hub at once
+    assert t.is_alive() and agent.status(running)["status"] == "pending"
+    gate.set()
+    t.join(30)
+    assert out == [True]
+    assert agent.status(running)["result"]["status"] == "ok"           # finished and posted
+    assert _sub_status(store, later) == "queued" and not w.store.has(later)
+    events = [json.loads(l)["event"] for l in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert "node_drained" in events
+
+
+@pytest.mark.parametrize("how", ["timeout", "second_signal"])
+def test_drain_is_cut_short_and_the_job_reruns_on_restart(connected, monkeypatch, how):
+    import signal
+    from bmb_eval import node
+    monkeypatch.setattr(node, "POLL_S", 0.05)
+    cfg, store, url, agent = connected
+    cfg.drain_timeout_s = 0 if how == "timeout" else 3600
+    w = Worker(cfg)
+    gate = threading.Event()
+    started = _blocking_evaluate(w, gate)
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    w.step()
+    assert started.wait(30)
+    w._on_signal(signal.SIGTERM, None)
+    if how == "second_signal":
+        w._on_signal(signal.SIGINT, None)
+    t0 = time.time()
+    assert w.serve() is False and time.time() - t0 < 10
+    events = [json.loads(l) for l in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    forced = [e for e in events if e["event"] == "node_stop_forced"]
+    assert forced[0]["running"] == [sid] and forced[0]["reason"] == ("drain_timeout" if how == "timeout"
+                                                                     else "signal")
+    # The next start runs it again, counted once.
+    w2 = Worker(cfg)
+    w2.drain(max_s=60)
+    assert agent.status(sid)["result"]["status"] == "ok"
+    assert w2.store.count_today("agent-1", "binding") == 1
+    gate.set()
+
+
+def test_run_forever_drains_on_sigterm_and_restores_handlers(connected, monkeypatch):
+    import signal
+    cfg, *_ = connected
+    w = Worker(cfg)
+    before = signal.getsignal(signal.SIGTERM)
+
+    def serve():
+        os.kill(os.getpid(), signal.SIGTERM)                 # handled on this (the main) thread
+        time.sleep(0.1)
+        return w._draining is not None
+    monkeypatch.setattr(w, "serve", serve)
+    assert w.run_forever() is True
+    assert signal.getsignal(signal.SIGTERM) is before
 
 def test_next_bare_code_works_after_a_connect_stops_at_bad_data(hub, node_dir, provider_files,
                                                                  tmp_path):
@@ -1676,39 +1864,60 @@ def test_next_bare_code_works_after_a_connect_stops_at_bad_data(hub, node_dir, p
         assert "connect code" not in str(e)
 
 
+class _Overlap:
+    """Counts how many calls are in flight at once. The tests below assert on that rather
+    than on elapsed time (they once said "under 1 s"), which a busy machine can miss
+    however concurrent the code is."""
+
+    def __init__(self):
+        self.lock, self.now, self.peak = threading.Lock(), 0, 0
+
+    def __enter__(self):
+        with self.lock:
+            self.now += 1
+            self.peak = max(self.peak, self.now)
+        time.sleep(0.01)
+
+    def __exit__(self, *exc):
+        with self.lock:
+            self.now -= 1
+
+
 def test_sign_all_gives_one_url_per_distinct_file():
     from bmb_eval.hub import sign_all
+    calls = _Overlap()
 
     class Blobs:
+        def signed(self, agent, sha):
+            return None                                # nothing signed ahead: sign each here
         def download(self, agent, sha, size):
-            time.sleep(0.01)
-            return f"https://x/{agent}/{sha}/{size}"
+            with calls:
+                return f"https://x/{agent}/{sha}/{size}"
 
     files = [{"sha256": f"{i:064x}", "size": i} for i in range(200)] + [{"sha256": f"{0:064x}", "size": 0}]
-    t = time.time()
     urls = sign_all(Blobs(), "a", files)
     assert len(urls) == 200 and urls[f"{5:064x}"] == f"https://x/a/{5:064x}/5"
-    assert time.time() - t < 1.0                      # concurrent, not 2 s one by one
+    assert calls.peak > 1                              # concurrent, not one by one
 
 
 def test_upload_plan_and_missing_check_run_concurrently():
     from bmb_eval.hub import missing_blobs, plan_uploads
+    has, upload = _Overlap(), _Overlap()
 
     class Blobs:
         def has(self, agent, sha, size):
-            time.sleep(0.01)
-            return int(sha, 16) % 2 == 0
+            with has:
+                return int(sha, 16) % 2 == 0
         def upload(self, agent, sha, size):
-            time.sleep(0.01)
-            return {"url": f"https://x/{sha}", "method": "PUT"}
+            with upload:
+                return {"url": f"https://x/{sha}", "method": "PUT"}
 
     files = [{"sha256": f"{i:064x}", "size": i} for i in range(200)] + [{"sha256": f"{1:064x}", "size": 1}]
-    t = time.time()
     ups = plan_uploads(Blobs(), "a", files)
     miss = missing_blobs(Blobs(), "a", files)
     assert len(ups) == 100 and all(int(u["sha256"], 16) % 2 for u in ups)
     assert miss == sorted(f"{i:064x}" for i in range(200) if i % 2)
-    assert time.time() - t < 1.5                         # concurrent: ~6 s one by one
+    assert has.peak > 1 and upload.peak > 1              # concurrent, not one by one
 
 
 def test_upload_plan_uses_one_listing_when_the_store_can_list():
@@ -1766,9 +1975,8 @@ def test_failed_connect_reports_step_and_reason_and_alerts(hub, node_dir, provid
         cli.main(["--config", str(node_dir / "config.yaml"), "connect", code, "--hub", url,
                   "--data", str(data), "--yes", "--no-service"])
     assert _reports(store)[-1] == ("review", "crashed", "RuntimeError")
-    for _ in range(50):
-        if len(alerts) == 3:
-            break
+    deadline = time.monotonic() + 10       # alerts go out on their own threads
+    while len(alerts) < 3 and time.monotonic() < deadline:
         time.sleep(0.05)
     assert len(alerts) == 3 and "at checking their data: data_problem" in alerts[0]
     assert not any("secret" in a for a in alerts)
@@ -1928,6 +2136,8 @@ def test_service_unit_carries_the_shells_proxy_and_certificate_settings(cfg, tmp
     assert ok and why == ""
     assert 'Environment="HTTPS_PROXY=http://proxy.example:3128"' in unit
     assert 'Environment="SSL_CERT_FILE=/etc/ssl/corp.pem"' in unit and "NO_PROXY" not in unit
+    # A restart drains: SIGTERM to the node only, and systemd outwaits its drain timeout.
+    assert "KillMode=mixed" in unit and f"TimeoutStopSec={cfg.drain_timeout_s + 300}" in unit
     assert ["systemctl", "--user", "enable", "--now", "bmb-eval"] in calls
 
 
@@ -2054,3 +2264,137 @@ def test_connect_refuses_a_conmon_that_drops_output(monkeypatch):
     assert cli.engine_problems("docker") == []
     monkeypatch.setattr(cli, "conmon_version", lambda: (2, 1, 12))
     assert cli.engine_problems("podman") == []
+
+
+# ------------------------------------------------------- one task, several nodes
+
+def test_task_served_by_two_nodes_shares_its_queue(hub, tmp_path, provider_files):
+    """A busy task isn't limited to one machine: a code made with add-node binds a second
+    node, and jobs go to whichever node asks first. Agents see the task once."""
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    a = Worker(_connect(_fresh_node(tmp_path / "node_a"), url, code, data))
+    second, _ = store.add_node_code("binding")
+    assert second != code and store.code_for("binding") == code
+    b = Worker(_connect(_fresh_node(tmp_path / "node_b"), url, second, data))
+    agent = Client(url, store.add_agent("agent-1"))
+    a.step(), b.step()
+    assert [t["contract"]["id"] for t in agent.tasks()["tasks"]] == ["binding"]
+    sids = [agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"] for _ in range(4)]
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        a.step(), b.step()
+        a.wait_jobs(0.05), b.wait_jobs(0.05)
+        if all(agent.status(s)["status"] == "done" for s in sids):
+            break
+    assert all(agent.status(s)["result"]["status"] == "ok" for s in sids)
+    by = {r[0] for r in store.q("SELECT node_id FROM submissions WHERE status='done'")}
+    assert len(by) == 2                                      # both machines took work
+
+
+def test_second_node_needs_its_own_code(hub, tmp_path, provider_files):
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    _connect(_fresh_node(tmp_path / "node_a"), url, code, data)
+    with pytest.raises(KeyError, match="already"):
+        store.activate(code, None, "node_b")                 # the task's own code: one machine
+
+
+def test_random_split_task_cannot_get_a_second_node(hub, tmp_path):
+    store, url = hub
+    d = _split_task(tmp_path, name="split_task")            # validation_fraction: drawn per node
+    store.add_enrollment(d)
+    with pytest.raises(ValueError, match="random"):
+        store.add_node_code("split_task")
+
+
+def test_update_reaches_every_node_of_a_task(hub, provider_files):
+    store, url = hub
+    _, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    second, _ = store.add_node_code("binding")
+    (task_dir / "notes.txt").write_text("changed")
+    store.add_enrollment(task_dir)
+    assert store.enrollment(code)[3] == store.enrollment(second)[3] == 2
+
+
+def test_first_result_of_a_job_stands(hub, tmp_path, provider_files):
+    """A job re-queued to another of its task's nodes while the first node's result was in
+    flight may be reported twice; the first report stands."""
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    ca = _connect(_fresh_node(tmp_path / "node_a"), url, code, data)
+    second, _ = store.add_node_code("binding")
+    cb = _connect(_fresh_node(tmp_path / "node_b"), url, second, data)
+    agent = Client(url, store.add_agent("agent-1"))
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    HubAPI(url, ca.hub["secret"]).result(sid, {"status": "ok", "from": "a"})
+    HubAPI(url, cb.hub["secret"]).result(sid, {"status": "ok", "from": "b"})
+    row = store.q("SELECT result FROM submissions WHERE id=?", (sid,), one=True)
+    assert json.loads(row[0])["from"] == "a"
+
+
+def test_old_hub_db_gets_multi_node_bindings(tmp_path):
+    import sqlite3
+    state = tmp_path / "hub_state"
+    state.mkdir()
+    db = sqlite3.connect(state / "hub.db")
+    db.executescript("CREATE TABLE node_tasks (task TEXT PRIMARY KEY, node_id TEXT NOT NULL, contract TEXT);"
+                     "INSERT INTO node_tasks VALUES ('t1', 'node_a', '{}');")
+    db.commit()
+    db.close()
+    store = hub_mod.HubStore(state)
+    store.q("INSERT INTO node_tasks VALUES ('t1', 'node_b', NULL)")
+    assert sorted(store.q("SELECT task, node_id FROM node_tasks")) == [("t1", "node_a"), ("t1", "node_b")]
+    hub_mod.HubStore(state)                                  # a second start changes nothing
+    assert len(store.q("SELECT * FROM node_tasks")) == 2
+
+
+def test_a_jobs_files_download_concurrently(tmp_path):
+    """A bundle of many small files downloads several at a time, not one by one (a genomic
+    bundle of thousands of files took over 20 minutes serially on 2026-11-02)."""
+    import hashlib
+    w = object.__new__(Worker)
+    w.cache = BlobCache(tmp_path / "blobs")
+    w._fetch_lock, w._fetching = threading.Lock(), {}
+    w._download_slots = threading.Semaphore(8)
+    live, peak = [0], [0]
+    lock = threading.Lock()
+    data = {}
+
+    class Api:
+        def download(self, info, cache, sha, size):
+            with lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+            time.sleep(0.05)
+            cache.put(sha, size, io.BytesIO(data[sha]).read)
+            with lock:
+                live[0] -= 1
+    w.api = Api()
+    files, downloads = [], {}
+    for i in range(40):
+        b = f"file {i}".encode()
+        sha = hashlib.sha256(b).hexdigest()
+        data[sha] = b
+        files.append({"sha256": sha, "size": len(b), "path": f"f{i}"})
+        downloads[sha] = {"url": "x"}
+    assert w._fetch(files, downloads) == sum(f["size"] for f in files)
+    assert 1 < peak[0] <= 8                       # concurrent, within the node's download slots
+    assert all(w.cache.has(f["sha256"], f["size"]) for f in files)
+
+
+def test_second_node_for_a_task_whose_contract_names_a_labels_file(hub, tmp_path):
+    """A perturbation task's contract names a labels file in its package; add-node loads the
+    contract with its package, as a node does."""
+    store, url = hub
+    d = tmp_path / "pert"
+    shutil.copytree(REPO / "examples" / "tasks" / "perturbation", d, ignore=shutil.ignore_patterns("bundle"))
+    assert "split:" not in (d / "contract.yaml").read_text()   # no split: any node scores the same rows
+    store.add_enrollment(d)
+    task = Contract.load(d / "contract.yaml").id
+    code, c = store.add_node_code(task)
+    assert c.id == task and code

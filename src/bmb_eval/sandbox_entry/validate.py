@@ -61,4 +61,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from bmb_eval.sandbox_entry import run
+    run(main)

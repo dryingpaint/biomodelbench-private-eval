@@ -117,6 +117,19 @@ def cmd_build_image(args) -> None:
     if engine not in ENGINES:
         print("local backend: no image needed")
         return
+    # One build at a time per machine and user: two `podman build`s of the same image at once
+    # failed ("read/write on closed pipe") when tests connected nodes in parallel (2026-11-02);
+    # the second waits, then finds the image current and skips.
+    import fcntl
+    lock = open(Path(tempfile.gettempdir()) / f"bmb-eval-image-{os.getuid()}.lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        _get_or_build_image(cfg, engine, args)
+    finally:
+        lock.close()
+
+
+def _get_or_build_image(cfg, engine: str, args) -> None:
     # Updates (setup.sh) call this every time; skip the multi-GB download when the
     # image here was built from this very code (stamp label == SANDBOX_FILES digest).
     if make_sandbox(cfg).image_id() != "missing" and not stale_image_message(cfg):
@@ -294,10 +307,13 @@ def _rows(n: float, n_rows: int) -> str:
     return f"about {n:,.0f} of your {n_rows:,} rows ({n / n_rows:.1%})"
 
 
+MIN_FREE_GB = 20     # below this, connect stops: models need room to download (tests set it to 0)
+
+
 def hardware_problems(lim, root: Path, cfg=None) -> list[str]:
     out = gpu_problems(lim, cfg)
-    if (shutil.disk_usage(root).free >> 30) < 20:
-        out.append("Less than 20 GB of disk is free; models need room to download.")
+    if (shutil.disk_usage(root).free >> 30) < MIN_FREE_GB:
+        out.append(f"Less than {MIN_FREE_GB} GB of disk is free; models need room to download.")
     return out
 
 
@@ -712,6 +728,7 @@ SERVICE_ENV = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_pro
                "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
                # A Modal node's credentials stay in ~/.modal.toml; these only say which profile.
                "MODAL_PROFILE", "MODAL_CONFIG_PATH")
+DRAIN_MARGIN_S = 300     # systemd's stop timeout beyond drain_timeout_s: the node stops itself first
 
 
 def _install_service(cfg) -> tuple[bool, str]:
@@ -725,6 +742,8 @@ def _install_service(cfg) -> tuple[bool, str]:
     name = cfg.service_name
     unit = Path.home() / f".config/systemd/user/{name}.service"
     unit.parent.mkdir(parents=True, exist_ok=True)
+    # PYTHONUNBUFFERED: the service's stdout is a pipe to the journal, which Python
+    # block-buffers, so the node's output reached `journalctl` kilobytes late or never.
     unit.write_text(f"""[Unit]
 Description=BioModelBench evaluation node
 After=network-online.target
@@ -732,9 +751,17 @@ After=network-online.target
 [Service]
 WorkingDirectory={cfg.path.parent}
 Environment=BMB_CONFIG={cfg.path}
+Environment=PYTHONUNBUFFERED=1
 {env}ExecStart={exe} --config {cfg.path} run
 Restart=always
 RestartSec=10
+# A stop or restart drains: the node finishes the evaluations it is running, then exits.
+# SIGTERM goes to the node alone: by default every process of the unit gets it, and the
+# sandboxes running those evaluations would die of it. systemd waits a little longer than
+# the node's own limit, then kills whatever is left.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec={cfg.drain_timeout_s + DRAIN_MARGIN_S}
 
 [Install]
 WantedBy=default.target
@@ -743,6 +770,9 @@ WantedBy=default.target
     r = subprocess.run(["systemctl", "--user", "enable", "--now", name], capture_output=True, text=True)
     if r.returncode != 0:
         return False, (r.stderr or r.stdout or "").strip()
+    if _service_state(name) == "active":
+        print(f"  Restarting {name}: it first finishes the evaluations it is running "
+              f"(at most {cfg.drain_timeout_s // 60} min).", flush=True)
     subprocess.run(["systemctl", "--user", "restart", name], capture_output=True)
     user = os.environ.get("USER", "")
     if subprocess.run(["loginctl", "enable-linger", user], capture_output=True).returncode != 0:
@@ -844,7 +874,11 @@ def cmd_install_service(args) -> None:
 
 def cmd_run(args) -> None:
     from .node import Worker
-    Worker(_cfg(args)).run_forever()
+    if not Worker(_cfg(args)).run_forever():
+        # Stopped before its jobs finished: their threads may be inside Modal or a sandbox
+        # call that interpreter shutdown would wait on. The next start re-runs them.
+        sys.stdout.flush()
+        os._exit(1)
 
 
 # ------------------------------------------------------------- day to day
@@ -875,6 +909,73 @@ def cmd_status(args) -> None:
         c = counts.get(task, {})
         print(f"task        {task}: {c.get('done', 0)} evaluated, "
               f"{c.get('queued', 0) + c.get('running', 0)} in progress")
+    if recent := recent_events(cfg.state_dir, STATUS_EVENTS):
+        print("recent      (all of it: bmb-eval logs)")
+        for e in recent:
+            print("  " + format_event(e))
+
+
+STATUS_EVENTS = 8
+HIDDEN_FIELDS = ("prev", "hash")       # the audit chain, not news
+
+
+def recent_events(state_dir: Path, n: int, kinds: list[str] | None = None) -> list[dict]:
+    """The last n events (of these kinds, if given) in the node's audit log, oldest first."""
+    from collections import deque
+    p = state_dir / "audit.jsonl"
+    if not p.exists():
+        return []
+    with p.open(errors="replace") as f:
+        # Only the kept lines are parsed: the log grows by every run and check-in problem.
+        lines = deque((line for line in f if not kinds or any(f'"{k}"' in line for k in kinds)),
+                      maxlen=None if kinds else n)
+    out = []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not kinds or e.get("event") in kinds:
+            out.append(e)
+    return out[-n:]
+
+
+def format_event(e: dict, full: bool = False) -> str:
+    """'2026-11-01 17:02:03  run  task=x status=ok ...', one line for people: hashes
+    shortened to 12 characters and the line to 160, unless full."""
+    def value(v):
+        if not isinstance(v, str):
+            return json.dumps(v)
+        return v[:12] if not full and re.fullmatch(r"[0-9a-f]{64}", v) else v
+    fields = " ".join(f"{k}={value(v)}" for k, v in e.items() if k not in ("ts", "event", *HIDDEN_FIELDS))
+    line = f"{str(e.get('ts', '')).replace('T', ' ').rstrip('Z')}  {e.get('event', '?'):<18} {fields}".rstrip()
+    return line if full or len(line) <= 160 else line[:157] + "..."
+
+
+def cmd_logs(args) -> None:
+    """The node's own record of what it did: the service prints little to the journal."""
+    cfg = _cfg(args)
+
+    def show(events):
+        for e in events:
+            if not args.event or e.get("event") in args.event:
+                print(format_event(e, args.full), flush=True)
+    show(recent_events(cfg.state_dir, args.n, args.event))
+    p = cfg.state_dir / "audit.jsonl"
+    offset = p.stat().st_size if p.exists() else 0
+    while args.follow:
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            return
+        if not p.exists():
+            continue
+        with p.open("rb") as f:
+            f.seek(offset)
+            chunk = f.read()
+        done = chunk[:chunk.rfind(b"\n") + 1]      # a line still being written waits
+        offset += len(done)
+        show(json.loads(line) for line in done.decode(errors="replace").splitlines() if line.strip())
 
 
 def cmd_stop(args) -> None:
@@ -931,6 +1032,11 @@ def cmd_check(args) -> None:
         errors.append(stale)
     elif not cfg.runtime:
         warnings.append("gVisor not configured (optional hardening; see docs/PROVIDER_SETUP.md)")
+    disk_gb = shutil.disk_usage(next(p for p in (cfg.blob_dir, *cfg.blob_dir.parents) if p.exists())).total >> 30
+    if cfg.cache_gb > disk_gb:
+        warnings.append(f"cache_gb is {cfg.cache_gb} but the disk holding {cfg.blob_dir} has {disk_gb} GB: "
+                        "the disk fills before the cache evicts anything (leave cache_gb out for "
+                        "half the disk, up to 300)")
     for tid, t in cfg.tasks.items():
         print(f"\n== {tid}")
         errors += [f"{tid}: {p}" for p in data_problems(t)]
@@ -1012,6 +1118,12 @@ def cmd_eval(args) -> None:
 
 def cmd_contract(args) -> None:
     print(json.dumps(_cfg(args).tasks[args.task].contract.public(), indent=2))
+
+
+def cmd_check_task(args) -> None:
+    from .taskcheck import check
+    if check(Path(args.task_dir), _user_path(args.data) if args.data else None, n=args.n, seed=args.seed):
+        sys.exit(1)
 
 
 def cmd_audit(args) -> None:
@@ -1105,6 +1217,12 @@ def main(argv=None) -> None:
     sub.add_parser("stop", help="emergency stop: refuse new work, kill running evaluations"
                    ).set_defaults(fn=cmd_stop)
     sub.add_parser("resume", help="undo stop").set_defaults(fn=cmd_resume)
+    p = sub.add_parser("logs", help="what the node did recently (its audit log, readable)")
+    p.add_argument("-n", type=int, default=40, help="how many events (default 40)")
+    p.add_argument("-f", "--follow", action="store_true", help="keep printing new events")
+    p.add_argument("--event", action="append", help="only this kind of event (repeatable), e.g. run")
+    p.add_argument("--full", action="store_true", help="don't shorten long lines")
+    p.set_defaults(fn=cmd_logs)
     sub.add_parser("approve", help="accept changed settings").set_defaults(fn=cmd_approve)
     p = sub.add_parser("update", help="review and approve task updates from BioModelBench")
     p.add_argument("task", nargs="?", help="only this task (default: every task with an update)")
@@ -1140,6 +1258,13 @@ def main(argv=None) -> None:
     p = sub.add_parser("audit", help="(troubleshoot) verify the audit log")
     p.add_argument("action", choices=["verify"])
     p.set_defaults(fn=cmd_audit)
+    p = sub.add_parser("check-task", help="(operator) run a task folder's scorer on synthetic data "
+                       "and edge cases before any provider connects")
+    p.add_argument("task_dir", help="folder with contract.yaml and score.py")
+    p.add_argument("--data", help="a provider-style table or folder to use instead of synthetic rows")
+    p.add_argument("-n", type=int, default=300, help="synthetic rows (default 300)")
+    p.add_argument("--seed", type=int, default=0)
+    p.set_defaults(fn=cmd_check_task)
     p = sub.add_parser("contract", help="(operator) print a task's public contract")
     p.add_argument("task")
     p.set_defaults(fn=cmd_contract)

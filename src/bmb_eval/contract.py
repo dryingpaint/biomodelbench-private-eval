@@ -261,7 +261,7 @@ class Contract:
         data = raw.get("data") or {}
         c = cls(
             id=raw["id"],
-            version=int(raw["version"]),
+            version=_version(raw["version"]),
             title=raw.get("title", raw["id"]),
             description=raw.get("description", ""),
             key=list(raw["key"]),
@@ -393,6 +393,16 @@ class Contract:
 
     def metric(self, name: str) -> Metric:
         return next(m for m in self.metrics if m.name == name)
+
+
+def _version(v) -> int:
+    """The contract version as an int. A quoted whole number ("2") is accepted, as it
+    always was; anything else ("2.0", 2.5) is refused with a message that says what's
+    wrong, not int()'s "invalid literal"."""
+    if isinstance(v, bool) or not (isinstance(v, int) or (isinstance(v, float) and v.is_integer())
+                                   or (isinstance(v, str) and v.strip().isdigit())):
+        raise ValueError(f"version must be a whole number, e.g. `version: 2` (got {v!r})")
+    return int(v)
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,11 @@ def _stage_records(fm, stage):
     return [r for r in fm.created if fm.stage_of(r) == stage]
 
 
+def _bundle_volumes(fm):
+    d = fm.root / "volumes" / "bmb-eval"
+    return sorted(p.name for p in d.iterdir() if "-bun-" in p.name) if d.exists() else []
+
+
 # ------------------------------------------------------------- full flow
 
 def test_connect_syncs_and_an_agent_gets_scores(modal_connected):
@@ -85,10 +90,11 @@ def test_connect_syncs_and_an_agent_gets_scores(modal_connected):
     res = agent.status(sid)
     assert res["status"] == "done" and res["result"]["status"] == "ok", res
     assert res["result"]["metrics"]["spearman"] > 0.3
-    # Every stage ran without network, with this node's tags; job volumes are gone afterwards.
+    # Every stage ran without network, with this node's tags; the bundle's volume stays
+    # for its next job (until BUNDLE_IDLE_S).
     assert fm.created and all(r["block_network"] for r in fm.created)
     assert all(r["tags"] == {"bmb-eval": "1", "node": cfg.hub["node_id"]} for r in fm.created)
-    assert not [p for p in (fm.root / "volumes" / "bmb-eval").iterdir() if "-job-" in p.name]
+    assert len(_bundle_volumes(fm)) == 1
 
 
 def test_predict_never_gets_answers_or_the_other_half(modal_connected):
@@ -107,14 +113,14 @@ def test_predict_never_gets_answers_or_the_other_half(modal_connected):
         names = [n for n, _ in r["volumes"].values()]
         assert all(ro for _, ro in r["volumes"].values())             # all read-only
         assert not [n for n in names if n.endswith(("-ans", "-task", "-blobs", "-meta"))]
-        halves.append(sorted(n.rsplit("-", 1)[1] for n in names if "-job-" not in n))
+        halves.append(sorted(n.rsplit("-", 1)[1] for n in names if "-bun-" not in n))
     assert halves == [["val"], ["test"]]
     assert predicts[0]["gpu"] is None and predicts[1]["gpu"] == "H100:8"   # finals: 8 GPUs
     score = _stage_records(fm, "score")
     assert any(n.endswith("-ans") for n, _ in score[0]["volumes"].values())
-    # The stager alone mounts the blob volume, and writes only the job's volume.
+    # The stager alone mounts the blob volume, and writes only the bundle's volume.
     for r in _stage_records(fm, "stage"):
-        assert r["volumes"]["/blobs"][1] is True and "-job-" in r["volumes"]["/out"][0]
+        assert r["volumes"]["/blobs"][1] is True and "-bun-" in r["volumes"]["/out"][0]
 
 
 def test_stage_allowlist_refuses_before_anything_starts(modal_connected):
@@ -248,6 +254,151 @@ def test_requeues_are_bounded_per_job(modal_connected):
     res = agent.status(sid)
     assert res["status"] == "done" and res["result"]["error"]["code"] == "infra_error"
     assert w.store.count_today("agent-modal", "split_task") == 1    # now it counts
+
+
+# --------------------------------------------- bundles staged once, shared
+
+def _bundle_copy(tmp_path, name, extra=None):
+    import shutil
+    d = tmp_path / name
+    shutil.copytree(EXAMPLE_BUNDLE, d, ignore=shutil.ignore_patterns("__pycache__"))
+    if extra:
+        (d / "extra.txt").write_text(extra)
+    return d
+
+
+def test_jobs_of_one_bundle_stage_it_once(modal_connected, tmp_path):
+    """A family's datasets share one bundle: staged once, every predict mounts the same
+    read-only volume; a different bundle gets a volume of its own."""
+    cfg, *_, fm = modal_connected
+    r = Runner(cfg, send_alerts=False)                       # one sandbox, as in the node
+    for _ in range(3):
+        assert r.evaluate("split_task", pack_dir(EXAMPLE_BUNDLE))["status"] == "ok"
+    assert len(_stage_records(fm, "stage")) == 1
+    mounted = {rec["volumes"]["/bundle"] for rec in _stage_records(fm, "predict")}
+    assert len(mounted) == 1 and next(iter(mounted))[1] is True      # one volume, read-only
+    assert r.evaluate("split_task", pack_dir(_bundle_copy(tmp_path, "b2", "x")))["status"] == "ok"
+    assert len(_stage_records(fm, "stage")) == 2
+    vols = [rec["volumes"]["/bundle"][0] for rec in _stage_records(fm, "predict")]
+    assert len(set(vols)) == 2 and vols[-1] not in vols[:3]
+    assert len(_bundle_volumes(fm)) == 2
+
+
+def test_jobs_arriving_together_wait_for_one_staging(modal_connected, monkeypatch):
+    cfg, *_, fm = modal_connected
+    sb = Runner(cfg).sandbox
+    real, calls = sb._stage_bundle, []
+
+    def slow(*a):
+        calls.append(a[2])
+        time.sleep(0.3)                                      # the others arrive meanwhile
+        return real(*a)
+    monkeypatch.setattr(sb, "_stage_bundle", slow)
+    held, errors = [], []
+
+    def job(i):
+        try:
+            held.append(sb._hold_bundle(EXAMPLE_BUNDLE, f"j{i}"))
+        except Exception as e:
+            errors.append(e)
+    threads = [threading.Thread(target=job, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and len(calls) == 1
+    assert {st.volume for _, st in held} == {calls[0]} and held[0][1].users == 8
+    for h in held:
+        sb._release_bundle(*h)
+    assert held[0][1].users == 0 and _bundle_volumes(fm) == [calls[0]]   # idle, not yet deleted
+
+
+def test_idle_bundle_volumes_are_deleted(modal_connected, monkeypatch):
+    cfg, *_, fm = modal_connected
+    sb = Runner(cfg).sandbox
+    a = sb._hold_bundle(EXAMPLE_BUNDLE, "a")
+    b = sb._hold_bundle(EXAMPLE_BUNDLE, "b")
+    monkeypatch.setattr(modal_backend, "BUNDLE_IDLE_S", 0)
+    sb._release_bundle(*a)
+    assert _bundle_volumes(fm) == [a[1].volume]              # b still holds it
+    sb._release_bundle(*b)
+    assert _bundle_volumes(fm) == [] and not sb._staged      # idle: deleted
+    c = sb._hold_bundle(EXAMPLE_BUNDLE, "c")                 # staged afresh, under a new name
+    assert c[1].volume != a[1].volume and _bundle_volumes(fm) == [c[1].volume]
+    # At node start, every bundle volume (and a pre-sharing job volume) is an orphan.
+    for name in (("job", "0" * 20), ("bun", "val")):            # a pre-sharing job volume; task "bun"'s
+        fm.Volume.from_name(modal_backend.vol_name(cfg.modal.volume_prefix, *name),
+                            environment_name="bmb-eval", create_if_missing=True)
+    orphans = {c[1].volume, modal_backend.vol_name(cfg.modal.volume_prefix, "job", "0" * 20)}
+    others = sorted(p.name for p in (fm.root / "volumes" / "bmb-eval").iterdir() if p.name not in orphans)
+    assert modal_backend.vol_name(cfg.modal.volume_prefix, "bun", "val") in others
+    assert modal_backend.cleanup_jobs(cfg) == 2
+    assert sorted(p.name for p in (fm.root / "volumes" / "bmb-eval").iterdir()) == others
+
+
+def test_idle_volume_is_deleted_by_the_timer(modal_connected, monkeypatch):
+    cfg, *_, fm = modal_connected
+    monkeypatch.setattr(modal_backend, "BUNDLE_IDLE_S", 0.5)
+    sb = Runner(cfg).sandbox
+    sb._release_bundle(*sb._hold_bundle(EXAMPLE_BUNDLE, "a"))
+    assert len(_bundle_volumes(fm)) == 1 and sb._sweep_timer is not None
+    deadline = time.time() + 10
+    while _bundle_volumes(fm) and time.time() < deadline:
+        time.sleep(0.1)
+    assert _bundle_volumes(fm) == [] and not sb._staged
+
+
+def test_a_failed_staging_is_never_mounted(modal_connected, monkeypatch):
+    """Files that never became visible: the jobs waiting on that staging fail (and are
+    retried), the half-staged volume is deleted, and the bundle is staged afresh."""
+    cfg, *_, fm = modal_connected
+    sb = Runner(cfg).sandbox
+    real, entered, release = sb._wait_visible, threading.Event(), threading.Event()
+
+    def never_visible(vol, manifest):
+        entered.set()
+        release.wait(5)
+        raise RuntimeError(f"staged files not visible on {vol} after 120s")
+    monkeypatch.setattr(sb, "_wait_visible", never_visible)
+    out = {}
+
+    def job(i):
+        try:
+            out[i] = sb._hold_bundle(EXAMPLE_BUNDLE, f"j{i}")
+        except Exception as e:
+            out[i] = e
+    first = threading.Thread(target=job, args=(0,))
+    first.start()
+    assert entered.wait(10)
+    waiter = threading.Thread(target=job, args=(1,))
+    waiter.start()
+    time.sleep(0.2)
+    release.set()
+    first.join()
+    waiter.join()
+    assert isinstance(out[0], RuntimeError)
+    assert isinstance(out[1], modal_backend._Infra) and "not visible" in str(out[1])
+    assert _bundle_volumes(fm) == [] and not sb._staged
+    failed = [r["volumes"]["/out"][0] for r in _stage_records(fm, "stage")]
+    monkeypatch.setattr(sb, "_wait_visible", real)
+    held = sb._hold_bundle(EXAMPLE_BUNDLE, "j2")
+    assert held[1].volume not in failed and held[1].users == 1
+    # End to end: the job's retry stages afresh, and no predict ever mounted the failed volume.
+    sb._release_bundle(*held)
+    r = Runner(cfg, send_alerts=False)
+    tries = []
+
+    def once(vol, manifest):
+        tries.append(vol)
+        if len(tries) == 1:
+            raise RuntimeError("staged files not visible")
+        return real(vol, manifest)
+    monkeypatch.setattr(r.sandbox, "_wait_visible", once)
+    assert r.evaluate("split_task", pack_dir(EXAMPLE_BUNDLE))["status"] == "ok"
+    assert len(tries) == 2 and tries[0] != tries[1]
+    mounted = {rec["volumes"]["/bundle"][0] for rec in _stage_records(fm, "predict")}
+    assert tries[0] not in mounted and tries[1] in mounted
+    assert tries[0] not in _bundle_volumes(fm)
 
 
 # ------------------------------------------------------------- operations

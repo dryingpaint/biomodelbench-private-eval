@@ -704,7 +704,7 @@ def cmd_confidential_node(args) -> None:
         if busy:
             sealed.save(worker.store)
             idle_since = time.time()
-        elif time.time() - idle_since > IDLE_EXIT_S:
+        elif not worker._jobs and time.time() - idle_since > IDLE_EXIT_S:   # jobs run in threads
             sealed.save(worker.store)
             say(step="exit", reason="idle")
             return

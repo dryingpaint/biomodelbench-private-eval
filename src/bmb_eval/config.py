@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -10,6 +11,18 @@ import yaml
 from .contract import Contract
 
 PKG = Path(__file__).resolve().parent  # the bmb_eval package directory
+CACHE_GB = 300     # model-file cache when config.yaml doesn't say, on a disk of 600 GB or more
+# A Modal sandbox lives at most 24 h; a batch's predict also needs its cold start and margin.
+BATCH_MAX_PREDICT_S = 23 * 3600
+
+
+def default_cache_gb(blob_dir: Path) -> int:
+    """CACHE_GB, or half the disk holding the cache if that is less. A flat 300 GB on a
+    290 GB disk never evicted anything: the disk filled first."""
+    p = blob_dir
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return max(1, min(CACHE_GB, (shutil.disk_usage(p).total >> 30) // 2))
 
 
 @dataclass
@@ -81,6 +94,19 @@ class Config:
     # The systemd user unit the node runs as. A second node on the same machine (e.g. a
     # Modal node beside a container node) needs its own.
     service_name: str = "bmb-eval"
+    # On SIGTERM (a restart) the node takes no new work and waits this long for the
+    # evaluations it is running to finish before stopping anyway. GPU evaluations run up
+    # to hours; the systemd unit's TimeoutStopSec is set from it (install-service).
+    drain_timeout_s: int = 7200
+    # Family batching (off by default; for our own public-data nodes, never a provider's):
+    # jobs of one bundle and split on several of this node's tasks share one predict
+    # sandbox, which loads the model once and so sees every batched task's inputs together
+    # (docs/THREAT_MODEL.md). Validate and score stay per task.
+    batch_families: bool = False
+    batch_max_tasks: int = 32
+    # The whole batch's predict time limit: the sum of its tasks' limits, at most this.
+    # Tasks a batch cut off still run, each alone (Modal's sandboxes live at most 24 h).
+    batch_max_predict_s: int = 6 * 3600
     tasks: dict[str, TaskBinding] = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
@@ -98,10 +124,12 @@ class Config:
 
         sb = raw.get("sandbox", {})
         al = raw.get("alerts", {})
+        state_dir = rel(raw.get("state_dir", "state"))
+        blob_dir = rel(raw["blob_dir"]) if raw.get("blob_dir") else state_dir / "blobs"
         cfg = cls(
             path=path,
             node_name=raw.get("node_name", "bmb-eval-node"),
-            state_dir=rel(raw.get("state_dir", "state")),
+            state_dir=state_dir,
             backend=sb.get("backend", "docker"),
             image=sb.get("image", "bmb-eval-sandbox:latest"),
             runtime=sb.get("runtime"),
@@ -109,16 +137,19 @@ class Config:
             webhook_url=al.get("webhook_url"),
             infra_failure_threshold=int(al.get("infra_failure_threshold", 3)),
             retain_bundles=bool(raw.get("retain_bundles", False)),
-            cache_gb=int(raw.get("cache_gb", 300)),
+            cache_gb=int(raw["cache_gb"]) if raw.get("cache_gb") is not None else default_cache_gb(blob_dir),
             max_parallel=max(1, int(raw.get("max_parallel", 1))),
             hub=dict(raw.get("hub") or {}),
-            blob_dir=rel(raw["blob_dir"]) if raw.get("blob_dir") else None,
+            blob_dir=blob_dir,
             service_name=str(raw.get("service_name") or "bmb-eval"),
+            drain_timeout_s=max(0, int(raw.get("drain_timeout_s", 7200))),
+            batch_families=bool(raw.get("batch_families", False)),
+            batch_max_tasks=max(2, int(raw.get("batch_max_tasks", 32))),
+            batch_max_predict_s=min(BATCH_MAX_PREDICT_S, max(60, int(raw.get("batch_max_predict_s", 6 * 3600)))),
             raw=raw,
         )
         if not cfg.service_name.replace("-", "").replace("_", "").isalnum():
             raise SystemExit("service_name may hold only letters, digits, - and _")
-        cfg.blob_dir = cfg.blob_dir or cfg.state_dir / "blobs"
         for tid, t in (raw.get("tasks") or {}).items():
             d = rel(t["dir"])
             contract = Contract.load(d / "contract.yaml")
@@ -134,6 +165,9 @@ class Config:
             cfg.modal = ModalSettings.parse(raw.get("modal"), cfg.node_name)
             # Evaluations run side by side, each in its own Modal container.
             cfg.max_parallel = max(1, cfg.modal.max_jobs)
+        if cfg.batch_families and cfg.sealed:
+            # A provider's data: a batched model sees every task's inputs at once.
+            raise SystemExit("batch_families is for public-data nodes; the sealed node can't batch")
         if cfg.backend == "local" and not cfg.allow_unisolated:
             raise SystemExit("sandbox.backend local is NOT isolated; set "
                              "sandbox.i_understand_local_backend_is_not_isolated: true "

@@ -294,10 +294,13 @@ def _rows(n: float, n_rows: int) -> str:
     return f"about {n:,.0f} of your {n_rows:,} rows ({n / n_rows:.1%})"
 
 
+MIN_FREE_GB = 20     # below this, connect stops: models need room to download (tests set it to 0)
+
+
 def hardware_problems(lim, root: Path, cfg=None) -> list[str]:
     out = gpu_problems(lim, cfg)
-    if (shutil.disk_usage(root).free >> 30) < 20:
-        out.append("Less than 20 GB of disk is free; models need room to download.")
+    if (shutil.disk_usage(root).free >> 30) < MIN_FREE_GB:
+        out.append(f"Less than {MIN_FREE_GB} GB of disk is free; models need room to download.")
     return out
 
 

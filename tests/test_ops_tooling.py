@@ -1,6 +1,7 @@
-"""Operator tooling: check-task."""
+"""Operator tooling: check-task and the free-disk check."""
 from __future__ import annotations
 
+import collections
 import shutil
 from pathlib import Path
 
@@ -99,3 +100,18 @@ def test_quoted_whole_number_versions_still_load(tmp_path):
     (d / "contract.yaml").write_text((d / "contract.yaml").read_text().replace('"3"', '"2.0"'))
     with pytest.raises(ValueError, match="version must be a whole number"):
         Contract.load(d / "contract.yaml")
+
+
+# ------------------------------------------------------------------ disk
+
+Usage = collections.namedtuple("Usage", "total used free")
+
+
+def test_connect_still_refuses_a_nearly_full_disk(tmp_path, monkeypatch):
+    # conftest turns the check off for the suite; the production threshold is unchanged.
+    from bmb_eval.contract import Limits
+    monkeypatch.setattr(cli, "MIN_FREE_GB", 20)
+    monkeypatch.setattr(cli.shutil, "disk_usage", lambda p: Usage(500 << 30, 490 << 30, 10 << 30))
+    assert any("Less than 20 GB of disk is free" in p for p in cli.hardware_problems(Limits(), tmp_path))
+    monkeypatch.setattr(cli.shutil, "disk_usage", lambda p: Usage(500 << 30, 400 << 30, 100 << 30))
+    assert cli.hardware_problems(Limits(), tmp_path) == []

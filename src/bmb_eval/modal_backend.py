@@ -47,7 +47,7 @@ from pathlib import Path
 
 from . import audit
 from .contract import Limits
-from .sandbox import LOG_CAP, Mount, Result, SandboxLost, _bytes
+from .sandbox import LOG_CAP, Mount, Result, SandboxLost, SandboxRefused, _bytes
 
 RUN = "/run/bmb"                  # launcher spec, stdin, stdout and stderr files in the sandbox
 CONTRACT = "/contract.json"
@@ -83,6 +83,20 @@ def _must_wait(e: Exception) -> bool:
     """Modal has no capacity free, or asks us to slow down: wait, don't fail the stage."""
     return "Insufficient capacity" in str(e) or "rate limit exceeded" in str(e)
 MODAL_IMAGE_FILES = ("sandbox/modal/Dockerfile", "sandbox/modal/requirements.lock")
+
+
+# Modal's errors for a request it will never accept (bad resources, credentials, access):
+# not transient, so not retried, waited for or handed back.
+PERMANENT_ERRORS = ("InvalidError", "ConflictError", "AuthError", "PermissionDeniedError",
+                    "UnimplementedError")
+
+
+def _permanent(e: BaseException | None) -> bool:
+    while e is not None:
+        if type(e).__name__ in PERMANENT_ERRORS:
+            return True
+        e = e.__cause__
+    return False
 
 
 class _Infra(Exception):
@@ -351,6 +365,7 @@ class ModalSandbox:
         plan = self.plan(entry, mounts)          # PermissionError: never retried
         if gpus > self.s.max_gpus_per_job:
             raise PermissionError(f"{gpus} GPUs is more than one Modal container has")
+        self.request(entry, limits, gpus)        # SandboxRefused before anything starts
         t0 = time.time()
         held = None                              # (digest, _Staged) of the bundle this stage mounts
         errors = []
@@ -367,9 +382,13 @@ class ModalSandbox:
                                      waited_s=round(time.time() - t0))
                     r.seconds = round(time.time() - t0, 2)
                     return r
-                except PermissionError:
+                except (PermissionError, SandboxRefused):
                     raise
                 except Exception as e:       # Modal's errors, connection failures, a lost sandbox
+                    if _permanent(e):
+                        audit.record(self.cfg.state_dir, "modal_request_refused", stage=name,
+                                     error=f"{type(e).__name__}: {str(e)[:200]}")
+                        raise SandboxRefused(f"{name}: {type(e).__name__}: {str(e)[:300]}") from e
                     if _must_wait(e) and time.time() - t0 < CAPACITY_WAIT_S:
                         if not waits:
                             audit.record(self.cfg.state_dir, "modal_capacity_wait", stage=name, gpus=gpus,
@@ -397,13 +416,13 @@ class ModalSandbox:
         vols = {path: self.volume(v).read_only() for path, v in plan.volumes.items()}
         if bundle_vol is not None:
             vols[MOUNT_AT["bundle"]] = self.volume(bundle_vol).read_only()
-        mem_mib = (_bytes(limits.memory) >> 20) + self.s.memory_headroom_mb
+        cpus, mem_mib, mem_bytes = self.request(entry, limits, gpus)
         sb_timeout = timeout_s + COLD_START_S
         try:
             sb = self.m.Sandbox.create(
                 "sleep", str(sb_timeout + 60), app=self.app(), image=self.image(), volumes=vols,
                 gpu=f"{self.s.gpu}:{gpus}" if gpus else None,
-                cpu=(float(limits.cpus), float(limits.cpus)), memory=(mem_mib, mem_mib),
+                cpu=(cpus, cpus), memory=(mem_mib, mem_mib),
                 timeout=sb_timeout, block_network=True, tags=self.tags())
         except Exception as e:
             raise _Infra(f"create: {type(e).__name__}: {e}") from e
@@ -425,10 +444,10 @@ class ModalSandbox:
                 fs.write_bytes(plan.contract.read_bytes(), root + CONTRACT)
             if stdin:
                 fs.write_bytes(stdin, root + RUN + "/in.bin")
-            threads = str(max(1, int(limits.cpus)))
+            threads = str(max(1, int(cpus)))
             spec = {
                 "entry": entry, "run_dir": root + RUN, "timeout_s": timeout_s, "stdout_cap": stdout_cap,
-                "memory_bytes": _bytes(limits.memory), "cpus": limits.cpus, "pids": limits.pids,
+                "memory_bytes": mem_bytes, "cpus": cpus, "pids": limits.pids,
                 "gpus": gpus, "stdin": bool(stdin), "cwd": root + "/tmp" if root else "/tmp",
                 "env": {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": root + "/tmp" if root else "/tmp",
                         "TMPDIR": root + "/tmp" if root else "/tmp", "PYTHONHASHSEED": "0",
@@ -481,6 +500,30 @@ class ModalSandbox:
                 sb.terminate()
             except Exception:
                 pass
+
+    def request(self, entry: str, limits: Limits, gpus: int) -> tuple[float, int, int]:
+        """(cpus, container memory MiB, the launcher's memory limit in bytes) for a stage.
+
+        Validate and score get the contract's limits too, though they run no model and no
+        GPU; on a CPU-only sandbox Modal accepts at most cpu_max_memory_mib and max_cpus, so
+        they are clamped (a final's 1024g made every genomic final's validate fail,
+        2026-10-31). Predict gets exactly the contract's limits, or SandboxRefused when
+        Modal can't give them, before anything starts."""
+        s = self.s
+        want_mib = (_bytes(limits.memory) >> 20) + s.memory_headroom_mb
+        cpus = float(limits.cpus)
+        cap_mib = None if gpus else s.cpu_max_memory_mib
+        if entry == "predict":
+            if cpus > s.max_cpus or (cap_mib is not None and want_mib > cap_mib):
+                raise SandboxRefused(
+                    f"predict asks for {limits.cpus} CPUs and {limits.memory} memory"
+                    + (f" with {gpus} GPU(s)" if gpus else " on a CPU-only sandbox")
+                    + f"; Modal gives at most {s.max_cpus:g} CPUs"
+                    + (f" and {cap_mib} MiB" if cap_mib is not None else ""))
+            return cpus, want_mib, _bytes(limits.memory)
+        cpus = min(cpus, s.max_cpus)
+        mem_mib = min(want_mib, cap_mib) if cap_mib is not None else want_mib
+        return cpus, mem_mib, min(_bytes(limits.memory), (mem_mib - s.memory_headroom_mb) << 20)
 
     def _exit_code(self, sb) -> int | None:
         """The sandbox's own exit code once it has gone (OOM shows as 137)."""

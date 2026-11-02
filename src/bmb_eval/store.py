@@ -109,6 +109,13 @@ class Store:
                 "UPDATE submissions SET status='done', finished=?, result=?, release_at=?, split=? "
                 "WHERE id=?", (now, json.dumps(result), now, split, sid))
 
+    def uncount(self, sid: str) -> None:
+        """Keep a finished job, but out of every quota and final-evaluation count (its
+        split becomes e.g. "test_refused", as for a refused final)."""
+        with self.lock, self.db:
+            self.db.execute("UPDATE submissions SET split = split || '_refused' WHERE id=? "
+                            "AND split IN ('validation', 'test')", (sid,))
+
     def has(self, sid: str) -> bool:
         with self.lock:
             return self.db.execute("SELECT 1 FROM submissions WHERE id=?", (sid,)).fetchone() is not None

@@ -322,9 +322,17 @@ def nvidia_driver() -> tuple[str, int] | None:
 
 def gpu_problems(lim, cfg=None) -> list[str]:
     out = []
-    if lim.gpus and cfg is not None and cfg.backend == "modal":
+    if cfg is not None and cfg.backend == "modal":
         # Modal's GPUs, not this machine's: no driver, engine or device spec here to check.
-        mem = make_sandbox(cfg).gpus_available()
+        from .sandbox import SandboxRefused
+        sb = make_sandbox(cfg)
+        try:
+            sb.request("predict", lim, lim.gpus)
+        except SandboxRefused as e:
+            out.append(f"Modal can't run this task's model as its contract asks: {e}.")
+        if not lim.gpus:
+            return out
+        mem = sb.gpus_available()
         if len(mem) < lim.gpus:
             out.append(f"This task needs {lim.gpus} GPUs in one container; Modal gives at most {len(mem)}.")
         elif lim.gpu_memory_gb and min(mem) < lim.gpu_memory_gb:

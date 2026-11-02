@@ -681,3 +681,74 @@ def test_sandbox_pythonpath_drops_entries_the_sandbox_user_cannot_list(tmp_path)
     private.chmod(0o700)
     value = os.pathsep.join([str(shared), str(private), str(tmp_path / "missing"), ""])
     assert _sandbox_pythonpath(value) == str(shared)
+
+
+# ---------------------------------------- what Modal accepts for each stage
+
+@pytest.fixture
+def modal_big_final(hub, provider_files, tmp_path, fm, monkeypatch):  # noqa: F811
+    """A connected Modal node on a task whose finals ask for what genomic finals do."""
+    store, url = hub
+    data, _ = provider_files
+    cfg_path = _modal_node(tmp_path / "mnode")
+    monkeypatch.setattr(cli, "_selftest", lambda *a, **k: 0)
+    code, _ = store.add_enrollment(_split_task(tmp_path, final_limits="gpus: 8, memory: 1024g, cpus: 64"))
+    cfg = _connect(cfg_path.parent, url, code, data)
+    return cfg, store, url, Client(url, store.add_agent("agent-big")), fm
+
+
+def _final(store, w, agent):
+    sid = agent.submit_async("split_task", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain()
+    fid = store.request_final(sid)
+    w.drain()
+    return fid, json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
+
+
+def test_final_sized_limits_are_clamped_only_where_modal_needs_it(modal_big_final):
+    cfg, store, url, agent, fm = modal_big_final
+    w = Worker(cfg)
+    fid, r = _final(store, w, agent)
+    assert r["status"] == "ok" and r["split"] == "test", r
+    last = {fm.stage_of(x): x for x in fm.created}           # the final's stages are the last ones
+    assert last["predict"]["gpu"] == "H100:8"
+    assert last["predict"]["memory"] == (1024 * 1024 + 2048,) * 2 and last["predict"]["cpu"] == (64.0, 64.0)
+    for stage in ("validate", "score"):                       # CPU-only: within Modal's limits
+        assert last[stage]["gpu"] is None and last[stage]["memory"] == (344064, 344064)
+
+
+def test_predict_modal_cant_give_is_refused_before_starting_and_at_connect(modal_big_final):
+    cfg, *_ , fm = modal_big_final
+    from bmb_eval.contract import Limits
+    from bmb_eval.sandbox import SandboxRefused
+    sb = Runner(cfg).sandbox
+    with pytest.raises(SandboxRefused):
+        sb.request("predict", Limits(memory="400g", cpus=8), 0)          # CPU-only predict, too much memory
+    with pytest.raises(SandboxRefused):
+        sb.request("predict", Limits(memory="64g", cpus=96), 8)          # more CPUs than any container
+    assert sb.request("predict", Limits(memory="1024g", cpus=64), 8)[1] == 1024 * 1024 + 2048
+    assert any("Modal can't run" in p for p in cli.gpu_problems(Limits(memory="400g", cpus=8), cfg))
+    assert cli.gpu_problems(cfg.tasks["split_task"].contract.limits_for("test"), cfg) == []
+
+
+def test_a_request_modal_refuses_fails_fast_uncounted_with_an_alert(modal_big_final, monkeypatch):
+    cfg, store, url, agent, fm = modal_big_final
+    sent = []
+    from bmb_eval import alerts
+    monkeypatch.setattr(alerts, "send", lambda cfg, kind, summary, **f: sent.append((kind, summary)))
+    w = Worker(cfg)
+    sid = agent.submit_async("split_task", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain()
+    fm.cpu_max_memory_mib = 1024                              # Modal tightens its limits
+    before = len(fm.created)
+    fid = store.request_final(sid)
+    w.drain()
+    r = json.loads(store.q("SELECT result FROM submissions WHERE id=?", (fid,), one=True)[0])
+    assert r["error"]["code"] == "infra_error"
+    validates = [x for x in fm.created[before:] if fm.stage_of(x) == "validate"]
+    assert validates == []                                    # refused at create: one try, no retries
+    events = [e["event"] for e in (json.loads(x) for x in (cfg.state_dir / "audit.jsonl").read_text().splitlines())]
+    assert "modal_request_refused" in events and "job_refused_by_sandbox" in events
+    assert "modal_infra_failure" not in events and "job_requeued_infra" not in events
+    assert w.store.count_final("split_task") == 0             # the final isn't used up
+    assert any("refused" in s for k, s in sent if k == "infra")

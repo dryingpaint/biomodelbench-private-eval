@@ -197,6 +197,12 @@ class GCSBlobs:
         b = self.bucket.get_blob(self._name(agent, sha))
         return b is not None and b.size == size
 
+    def held(self, agent: str) -> dict[str, int]:
+        """Every file stored for this agent, {sha256: size}, from one prefix listing (about
+        1,000 objects per page): a 10,000-file bundle needs ~10 calls, not 10,000 get_blob."""
+        prefix = self._name(agent, "")
+        return {b.name[len(prefix):]: b.size for b in self.bucket.list_blobs(prefix=prefix)}
+
     def upload(self, agent: str, sha: str, size: int) -> dict:
         ct = "application/octet-stream"
         return {"url": self._sign(agent, sha, "PUT", content_type=ct), "method": "PUT",
@@ -887,23 +893,30 @@ def _concurrently(fn, items: list) -> list:
         return list(ex.map(fn, items))
 
 
+def _held_check(blobs, agent: str, uniq: list[dict]) -> list[bool]:
+    """Whether the hub holds each file. A store that can list an agent's files (GCSBlobs.held)
+    answers with one listing; otherwise one existence check per file, run concurrently."""
+    if hasattr(blobs, "held"):
+        held = blobs.held(agent)
+        return [held.get(f["sha256"]) == f["size"] for f in uniq]
+    return _concurrently(lambda f: blobs.has(agent, f["sha256"], f["size"]), uniq)
+
+
 def plan_uploads(blobs, agent: str, files: list[dict]) -> list[dict]:
     """An upload URL for each distinct file the hub doesn't hold yet. Existence checks and
     signatures are GCS/IAM calls (~0.1 s each): one by one, a 1,482-file bundle took minutes,
-    the client timed out and retried, and each retry left another submission stuck uploading."""
+    the client timed out and retried, and each retry left another submission stuck uploading.
+    Existence comes from one listing (_held_check); only the missing files are signed."""
     uniq = list({f["sha256"]: f for f in files}.values())
-    def one(f):
-        if blobs.has(agent, f["sha256"], f["size"]):
-            return None
-        return {"sha256": f["sha256"], "size": f["size"], **blobs.upload(agent, f["sha256"], f["size"])}
-    return [u for u in _concurrently(one, uniq) if u]
+    todo = [f for f, h in zip(uniq, _held_check(blobs, agent, uniq)) if not h]
+    return _concurrently(lambda f: {"sha256": f["sha256"], "size": f["size"],
+                                    **blobs.upload(agent, f["sha256"], f["size"])}, todo)
 
 
 def missing_blobs(blobs, agent: str, files: list[dict]) -> list[str]:
-    """Distinct files of a submission the hub doesn't hold (checked concurrently)."""
+    """Distinct files of a submission the hub doesn't hold."""
     uniq = list({f["sha256"]: f for f in files}.values())
-    held = _concurrently(lambda f: blobs.has(agent, f["sha256"], f["size"]), uniq)
-    return sorted(f["sha256"] for f, h in zip(uniq, held) if not h)
+    return sorted(f["sha256"] for f, h in zip(uniq, _held_check(blobs, agent, uniq)) if not h)
 
 
 def sign_all(blobs, agent: str, files: list[dict]) -> dict[str, dict]:

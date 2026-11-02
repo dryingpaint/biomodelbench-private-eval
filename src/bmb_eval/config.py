@@ -53,6 +53,10 @@ class ModalSettings:
     volume_prefix: str = ""           # names this node's volumes; default: the node name
     retries: int = 2                  # retries of a stage after a Modal (not model) failure
     memory_headroom_mb: int = 2048    # container memory above the contract's, for the launcher
+    # What Modal accepts per sandbox (InvalidError past them; measured 2026-11-01): 64 CPUs,
+    # and 344064 MiB on a CPU-only sandbox. GPU sandboxes took up to 2,000,000 MiB (H100:8).
+    max_cpus: float = 64
+    cpu_max_memory_mib: int = 344064
 
     @classmethod
     def parse(cls, raw: dict | None, node_name: str) -> "ModalSettings":

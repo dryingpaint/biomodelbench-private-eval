@@ -21,7 +21,7 @@ from .blobs import BlobCache, check_manifest
 from .config import Config
 from .errors import EvalError
 from .runner import Runner
-from .sandbox import SandboxLost, stale_image_message
+from .sandbox import SandboxLost, SandboxRefused, stale_image_message
 from .store import Store
 
 POLL_S = 5
@@ -688,6 +688,20 @@ class Worker:
             if self._requeue_lost(sid, task, e):
                 return
             result = {"run_id": sid, "status": "error", "error": EvalError("infra_error").public()}
+        except SandboxRefused as e:
+            # A configuration problem (e.g. a contract asking Modal for more than a container
+            # can have): every retry would be refused the same way, so it isn't handed back.
+            # Finished as an infra_error the agent isn't charged for; the operator fixes it.
+            self.store.finish(sid, {"run_id": sid, "task": task, "status": "error",
+                                    "error": EvalError("infra_error").public()})
+            self.store.uncount(sid)
+            path.unlink(missing_ok=True)
+            audit.record(self.cfg.state_dir, "job_refused_by_sandbox", run_id=sid, task=task,
+                         error=str(e)[:300])
+            alerts.send(self.cfg, "infra", f"the sandbox backend refused run {sid} as configured "
+                        "(not retried, not counted); fix the task or node config", run_id=sid, task=task,
+                        error=str(e)[:200])
+            return
         except Exception as e:
             audit.record(self.cfg.state_dir, "worker_error", run_id=sid, error=type(e).__name__)
             result = {"run_id": sid, "status": "error", "error": EvalError("infra_error").public()}

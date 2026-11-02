@@ -59,6 +59,13 @@ class SandboxLost(Exception):
     model did. The node hands the job back to the hub without counting it."""
 
 
+class SandboxRefused(Exception):
+    """The sandbox backend refused the request as configured (Modal: InvalidError and the
+    like, e.g. more memory than a container can have). Permanent: retrying can't help and it
+    is no fault of the model. The node finishes the job as an uncounted infra_error and
+    alerts the operator."""
+
+
 @dataclass
 class Result:
     exit_code: int

@@ -1920,6 +1920,30 @@ def test_upload_plan_and_missing_check_run_concurrently():
     assert has.peak > 1 and upload.peak > 1              # concurrent, not one by one
 
 
+def test_upload_plan_uses_one_listing_when_the_store_can_list():
+    """GCSBlobs.held: existence from one prefix listing, so a 10,000-file bundle doesn't make
+    10,000 get_blob calls (the client's 60 s timeout ran out and it re-sent the bundle)."""
+    from bmb_eval.hub import missing_blobs, plan_uploads
+
+    class Blobs:
+        def __init__(self):
+            self.listings = 0
+        def held(self, agent):
+            self.listings += 1
+            return {f"{i:064x}": i for i in range(0, 10_000, 2)}
+        def has(self, agent, sha, size):
+            raise AssertionError("per-file existence check with a listing available")
+        def upload(self, agent, sha, size):
+            return {"url": f"https://x/{sha}", "method": "PUT"}
+
+    files = [{"sha256": f"{i:064x}", "size": i} for i in range(10_000)]
+    files[2] = {**files[2], "size": 999}               # held under this hash, but another size
+    b = Blobs()
+    ups = plan_uploads(b, "a", files)
+    assert len(ups) == 5001 and b.listings == 1
+    assert missing_blobs(b, "a", files)[:2] == [f"{1:064x}", f"{2:064x}"] and b.listings == 2
+
+
 # ------------------------------------------- failed and stalled setups reach BioModelBench
 
 def _reports(store):

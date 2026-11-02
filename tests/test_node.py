@@ -2351,3 +2351,37 @@ def test_old_hub_db_gets_multi_node_bindings(tmp_path):
     assert sorted(store.q("SELECT task, node_id FROM node_tasks")) == [("t1", "node_a"), ("t1", "node_b")]
     hub_mod.HubStore(state)                                  # a second start changes nothing
     assert len(store.q("SELECT * FROM node_tasks")) == 2
+
+
+def test_a_jobs_files_download_concurrently(tmp_path):
+    """A bundle of many small files downloads several at a time, not one by one (a genomic
+    bundle of thousands of files took over 20 minutes serially on 2026-11-02)."""
+    import hashlib
+    w = object.__new__(Worker)
+    w.cache = BlobCache(tmp_path / "blobs")
+    w._fetch_lock, w._fetching = threading.Lock(), {}
+    w._download_slots = threading.Semaphore(8)
+    live, peak = [0], [0]
+    lock = threading.Lock()
+    data = {}
+
+    class Api:
+        def download(self, info, cache, sha, size):
+            with lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+            time.sleep(0.05)
+            cache.put(sha, size, io.BytesIO(data[sha]).read)
+            with lock:
+                live[0] -= 1
+    w.api = Api()
+    files, downloads = [], {}
+    for i in range(40):
+        b = f"file {i}".encode()
+        sha = hashlib.sha256(b).hexdigest()
+        data[sha] = b
+        files.append({"sha256": sha, "size": len(b), "path": f"f{i}"})
+        downloads[sha] = {"url": "x"}
+    assert w._fetch(files, downloads) == sum(f["size"] for f in files)
+    assert 1 < peak[0] <= 8                       # concurrent, within the node's download slots
+    assert all(w.cache.has(f["sha256"], f["size"]) for f in files)

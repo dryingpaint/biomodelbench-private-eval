@@ -40,7 +40,7 @@ MODAL_CHECK_BACKOFF_S = (60, 120, 300, 600, 1800)   # after checks Modal couldn'
 MODAL_CHECK_ALERT_AFTER = 3   # failed checks in a row before alerting
 # Model files fetched at once across all jobs. Each job downloads in its own thread, so a
 # node taking hundreds of jobs would otherwise open hundreds of multi-GB streams.
-MAX_DOWNLOADS = 8
+MAX_DOWNLOADS = 32
 
 
 class HubError(Exception):
@@ -614,31 +614,46 @@ class Worker:
 
     def _fetch(self, files: list[dict], downloads: dict) -> int:
         """Download every file of a job that isn't cached; returns the bytes fetched.
-        HubError when one can't be fetched; EvalError when one fails its hash."""
+        HubError when one can't be fetched; EvalError when one fails its hash.
+
+        A job's files download concurrently (up to MAX_DOWNLOADS across the node). One at a
+        time, a genomic bundle of thousands of small files took over 20 minutes on
+        2026-11-02, a new HTTPS connection per file, while its family's other 25 jobs waited
+        on the same files."""
+        uniq = list({f["sha256"]: f for f in files}.values())
+        if len(uniq) <= 1:
+            return sum(self._fetch_one(f, downloads) for f in uniq)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(min(MAX_DOWNLOADS, len(uniq)), thread_name_prefix="fetch") as ex:
+            # Leaving the pool waits for every download, so a failure is raised only once
+            # nothing is still writing into the cache for this job.
+            futures = [ex.submit(self._fetch_one, f, downloads) for f in uniq]
+            return sum(f.result() for f in futures)
+
+    def _fetch_one(self, f: dict, downloads: dict) -> int:
         fetched = 0
-        for f in {f["sha256"]: f for f in files}.values():
-            sha, size = f["sha256"], f["size"]
-            while not self.cache.has(sha, size):
+        sha, size = f["sha256"], f["size"]
+        while not self.cache.has(sha, size):
+            with self._fetch_lock:
+                pending = self._fetching.get(sha)
+                if pending is None:
+                    mine = self._fetching[sha] = threading.Event()
+            if pending is not None:
+                # Another job is fetching this file: wait, then look again (and fetch it
+                # ourselves if that download failed).
+                pending.wait()
+                continue
+            try:
+                if sha not in downloads:
+                    # A job resumed after a restart has no links (signed, short-lived).
+                    raise HubError(f"no download link for {sha[:12]}")
+                with self._download_slots:
+                    self.api.download(downloads[sha], self.cache, sha, size)
+                fetched += size
+            finally:
                 with self._fetch_lock:
-                    pending = self._fetching.get(sha)
-                    if pending is None:
-                        mine = self._fetching[sha] = threading.Event()
-                if pending is not None:
-                    # Another job is fetching this file: wait, then look again (and fetch it
-                    # ourselves if that download failed).
-                    pending.wait()
-                    continue
-                try:
-                    if sha not in downloads:
-                        # A job resumed after a restart has no links (signed, short-lived).
-                        raise HubError(f"no download link for {sha[:12]}")
-                    with self._download_slots:
-                        self.api.download(downloads[sha], self.cache, sha, size)
-                    fetched += size
-                finally:
-                    with self._fetch_lock:
-                        del self._fetching[sha]
-                    mine.set()
+                    del self._fetching[sha]
+                mine.set()
         return fetched
 
     def _hand_back(self, sid: str, task: str, e: HubError) -> None:

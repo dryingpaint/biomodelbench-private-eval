@@ -491,13 +491,16 @@ def test_total_quota_counts_per_submitter(connected):
 
 def test_result_held_on_node_until_release(connected):
     cfg, store, url, agent = connected
-    cfg.tasks["binding"].contract.limits.release_after_s = 4
+    # Release time is moved by hand, not waited for: with release_after_s = 4 and a sleep,
+    # a run slower than 4 s (a loaded machine) was released before the "pending" check.
+    cfg.tasks["binding"].contract.limits.release_after_s = 3600
     w = Worker(cfg)
     sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
-    w.step()                                     # runs it (well under 4s)
+    w.step()                                     # runs it
     w.step()
     assert agent.status(sid)["status"] == "pending"
-    time.sleep(4)
+    with w.store.lock, w.store.db:
+        w.store.db.execute("UPDATE submissions SET release_at = ? WHERE id = ?", (time.time() - 1, sid))
     w.step()
     assert agent.status(sid)["status"] == "done"
 
@@ -1623,13 +1626,18 @@ def test_parallel_node_runs_jobs_side_by_side_within_capacity(connected):
     w = Worker(cfg)
     lim = cfg.tasks["binding"].contract.limits
     w.capacity = (lim.cpus * 2, 1 << 50, 0)                 # room for exactly two at once
-    running, peak, lock = [0], [0], threading.Lock()
+    running, peak, lock, two = [0], [0], threading.Lock(), threading.Event()
 
     def evaluate(task, bundle, run_id, submitter, bundle_id=None, split="validation"):
         with lock:
             running[0] += 1
             peak[0] = max(peak[0], running[0])
-        time.sleep(0.3)
+            if running[0] == 2:
+                two.set()
+        # Each job holds its slot until a second one runs beside it (a serial node never
+        # gets there and fails below), rather than for a fixed 0.3 s, which a loaded
+        # machine could spend just taking the second job from the hub.
+        two.wait(timeout=10)
         with lock:
             running[0] -= 1
         return {"run_id": run_id, "status": "ok", "metrics": {"spearman": 0.9}}
@@ -1855,41 +1863,60 @@ def test_next_bare_code_works_after_a_connect_stops_at_bad_data(hub, node_dir, p
         assert "connect code" not in str(e)
 
 
+class _Overlap:
+    """Counts how many calls are in flight at once. The tests below assert on that rather
+    than on elapsed time (they once said "under 1 s"), which a busy machine can miss
+    however concurrent the code is."""
+
+    def __init__(self):
+        self.lock, self.now, self.peak = threading.Lock(), 0, 0
+
+    def __enter__(self):
+        with self.lock:
+            self.now += 1
+            self.peak = max(self.peak, self.now)
+        time.sleep(0.01)
+
+    def __exit__(self, *exc):
+        with self.lock:
+            self.now -= 1
+
+
 def test_sign_all_gives_one_url_per_distinct_file():
     from bmb_eval.hub import sign_all
+    calls = _Overlap()
 
     class Blobs:
         def signed(self, agent, sha):
             return None                                # nothing signed ahead: sign each here
         def download(self, agent, sha, size):
-            time.sleep(0.01)
-            return f"https://x/{agent}/{sha}/{size}"
+            with calls:
+                return f"https://x/{agent}/{sha}/{size}"
 
     files = [{"sha256": f"{i:064x}", "size": i} for i in range(200)] + [{"sha256": f"{0:064x}", "size": 0}]
-    t = time.time()
     urls = sign_all(Blobs(), "a", files)
     assert len(urls) == 200 and urls[f"{5:064x}"] == f"https://x/a/{5:064x}/5"
-    assert time.time() - t < 1.0                      # concurrent, not 2 s one by one
+    assert calls.peak > 1                              # concurrent, not one by one
 
 
 def test_upload_plan_and_missing_check_run_concurrently():
     from bmb_eval.hub import missing_blobs, plan_uploads
+    has, upload = _Overlap(), _Overlap()
 
     class Blobs:
         def has(self, agent, sha, size):
-            time.sleep(0.01)
-            return int(sha, 16) % 2 == 0
+            with has:
+                return int(sha, 16) % 2 == 0
         def upload(self, agent, sha, size):
-            time.sleep(0.01)
-            return {"url": f"https://x/{sha}", "method": "PUT"}
+            with upload:
+                return {"url": f"https://x/{sha}", "method": "PUT"}
 
     files = [{"sha256": f"{i:064x}", "size": i} for i in range(200)] + [{"sha256": f"{1:064x}", "size": 1}]
-    t = time.time()
     ups = plan_uploads(Blobs(), "a", files)
     miss = missing_blobs(Blobs(), "a", files)
     assert len(ups) == 100 and all(int(u["sha256"], 16) % 2 for u in ups)
     assert miss == sorted(f"{i:064x}" for i in range(200) if i % 2)
-    assert time.time() - t < 1.5                         # concurrent: ~6 s one by one
+    assert has.peak > 1 and upload.peak > 1              # concurrent, not one by one
 
 
 # ------------------------------------------- failed and stalled setups reach BioModelBench
@@ -1923,9 +1950,8 @@ def test_failed_connect_reports_step_and_reason_and_alerts(hub, node_dir, provid
         cli.main(["--config", str(node_dir / "config.yaml"), "connect", code, "--hub", url,
                   "--data", str(data), "--yes", "--no-service"])
     assert _reports(store)[-1] == ("review", "crashed", "RuntimeError")
-    for _ in range(50):
-        if len(alerts) == 3:
-            break
+    deadline = time.monotonic() + 10       # alerts go out on their own threads
+    while len(alerts) < 3 and time.monotonic() < deadline:
         time.sleep(0.05)
     assert len(alerts) == 3 and "at checking their data: data_problem" in alerts[0]
     assert not any("secret" in a for a in alerts)

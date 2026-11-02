@@ -143,14 +143,12 @@ def test_model_sees_only_inputs(node, task):
 
 
 @pytest.mark.parametrize("task", sorted(RAW))
-def test_agent_dryrun_on_synthetic_data(task, capsys):
+def test_agent_dryrun_on_synthetic_data(task, capsys, tmp_path):
     pub = Contract.load(EX / task / "contract.yaml").public()
-    path = Path(f"/tmp/bmb_pub_{task}.json")
+    # Not a fixed /tmp name: two test runs at once on one machine would delete each other's.
+    path = tmp_path / f"bmb_pub_{task}.json"
     path.write_text(json.dumps(pub))
-    try:
-        cli.main(["dryrun", str(path), str(EX / task / "bundle"), "-n", "20"])
-    finally:
-        path.unlink()
+    cli.main(["dryrun", str(path), str(EX / task / "bundle"), "-n", "20"])
     assert "pass the contract" in capsys.readouterr().out
 
 

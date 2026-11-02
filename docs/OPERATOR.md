@@ -127,8 +127,26 @@ deploy/gcp/hub alerts --webhook https://hooks.slack.com/… # where setup alerts
    - `per` on a metric reports it per group.
    - `limits` sets time, memory, GPUs (`gpus`, `gpu_memory_gb`), bundle size
      and evaluation caps.
-3. **Check it with fake data:** save the public contract (`Contract.load(...).public()`
-   as JSON), then run `bmb-eval dryrun contract.json <template>/bundle`.
+3. **Check the task folder:** `bmb-eval check-task <task folder>`. It loads the
+   contract (a parse error, or `version: "2.0"` where an integer belongs, is
+   named), then runs `score.py` the way the score stage does on fake answers and
+   predictions that satisfy the contract: random predictions, constant
+   predictions, answers that are all one value (one class), all rows of one
+   group gone (for each input with `allowed` values), and only 3 rows. Each
+   output goes through the node's output gate for validation and final
+   evaluations, and it lists every metric name emitted but not declared (e.g.
+   `mae[source_a|caco2_wang]` against `per:` naming `caco2_wang`), declared but
+   not emitted, None where the metric isn't `nullable`, or out of bounds. Then the
+   leakage budget. It exits non-zero on any problem; a scorer that fails this
+   would fail the provider's first evaluation as `output_contract_violation`.
+   Synthetic rows combine input values at random; for a scorer that accepts only
+   real combinations (e.g. endpoints that belong to one source), pass a few
+   real-shaped rows with `--data <table or folder>` (inputs and answers columns,
+   as the provider would give them). Scorers run with this environment's Python,
+   so a package only the sandbox has (e.g. scikit-learn) has to be installed here.
+   Then check a model against it: save the public contract
+   (`Contract.load(...).public()` as JSON) and run
+   `bmb-eval dryrun contract.json <template>/bundle`.
 4. **Enroll:** `deploy/gcp/hub enroll <task folder>` prints the email. Send it.
    The whole folder is shipped, subfolders and binary files included (e.g. a
    reference `.npy` the scorer loads), up to 16 MB. The example `bundle/`,
@@ -144,8 +162,10 @@ deploy/gcp/hub alerts --webhook https://hooks.slack.com/… # where setup alerts
    once the upload is in); a service that can't start or can't get out is reported
    as `start_service: ...` on the spot. A code that was used but whose setup still
    hasn't finished an hour later shows as STALLED and alerts once, with what to
-   ask the provider for (`~/bmb-eval/bmb-eval status`, `journalctl --user -u
-   bmb-eval -n 30`). The hub's journal records each activation and each node's
+   ask the provider for (`~/bmb-eval/bmb-eval status`, `~/bmb-eval/bmb-eval logs`,
+   `journalctl --user -u bmb-eval -n 30`). `status` ends with the node's last few
+   events; `logs` prints its audit log readably (`-f` to follow, `--event run`
+   for one kind). The hub's journal records each activation and each node's
    first check-in. Either way, the fix is usually to ask the provider for the
    message they saw and have them run the same command again.
 

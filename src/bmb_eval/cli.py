@@ -926,6 +926,11 @@ def cmd_check(args) -> None:
         errors.append(stale)
     elif not cfg.runtime:
         warnings.append("gVisor not configured (optional hardening; see docs/PROVIDER_SETUP.md)")
+    disk_gb = shutil.disk_usage(next(p for p in (cfg.blob_dir, *cfg.blob_dir.parents) if p.exists())).total >> 30
+    if cfg.cache_gb > disk_gb:
+        warnings.append(f"cache_gb is {cfg.cache_gb} but the disk holding {cfg.blob_dir} has {disk_gb} GB: "
+                        "the disk fills before the cache evicts anything (leave cache_gb out for "
+                        "half the disk, up to 300)")
     for tid, t in cfg.tasks.items():
         print(f"\n== {tid}")
         errors += [f"{tid}: {p}" for p in data_problems(t)]

@@ -1,7 +1,8 @@
-"""Operator tooling: check-task and the free-disk check."""
+"""Operator tooling: check-task, the disk and cache defaults."""
 from __future__ import annotations
 
 import collections
+import json
 import shutil
 from pathlib import Path
 
@@ -9,7 +10,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from bmb_eval import cli, taskcheck
+from bmb_eval import cli, config as config_mod, taskcheck
+from bmb_eval.config import Config
 
 EX = Path(__file__).resolve().parents[1] / "examples" / "tasks"
 PROPERTY = EX / "property_prediction"
@@ -102,7 +104,7 @@ def test_quoted_whole_number_versions_still_load(tmp_path):
         Contract.load(d / "contract.yaml")
 
 
-# ------------------------------------------------------------------ disk
+# ------------------------------------------------------------------ disk and cache
 
 Usage = collections.namedtuple("Usage", "total used free")
 
@@ -115,3 +117,32 @@ def test_connect_still_refuses_a_nearly_full_disk(tmp_path, monkeypatch):
     assert any("Less than 20 GB of disk is free" in p for p in cli.hardware_problems(Limits(), tmp_path))
     monkeypatch.setattr(cli.shutil, "disk_usage", lambda p: Usage(500 << 30, 400 << 30, 100 << 30))
     assert cli.hardware_problems(Limits(), tmp_path) == []
+
+
+def _node_config(tmp_path, **extra) -> Path:
+    p = tmp_path / "config.yaml"
+    p.write_text(json.dumps({"node_name": "t", "tasks": {},
+                             "sandbox": {"backend": "local", "i_understand_local_backend_is_not_isolated": True},
+                             **extra}))
+    return p
+
+
+def test_cache_defaults_to_half_a_small_disk_and_keeps_explicit_settings(tmp_path, monkeypatch):
+    seen = []
+
+    def disk(p):
+        seen.append(Path(p))
+        return Usage(290 << 30, 0, 290 << 30)
+    monkeypatch.setattr(config_mod.shutil, "disk_usage", disk)
+    assert Config.load(_node_config(tmp_path)).cache_gb == 145          # not 300 on a 290 GB disk
+    assert seen[-1] == tmp_path                                         # state/blobs doesn't exist yet
+    monkeypatch.setattr(config_mod.shutil, "disk_usage", lambda p: Usage(2000 << 30, 0, 2000 << 30))
+    assert Config.load(_node_config(tmp_path)).cache_gb == 300
+    assert Config.load(_node_config(tmp_path, cache_gb=500)).cache_gb == 500
+
+
+def test_check_warns_about_a_cache_bigger_than_its_disk(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli.shutil, "disk_usage", lambda p: Usage(290 << 30, 0, 290 << 30))
+    with pytest.raises(SystemExit):                     # the local backend is an error
+        cli.main(["--config", str(_node_config(tmp_path, cache_gb=300)), "check"])
+    assert "WARN  cache_gb is 300 but the disk holding" in capsys.readouterr().out

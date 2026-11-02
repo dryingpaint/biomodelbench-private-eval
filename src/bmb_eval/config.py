@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -10,6 +11,16 @@ import yaml
 from .contract import Contract
 
 PKG = Path(__file__).resolve().parent  # the bmb_eval package directory
+CACHE_GB = 300     # model-file cache when config.yaml doesn't say, on a disk of 600 GB or more
+
+
+def default_cache_gb(blob_dir: Path) -> int:
+    """CACHE_GB, or half the disk holding the cache if that is less. A flat 300 GB on a
+    290 GB disk never evicted anything: the disk filled first."""
+    p = blob_dir
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return max(1, min(CACHE_GB, (shutil.disk_usage(p).total >> 30) // 2))
 
 
 @dataclass
@@ -94,10 +105,12 @@ class Config:
 
         sb = raw.get("sandbox", {})
         al = raw.get("alerts", {})
+        state_dir = rel(raw.get("state_dir", "state"))
+        blob_dir = rel(raw["blob_dir"]) if raw.get("blob_dir") else state_dir / "blobs"
         cfg = cls(
             path=path,
             node_name=raw.get("node_name", "bmb-eval-node"),
-            state_dir=rel(raw.get("state_dir", "state")),
+            state_dir=state_dir,
             backend=sb.get("backend", "docker"),
             image=sb.get("image", "bmb-eval-sandbox:latest"),
             runtime=sb.get("runtime"),
@@ -105,16 +118,15 @@ class Config:
             webhook_url=al.get("webhook_url"),
             infra_failure_threshold=int(al.get("infra_failure_threshold", 3)),
             retain_bundles=bool(raw.get("retain_bundles", False)),
-            cache_gb=int(raw.get("cache_gb", 300)),
+            cache_gb=int(raw["cache_gb"]) if raw.get("cache_gb") is not None else default_cache_gb(blob_dir),
             max_parallel=max(1, int(raw.get("max_parallel", 1))),
             hub=dict(raw.get("hub") or {}),
-            blob_dir=rel(raw["blob_dir"]) if raw.get("blob_dir") else None,
+            blob_dir=blob_dir,
             service_name=str(raw.get("service_name") or "bmb-eval"),
             raw=raw,
         )
         if not cfg.service_name.replace("-", "").replace("_", "").isalnum():
             raise SystemExit("service_name may hold only letters, digits, - and _")
-        cfg.blob_dir = cfg.blob_dir or cfg.state_dir / "blobs"
         for tid, t in (raw.get("tasks") or {}).items():
             d = rel(t["dir"])
             contract = Contract.load(d / "contract.yaml")

@@ -151,6 +151,13 @@ class Store:
         with self.lock, self.db:
             self.db.execute("DELETE FROM submissions WHERE id=?", (sid,))
 
+    def requeue(self, sid: str) -> bool:
+        """A running job goes back to this node's queue, to run again from the start (a
+        batch that didn't predict it). True if it was running."""
+        with self.lock, self.db:
+            return self.db.execute("UPDATE submissions SET status='queued' WHERE id=? AND status='running'",
+                                   (sid,)).rowcount > 0
+
     def requeue_running(self) -> int:
         """On restart, runs interrupted mid-flight go back to the queue."""
         with self.lock, self.db:

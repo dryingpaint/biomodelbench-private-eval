@@ -76,6 +76,10 @@ def fingerprint(cfg: Config) -> dict:
         from .modal_sync import local_manifest_hash
         sb["modal"] = {"environment": cfg.modal.environment, "app": cfg.modal.app,
                        "manifest": local_manifest_hash(cfg)}
+    if cfg.batch_families:
+        # A batched model sees several tasks' inputs at once: turning it on is approved like
+        # any other change to what a model sees. Absent when off, so existing locks still match.
+        sb["batch_families"] = True
     return {
         "node_code": _dir_hash(PKG, "*.py"),
         "sandbox": sb,

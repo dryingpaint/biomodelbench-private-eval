@@ -24,7 +24,9 @@ while the node loop (queue, quotas, audit log, approval lock) stays on the node'
 Mount.host paths map to (volume, path) through state/modal/mounts.json, which
 `bmb-eval modal-sync` writes (modal_sync.py). Each stage's mounts are checked
 against an allowlist before anything starts: predict never gets answers, the
-task folder, or the other half of the data.
+task folder, or the other half of the data. A batched predict (batch_families)
+gets several of this node's tasks' inputs of one half, task i's at
+/data/inputs/<i>; any other stage gets one task's.
 
 A Modal failure (an API error, the sandbox gone without its launcher's report)
 is retried here, and after that raised as SandboxLost: the node then hands the
@@ -211,7 +213,7 @@ class Plan:
     env: dict = field(default_factory=dict)        # BMB_* -> path in the sandbox (no root prefix)
     contract: Path | None = None
     bundle: Path | None = None
-    mirror: bool = False
+    mirror: list = field(default_factory=list)     # inputs folders the launcher assembles
     kinds: set = field(default_factory=set)
     task: str | None = None
 
@@ -314,12 +316,13 @@ class ModalSandbox:
                 pass
         return n
 
-    def plan(self, entry: str, mounts: list[Mount]) -> Plan:
+    def plan(self, entry: str, mounts: list[Mount], batched: bool = False) -> Plan:
         """Where each mount comes from, checked against the stage's allowlist."""
         p = Plan(entry)
         entries = load_mounts(self.cfg)
         bundle_roots = [self.cfg.blob_dir.parent / "bundles", self.cfg.state_dir / "runs"]
         tasks = set()
+        indexed = set()                          # batched inputs: task index -> task
         for mt in mounts:
             host = mt.host.resolve()
             if mt.env == "BMB_CONTRACT_FILE":
@@ -338,31 +341,50 @@ class ModalSandbox:
             e, rel = hit
             p.kinds.add(e["kind"])
             tasks.add(e["task"])
-            base = MOUNT_AT[e["kind"]]
-            p.volumes[base] = e["volume"]
+            # A batched predict's inputs are numbered (BMB_INPUTS_DIR_<i>), each task's folder its own.
+            idx = re.fullmatch(r"BMB_INPUTS(?:_DIR)?_(\d+)", mt.env)
+            if bool(idx) != (batched and e["kind"] in INPUT_KINDS):
+                raise PermissionError(f"{entry}: {mt.env} on a {'batched' if batched else 'single'} stage")
+            at = f"{INPUTS}/{int(idx.group(1))}" if idx else INPUTS
+            if idx:
+                indexed.add((int(idx.group(1)), e["task"]))
+            base = at + "/.vol" if e["kind"] in INPUT_KINDS else MOUNT_AT[e["kind"]]
+            if p.volumes.setdefault(base, e["volume"]) != e["volume"]:
+                raise PermissionError(f"{entry}: two volumes at {base}")
             path = _join(e.get("path", ""), rel)
             if e["kind"] in INPUT_KINDS and entry == "predict" and e.get("links"):
                 for sha in sorted(set(e["links"].values())):
                     p.volumes[f"{SHARED_AT}/{sha[:16]}"] = vol_name(self.s.volume_prefix, "sh", sha[:16])
                 if not path:                         # the inputs folder itself: mirrored
-                    p.mirror = True
-                    p.env[mt.env] = INPUTS
+                    p.mirror.append(at)
+                    p.env[mt.env] = at
                     continue
             p.env[mt.env] = "/" + _join(base, path)
         extra = p.kinds - ALLOWED.get(entry, set())
         if extra:
             raise PermissionError(f"{entry} may not mount {sorted(extra)}")
-        if len(p.kinds & INPUT_KINDS) > 1 or len(tasks) > 1:
+        halves = p.kinds & INPUT_KINDS
+        if batched:
+            # Only on a node that opted in, only its own tasks, one task per index, and one
+            # half: the validation inputs of a task without a split are "inputs".
+            if entry != "predict" or not self.cfg.batch_families:
+                raise PermissionError(f"{entry}: batched, on a node that doesn't batch families")
+            if not tasks <= set(self.cfg.tasks) or len(indexed) != len(tasks) or len(
+                    {i for i, _ in indexed}) != len(tasks):
+                raise PermissionError(f"{entry}: a batch mounts each of this node's tasks once")
+            if "inputs_test" in halves and len(halves) > 1:
+                raise PermissionError(f"{entry}: a batch mounts one half of the data")
+        elif len(halves) > 1 or len(tasks) > 1:
             raise PermissionError(f"{entry} mounts more than one task's or half's data")
         if entry == "predict" and "bundle" not in p.kinds:
             raise PermissionError("predict has no bundle")
-        p.task = next(iter(tasks), None)
+        p.task = next(iter(tasks), None) if len(tasks) == 1 else None
         return p
 
     def run(self, *, name: str, entry: str, mounts: list[Mount], env: dict[str, str],
             limits: Limits, timeout_s: int, stdout_cap: int, stdin: bytes = b"",
             gpus: int = 0) -> Result:
-        plan = self.plan(entry, mounts)          # PermissionError: never retried
+        plan = self.plan(entry, mounts, batched="BMB_BATCH" in env)   # PermissionError: never retried
         if gpus > self.s.max_gpus_per_job:
             raise PermissionError(f"{gpus} GPUs is more than one Modal container has")
         self.request(entry, limits, gpus)        # SandboxRefused before anything starts
@@ -455,8 +477,8 @@ class ModalSandbox:
                         "TRANSFORMERS_OFFLINE": "1",
                         **{v: threads for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")},
                         **{k: root + v for k, v in plan.env.items()}, **env},
-                "mirror": ({"src": root + MOUNT_AT["inputs"], "dst": root + INPUTS, "shared": root + SHARED_AT}
-                           if plan.mirror else None),
+                "mirror": [{"src": root + at + "/.vol", "dst": root + at, "shared": root + SHARED_AT}
+                           for at in plan.mirror],
             }
             fs.write_bytes(json.dumps(spec).encode(), root + RUN + "/spec.json")
             watchdog.start()

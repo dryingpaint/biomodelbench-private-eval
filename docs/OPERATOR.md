@@ -377,6 +377,27 @@ too much output) are never retried. `bmb-eval stop` terminates every sandbox
 tagged with this node; a restarted node also cleans up orphaned sandboxes and
 job volumes.
 
+**Family batching** (our public-data nodes only, never a provider's). A family
+submission is one job per dataset, and each job loads the model in its own predict
+sandbox: a 26-dataset genomic family took 26 H100 containers. With
+
+```yaml
+batch_families: true          # default false; `./bmb-eval approve` after turning it on
+batch_max_tasks: 32           # jobs per batch
+batch_max_predict_s: 21600    # the batch's predict limit: its tasks' limits summed, at most this
+```
+
+the node takes a job's siblings (the hub counts them: same bundle, split and agent on
+this node's tasks) together with it, and runs one predict sandbox for all of them: the
+model loads once and predicts each dataset in turn, each with its own time limit.
+Validate and score still run per dataset, and each job keeps its own quota, result,
+release time and audit record (`internal.json` notes `batched`). GPU and CPU tasks
+are never batched together. A failing dataset gets its own error and the rest go on;
+if the whole batch dies (out of memory, past `batch_max_predict_s`, a Modal failure),
+datasets it had finished keep their predictions and the others run alone, each
+counted once (`job_unbatched` in the audit log). A model in a batch sees every
+batched dataset's inputs at once (docs/THREAT_MODEL.md), hence public data only.
+
 **Timings** (measured 2026-10-29, controller on a laptop). The image builds in
 about 2.5 minutes. A stage's sandbox is ready in about 3 s on CPU and 6 s with
 an H100; the example task's whole evaluation (1×H100 predict, staging included)

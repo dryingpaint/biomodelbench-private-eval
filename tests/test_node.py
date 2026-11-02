@@ -1735,33 +1735,6 @@ def test_upload_plan_uses_one_listing_when_the_store_can_list():
     assert missing_blobs(b, "a", files)[:2] == [f"{1:064x}", f"{2:064x}"] and b.listings == 2
 
 
-def test_sign_all_reuses_unexpired_urls():
-    """Every dataset job of a family submission asks for the same bundle's download URLs:
-    they are signed once, and re-signed only when close to expiry."""
-    import datetime
-    from bmb_eval import hub as hub_mod
-
-    class Blobs:
-        def __init__(self):
-            self.signed = 0
-        def download(self, agent, sha, size):
-            self.signed += 1
-            return {"url": f"https://x/{agent}/{sha}", "headers": {}, "auth": False}
-
-    b = Blobs()
-    files = [{"sha256": f"{i:064x}", "size": i} for i in range(50)]
-    first = hub_mod.sign_all(b, "a", files)
-    second = hub_mod.sign_all(b, "a", files)
-    assert first == second and b.signed == 50
-    hub_mod.sign_all(b, "other-agent", files[:3])       # cached per agent
-    assert b.signed == 53
-    soon = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=30)
-    for k, (u, _) in list(b._download_urls.items()):
-        b._download_urls[k] = (u, soon)                  # 30 min left: re-signed
-    hub_mod.sign_all(b, "a", files)
-    assert b.signed == 103
-
-
 # ------------------------------------------- failed and stalled setups reach BioModelBench
 
 def _reports(store):

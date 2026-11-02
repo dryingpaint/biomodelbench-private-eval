@@ -52,6 +52,17 @@ MODAL_CHECK_ALERT_AFTER = 3   # failed checks in a row before alerting
 MAX_DOWNLOADS = 32
 
 
+BATCH_MARKER = "BMB_BATCHABLE"   # a bundle file: the model may predict several tasks in one process
+
+
+def _batchable(job: dict) -> bool:
+    """Whether a job's bundle opted in to family batching. A batched model is imported and
+    loaded once for several tasks; one that reads its contract or inputs only at import would
+    predict every task as the first, so batching is the model's choice, not ours."""
+    files = (job.get("manifest") or {}).get("files") or []
+    return any(f.get("path") == BATCH_MARKER for f in files if isinstance(f, dict))
+
+
 class HubError(Exception):
     """A hub call failed: `status` is the HTTP status the hub answered with, or None
     when it couldn't be reached."""
@@ -467,7 +478,7 @@ class Worker:
         committed, and siblings claimed meanwhile by another node or loop are simply not here."""
         t = self.cfg.tasks.get(job.get("task"))
         want = min(int(job.get("siblings") or 0), self.cfg.batch_max_tasks - 1)
-        if not (self.cfg.batch_families and t and want > 0 and job.get("bundle_id")):
+        if not (self.cfg.batch_families and t and want > 0 and job.get("bundle_id") and _batchable(job)):
             return []
         split = job.get("split", "validation")
 

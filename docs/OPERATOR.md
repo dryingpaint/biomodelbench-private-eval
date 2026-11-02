@@ -52,7 +52,9 @@ Providers get updates by re-running the install command without arguments;
 their node pauses until they approve the new version.
 
 **Backups:** `/home/bmb/hub_state/hub.db` on the VM (tokens, codes, queue,
-results). Snapshot the VM's disk on a schedule.
+results), with its write-ahead log `hub.db-wal` beside it: copy both, or use
+`sqlite3 hub.db ".backup copy.db"`. Snapshot the VM's disk on a schedule.
+Uploads never committed are deleted after 24 hours.
 
 ## Releases: one tag for the three downloads
 

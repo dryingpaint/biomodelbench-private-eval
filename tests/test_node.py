@@ -985,7 +985,7 @@ def test_existing_databases_gain_split_column(tmp_path):
                 "created REAL NOT NULL, status TEXT NOT NULL, node_id TEXT, result TEXT, manifest TEXT NOT NULL)")
     hdb.commit()
     hdb.close()
-    assert "split" in {r[1] for r in hub_mod.HubStore(h).db.execute("PRAGMA table_info(submissions)")}
+    assert "split" in {r[1] for r in hub_mod.HubStore(h).q("PRAGMA table_info(submissions)")}
 
 
 def test_existing_databases_gain_kind_columns(tmp_path):
@@ -1680,6 +1680,8 @@ def test_sign_all_gives_one_url_per_distinct_file():
     from bmb_eval.hub import sign_all
 
     class Blobs:
+        def signed(self, agent, sha):
+            return None                                # nothing signed ahead: sign each here
         def download(self, agent, sha, size):
             time.sleep(0.01)
             return f"https://x/{agent}/{sha}/{size}"

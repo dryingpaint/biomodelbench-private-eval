@@ -186,8 +186,8 @@ def test_launcher_starts_only_offline_sealed_nodes_with_work(hub, provider_files
     store.q("UPDATE nodes SET confidential=? WHERE id=?", (json.dumps(ptr), nid))
     assert L.due(store) == []                                     # no queued work
     task = store.q("SELECT task FROM node_tasks WHERE node_id=?", (nid,), one=True)[0]
-    store.q("INSERT INTO submissions (id, task, agent, created, status, manifest) VALUES "
-            "('s1', ?, 'a', ?, 'queued', '{}')", (task, _t.time()))
+    store.q("INSERT INTO submissions (id, task, agent, created, status, manifest_id) VALUES "
+            "('s1', ?, 'a', ?, 'queued', 'm')", (task, _t.time()))
     store.q("UPDATE nodes SET last_seen=? WHERE id=?", (_t.time(), nid))
     assert L.due(store) == []                                     # node is online
     store.q("UPDATE nodes SET last_seen=? WHERE id=?", (_t.time() - 3600, nid))
@@ -222,8 +222,8 @@ def test_preempted_sealed_node_loses_nothing(hub, provider_files, tmp_path):  # 
     store.q("UPDATE nodes SET confidential=?, last_seen=? WHERE id=?",
             (json.dumps({"BUCKET": "gs://b"}), _t.time() - 3600, nid))
     task = store.q("SELECT task FROM node_tasks WHERE node_id=?", (nid,), one=True)[0]
-    store.q("INSERT INTO submissions (id, task, agent, created, status, node_id, manifest, split) VALUES "
-            "('f1', ?, 'a', ?, 'assigned', ?, '{}', 'test')", (task, _t.time(), nid))
+    store.q("INSERT INTO submissions (id, task, agent, created, status, node_id, manifest_id, split) VALUES "
+            "('f1', ?, 'a', ?, 'assigned', ?, 'm', 'test')", (task, _t.time(), nid))
     assert L.reclaim(store) == 1
     assert store.q("SELECT status, node_id FROM submissions WHERE id='f1'", one=True) == ("queued", None)
     assert [n for n, _ in L.due(store)] == [nid]

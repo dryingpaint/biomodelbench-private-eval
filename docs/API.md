@@ -105,6 +105,8 @@ Queues the submission once every file is present. Response `202`:
 
 If something is missing: `409` `files_missing`, with
 `"missing": ["<sha256>", …]`. Upload those files, then commit again.
+A submission not committed within 24 hours is deleted (`404` `not_found`);
+it never counted against your evaluations. Submit again.
 
 ### `GET /v1/submissions/<id>`
 Polls a submission. You can only see your own submissions.

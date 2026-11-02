@@ -2385,3 +2385,16 @@ def test_a_jobs_files_download_concurrently(tmp_path):
     assert w._fetch(files, downloads) == sum(f["size"] for f in files)
     assert 1 < peak[0] <= 8                       # concurrent, within the node's download slots
     assert all(w.cache.has(f["sha256"], f["size"]) for f in files)
+
+
+def test_second_node_for_a_task_whose_contract_names_a_labels_file(hub, tmp_path):
+    """A perturbation task's contract names a labels file in its package; add-node loads the
+    contract with its package, as a node does."""
+    store, url = hub
+    d = tmp_path / "pert"
+    shutil.copytree(REPO / "examples" / "tasks" / "perturbation", d, ignore=shutil.ignore_patterns("bundle"))
+    assert "split:" not in (d / "contract.yaml").read_text()   # no split: any node scores the same rows
+    store.add_enrollment(d)
+    task = Contract.load(d / "contract.yaml").id
+    code, c = store.add_node_code(task)
+    assert c.id == task and code

@@ -47,8 +47,6 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import yaml
-
 from . import release
 from .blobs import BlobCache, check_manifest, manifest_id
 from .contract import Contract
@@ -288,6 +286,21 @@ def _move_manifests(db: sqlite3.Connection) -> int:
     db.executemany("UPDATE submissions SET manifest_id=? WHERE id=?", moved)
     db.execute("ALTER TABLE submissions DROP COLUMN manifest")
     return len(moved)
+
+
+def _package_contract(files: dict) -> Contract:
+    """The contract of a task package (HubStore.package_files), loaded with its folder so
+    files it names (e.g. a perturbation task's genes.txt labels) resolve."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, body in files.items():
+            path = Path(tmp) / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(body, dict):
+                path.write_bytes(base64.b64decode(body["base64"]))
+            else:
+                path.write_text(body)
+        return Contract.load(Path(tmp) / "contract.yaml")
 
 
 def _widen_node_tasks(db: sqlite3.Connection) -> None:
@@ -624,7 +637,7 @@ class HubStore:
         if not code:
             raise KeyError(f"no task {task!r} on this hub")
         _, files, _, version = self.enrollment(code)
-        c = Contract.from_dict(yaml.safe_load(files["contract.yaml"]))
+        c = _package_contract(files)
         if c.split and not c.split.by_column:
             raise ValueError(f"task {task} splits its rows at random on each node; a second node "
                              "would score different validation rows. Use split.by_column to serve "

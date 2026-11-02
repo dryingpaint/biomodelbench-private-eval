@@ -52,7 +52,9 @@ Providers get updates by re-running the install command without arguments;
 their node pauses until they approve the new version.
 
 **Backups:** `/home/bmb/hub_state/hub.db` on the VM (tokens, codes, queue,
-results). Snapshot the VM's disk on a schedule.
+results), with its write-ahead log `hub.db-wal` beside it: copy both, or use
+`sqlite3 hub.db ".backup copy.db"`. Snapshot the VM's disk on a schedule.
+Uploads never committed are deleted after 24 hours.
 
 ## Releases: one tag for the three downloads
 
@@ -207,6 +209,28 @@ per submitter, so each attempt (agent run) gets its own; size it for one
 attempt's budget plus its final scoring, e.g. 60 for a 40-evaluation budget.
 Independent attempts aren't capped together: what all of them can learn grows
 with the number of attempts, so tell providers how many you plan.
+
+## One task, several nodes
+
+A task's jobs go to whichever of its nodes asks first, so a busy task can be spread
+over several machines (e.g. our public VM and a Modal node):
+
+```bash
+deploy/gcp/hub add-node <task> --public-url https://<hub address>   # a code for one more node
+```
+
+Connect the second machine with that code and the same data, as for the first. Updates
+(`enroll` again) reach every node of the task, each behind its own code.
+
+- **Same rows everywhere.** Only tasks without a split, or with a fixed `split.by_column`,
+  can have a second node: a random split is drawn on each node with its own secret seed,
+  so two nodes would score different validation rows. `add-node` refuses those.
+- **Caps are per node.** Each node enforces `submissions_per_day`, `submissions_total` and
+  the final-evaluation caps on its own, so N nodes allow up to N times as many, and the
+  leakage budget a provider approves grows with them. Use several nodes for our own
+  public data; ask before doing it with a provider's.
+- A job re-queued to another node while the first node's result was in flight can be
+  reported twice; the first report stands.
 
 ## Held-out test set and final evaluations
 

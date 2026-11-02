@@ -27,11 +27,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime
 import gzip
 import hashlib
 import io
 import json
+import queue
 import re
 import secrets
 import sqlite3
@@ -41,6 +43,8 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import yaml
 
 from . import release
 from .blobs import BlobCache, check_manifest, manifest_id
@@ -55,15 +59,17 @@ CREATE TABLE IF NOT EXISTS families (name TEXT PRIMARY KEY, tasks TEXT NOT NULL)
 CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY, secret_sha256 TEXT NOT NULL, name TEXT NOT NULL,
     created REAL NOT NULL, last_seen REAL, accepting INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS node_tasks (
-    task TEXT PRIMARY KEY, node_id TEXT NOT NULL, contract TEXT);
+CREATE TABLE IF NOT EXISTS node_tasks (     -- a task may be served by several nodes
+    task TEXT NOT NULL, node_id TEXT NOT NULL, contract TEXT, PRIMARY KEY (task, node_id));
 CREATE TABLE IF NOT EXISTS enrollments (
     code TEXT PRIMARY KEY, task TEXT NOT NULL, files TEXT NOT NULL,
     created REAL NOT NULL, used_by TEXT);
+CREATE TABLE IF NOT EXISTS manifests (     -- each bundle manifest once, by blobs.manifest_id
+    id TEXT PRIMARY KEY, manifest TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS submissions (
     id TEXT PRIMARY KEY, task TEXT NOT NULL, agent TEXT NOT NULL, created REAL NOT NULL,
     status TEXT NOT NULL,          -- uploading | queued | assigned | done
-    node_id TEXT, result TEXT, manifest TEXT NOT NULL);
+    node_id TEXT, result TEXT, manifest_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS setup_reports (   -- a provider's connect command that failed
     code TEXT NOT NULL, step TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL,
     at REAL NOT NULL);
@@ -90,8 +96,12 @@ MAX_JSON_BYTES = 16 << 20   # manifests of large bundles can be a few MB
 MAX_HELLO_BYTES = 4 << 20   # a node's hello carries every task's public contract (~2-6 KB each)
 MAX_RESULT_BYTES = 64 << 10
 MAX_PACKAGE_BYTES = 16 << 20   # a task folder: contract, scorer, labels, small reference files
+BUSY_S = 30            # how long a statement waits for another connection's write to finish
+MAX_IDLE_CONNECTIONS = 32
+ABANDON_S = 24 * 3600   # an upload not committed within this is dropped (HubStore.drop_abandoned)
 URL_TTL = datetime.timedelta(hours=24)
 URL_REUSE_MIN = datetime.timedelta(hours=12)   # a reused download link has at least this left
+RENEW_S = 4 * 3600      # how often Presigner checks a queued job's links
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O/1/I
 AGENT_KINDS = ("agent", "baseline")
 
@@ -121,8 +131,11 @@ class DiskBlobs:
         return {"url": f"{self.public_url}/v1/blobs/{sha}?size={size}", "method": "PUT",
                 "headers": {}, "auth": True}
 
-    def download(self, agent: str, sha: str, size: int) -> dict:
+    def download(self, agent: str, sha: str, size: int, ahead: float = 0) -> dict:
         return {"url": f"{self.public_url}/v1/blobs/{sha}", "headers": {}, "auth": True}
+
+    def signed(self, agent: str, sha: str) -> dict:
+        return self.download(agent, sha, 0)     # nothing to sign: always ready
 
 
 class GCSBlobs:
@@ -189,15 +202,16 @@ class GCSBlobs:
         return {"url": self._sign(agent, sha, "PUT", content_type=ct), "method": "PUT",
                 "headers": {"Content-Type": ct}, "auth": False}
 
-    def download(self, agent: str, sha: str, size: int) -> dict:
-        """A signed GET link, reused while at least URL_REUSE_MIN of it remains. A family's
-        datasets share one bundle, and a job whose hand-out times out is offered again a
-        minute later: without reuse each re-signed every file (on 2026-10-30, 3,063 files
-        per poll, never finishing inside the node's 60 s read timeout)."""
+    def download(self, agent: str, sha: str, size: int, ahead: float = 0) -> dict:
+        """A signed GET link, reused while at least URL_REUSE_MIN of it remains (`ahead`
+        seconds from now: see Presigner). A family's datasets share one bundle, and a job
+        whose hand-out times out is offered again a minute later: without reuse each re-signed
+        every file (on 2026-10-30, 3,063 files per poll, never finishing inside the node's
+        60 s read timeout)."""
         now = time.time()
         with self._signed_lock:
             hit = self._signed.get((agent, sha))
-        if hit and hit[0] > now:
+        if hit and hit[0] > now + ahead:
             return {"url": hit[1], "headers": {}, "auth": False}
         url = self._sign(agent, sha, "GET")
         until = now + (URL_TTL - URL_REUSE_MIN).total_seconds()
@@ -206,6 +220,12 @@ class GCSBlobs:
                 self._signed = {k: v for k, v in self._signed.items() if v[0] > now}
             self._signed[(agent, sha)] = (until, url)
         return {"url": url, "headers": {}, "auth": False}
+
+    def signed(self, agent: str, sha: str) -> dict | None:
+        """The download link already signed, if at least URL_REUSE_MIN of it remains."""
+        with self._signed_lock:
+            hit = self._signed.get((agent, sha))
+        return {"url": hit[1], "headers": {}, "auth": False} if hit and hit[0] > time.time() else None
 
 
 # -------------------------------------------------------------------- state
@@ -234,40 +254,139 @@ def _summary(sid: str, rows) -> dict:
     return out
 
 
+def _columns(db: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+
+
+def _prune_manifests(db: sqlite3.Connection) -> None:
+    """Delete manifests no submission refers to any more."""
+    db.execute("DELETE FROM manifests WHERE NOT EXISTS "
+               "(SELECT 1 FROM submissions s WHERE s.manifest_id = manifests.id)")
+
+
+def _move_manifests(db: sqlite3.Connection) -> int:
+    """Move manifests out of submission rows (an older hub.db) into the manifests table, each
+    stored once. Every row carried a full copy, a family submission one per dataset: 5,708 rows
+    and 425 MB on 2026-10-30, read on every hand-out. Runs inside the caller's transaction;
+    returns how many rows moved."""
+    ids, moved = {}, []    # a family's rows hold identical text: parse each distinct text once
+    for rid, text in db.execute("SELECT id, manifest FROM submissions"):
+        key = hashlib.sha256(text.encode()).digest()
+        if key not in ids:
+            ids[key] = manifest_id(json.loads(text))
+            db.execute("INSERT OR IGNORE INTO manifests VALUES (?,?)", (ids[key], text))
+        moved.append((ids[key], rid))
+    db.executemany("UPDATE submissions SET manifest_id=? WHERE id=?", moved)
+    db.execute("ALTER TABLE submissions DROP COLUMN manifest")
+    return len(moved)
+
+
+def _widen_node_tasks(db: sqlite3.Connection) -> None:
+    """An older hub.db keys node_tasks by task alone (one node per task). Rebuild it keyed by
+    (task, node), so a busy task can be served by several nodes at once. Runs inside the
+    caller's transaction; does nothing on a current database."""
+    pk = {r[1]: r[5] for r in db.execute("PRAGMA table_info(node_tasks)")}
+    if pk.get("node_id"):
+        return
+    db.execute("ALTER TABLE node_tasks RENAME TO node_tasks_old")
+    db.execute("CREATE TABLE node_tasks (task TEXT NOT NULL, node_id TEXT NOT NULL, contract TEXT, "
+               "PRIMARY KEY (task, node_id))")
+    db.execute("INSERT INTO node_tasks SELECT task, node_id, contract FROM node_tasks_old")
+    db.execute("DROP TABLE node_tasks_old")
+
+
 class HubStore:
+    """hub.db, shared by the HTTP server's request threads (one per request) and its background
+    loops. Each call borrows a pooled connection, and WAL lets reads run alongside a write. On
+    2026-10-30 one connection behind one lock served everything, so a slow query (a job
+    hand-out reading every manifest) stalled every agent's and node's request behind it."""
+
     def __init__(self, state: Path):
         self.state = state
         state.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(state / "hub.db", check_same_thread=False)
-        self.db.executescript(SCHEMA)
-        # Columns added after the first release; older hub.db files gain them here.
-        for table, col, decl in [("enrollments", "version", "INTEGER NOT NULL DEFAULT 1"),
-                                 ("enrollments", "activated", "REAL"),
-                                 ("submissions", "split", "TEXT NOT NULL DEFAULT 'validation'"),
-                                 ("submissions", "group_id", "TEXT"),
-                                 ("agents", "eval_budget", "INTEGER"),
-                                 ("nodes", "confidential", "TEXT"),
-                                 ("nodes", "status", "TEXT"),
-                                 # "baseline": BioModelBench's reference models, whose finals
-                                 # count against the contract's baseline_final_evaluations.
-                                 ("agents", "kind", "TEXT NOT NULL DEFAULT 'agent'"),
-                                 ("submissions", "kind", "TEXT NOT NULL DEFAULT 'agent'")]:
-            if col not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
-                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
-        # Each submission row carries its bundle's manifest (up to a few MB), and the columns
-        # added above sit after it: without indexes, every status poll and job hand-out read
-        # every manifest (5,708 rows, 425 MB on 2026-10-30) under the store's one lock.
-        for name, cols in [("group", "group_id, split"), ("agent", "agent, split"),
-                           ("queue", "status, created"), ("node", "node_id, status"),
-                           ("task", "task, status")]:
-            self.db.execute(f"CREATE INDEX IF NOT EXISTS submissions_{name} ON submissions ({cols})")
-        self.db.commit()
-        self.lock = threading.Lock()
+        self._idle: queue.SimpleQueue[sqlite3.Connection] = queue.SimpleQueue()
+        with self._conn() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.executescript(SCHEMA)
+            if "manifest" in _columns(db, "submissions"):
+                # Before moving manifests out: the move rewrites the biggest table in place.
+                bak = sqlite3.connect(state / f"hub.db.bak-{time.strftime('%Y%m%d-%H%M%S')}-manifests")
+                db.backup(bak)
+                bak.close()
+        moved = 0
+        # One transaction, so a `bmb-hub` command started alongside a starting hub waits and
+        # then finds the work done, and a failure leaves the database as it was.
+        with self.tx() as db:
+            # Columns added after the first release; older hub.db files gain them here.
+            for table, col, decl in [("enrollments", "version", "INTEGER NOT NULL DEFAULT 1"),
+                                     ("enrollments", "activated", "REAL"),
+                                     ("submissions", "split", "TEXT NOT NULL DEFAULT 'validation'"),
+                                     ("submissions", "group_id", "TEXT"),
+                                     ("agents", "eval_budget", "INTEGER"),
+                                     ("nodes", "confidential", "TEXT"),
+                                     ("nodes", "status", "TEXT"),
+                                     # "baseline": BioModelBench's reference models, whose finals
+                                     # count against the contract's baseline_final_evaluations.
+                                     ("agents", "kind", "TEXT NOT NULL DEFAULT 'agent'"),
+                                     ("submissions", "kind", "TEXT NOT NULL DEFAULT 'agent'"),
+                                     ("submissions", "manifest_id", "TEXT"),
+                                     # 1: a code that adds another node to a task (add_node_code)
+                                     ("enrollments", "extra", "INTEGER NOT NULL DEFAULT 0")]:
+                if col not in _columns(db, table):
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            if "manifest" in _columns(db, "submissions"):
+                moved = _move_manifests(db)
+            _widen_node_tasks(db)
+            # Without indexes every status poll and job hand-out scanned the whole table (5,708
+            # rows, 425 MB with the manifests still in it, on 2026-10-30).
+            for name, cols in [("group", "group_id, split"), ("agent", "agent, split"),
+                               ("queue", "status, created"), ("node", "node_id, status"),
+                               ("task", "task, status"), ("manifest", "manifest_id")]:
+                db.execute(f"CREATE INDEX IF NOT EXISTS submissions_{name} ON submissions ({cols})")
+        if moved:
+            with self._conn() as db:
+                db.execute("VACUUM")     # give back the space the copies took
+            print(f"[bmb-hub] moved the manifests of {moved} submissions into their own table",
+                  flush=True)
+
+    @contextlib.contextmanager
+    def _conn(self):
+        try:
+            db = self._idle.get_nowait()
+        except queue.Empty:
+            # Autocommit: each q() is its own transaction; tx() opens longer ones explicitly.
+            db = sqlite3.connect(self.state / "hub.db", isolation_level=None,
+                                 check_same_thread=False, timeout=BUSY_S)
+        try:
+            yield db
+        finally:
+            if db.in_transaction:          # a failed COMMIT: don't lend out a held write lock
+                db.execute("ROLLBACK")
+            if self._idle.qsize() < MAX_IDLE_CONNECTIONS:
+                self._idle.put(db)
+            else:
+                db.close()
+
+    @contextlib.contextmanager
+    def tx(self):
+        """A write transaction. BEGIN IMMEDIATE takes the write lock up front, so what it
+        reads can't change before it writes (a job is claimed by one node only)."""
+        with self._conn() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                yield db
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
+            db.execute("COMMIT")
 
     def q(self, sql: str, args=(), one=False):
-        with self.lock, self.db:
-            cur = self.db.execute(sql, args)
-            return cur.fetchone() if one else cur.fetchall()
+        """One statement, as its own transaction. Rows are always fetched in full: a
+        statement left half-read keeps its snapshot (or, for UPDATE ... RETURNING, the write
+        lock) until the connection is next used."""
+        with self._conn() as db:
+            rows = db.execute(sql, args).fetchall()
+        return (rows[0] if rows else None) if one else rows
 
     # ---------------------------------------------------------------- auth
 
@@ -324,7 +443,7 @@ class HubStore:
         Admin only. The provider's node decides whether it may run (its cap). With
         again=False, an existing final is returned instead of spending another, unless
         the node refused it: a refused final never ran and wasn't counted."""
-        row = self.q("SELECT task, agent, manifest, kind FROM submissions WHERE id=? AND split='validation' "
+        row = self.q("SELECT task, agent, manifest_id, kind FROM submissions WHERE id=? AND split='validation' "
                      "AND status NOT IN ('uploading', 'uploading_final')", (sid,), one=True)
         if not row:
             raise KeyError(f"no committed submission {sid}")
@@ -333,7 +452,7 @@ class HubStore:
             return done[-1]
         fid = f"{sid}-final{len(done) + 1}"
         # The final keeps its submission's kind: a baseline's counts against the baseline cap.
-        self.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, manifest, split, "
+        self.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, manifest_id, split, "
                "kind) VALUES (?,?,?,?, 'queued', NULL, NULL, ?, 'test', ?)",
                (fid, row[0], row[1], time.time(), row[2], row[3]))
         return fid
@@ -370,11 +489,42 @@ class HubStore:
         return row[0] if row else "agent"
 
     def budget(self, agent: str) -> tuple[int | None, int]:
-        """(evaluation budget, evaluations used) for an attempt."""
+        """(evaluation budget, evaluations used) for an attempt. Uploads that were never
+        committed don't count (nor final candidates, which aren't run on validation)."""
         cap = self.q("SELECT eval_budget FROM agents WHERE name=?", (agent,), one=True)[0]
         used = self.q("SELECT COUNT(DISTINCT COALESCE(group_id, id)) FROM submissions WHERE agent=? "
                       "AND split='validation' AND status IN ('queued', 'assigned', 'done')", (agent,), one=True)[0]
         return cap, used
+
+    # --------------------------------------------------------- submissions
+
+    def add_submission(self, sid: str, tasks: list[str], agent: str, manifest: dict, family: bool,
+                       final: bool) -> str:
+        """Record an upload: its manifest once, and a row per dataset (a family submission is
+        one row per dataset, sharing a group id). Returns the manifest's id."""
+        mid, kind, now = manifest_id(manifest), self.agent_kind(agent), time.time()
+        with self.tx() as db:
+            db.execute("INSERT OR IGNORE INTO manifests VALUES (?,?)", (mid, json.dumps(manifest)))
+            for task in tasks:
+                rid, gid = (f"{sid}-{task}", sid) if family else (sid, None)
+                db.execute("INSERT INTO submissions (id, task, agent, created, status, node_id, result, "
+                           "manifest_id, group_id, kind) VALUES (?,?,?,?, ?, NULL, NULL, ?, ?, ?)",
+                           (rid, task, agent, now, "uploading_final" if final else "uploading", mid, gid, kind))
+        return mid
+
+    def manifest(self, mid: str) -> dict:
+        return json.loads(self.q("SELECT manifest FROM manifests WHERE id=?", (mid,), one=True)[0])
+
+    def drop_abandoned(self, now: float | None = None) -> int:
+        """Delete uploads not committed within ABANDON_S: a client that timed out and retried
+        leaves its first try behind (855 of them for one task family on 2026-10-30). They never
+        counted against a budget (see budget); a commit for one now finds no such submission."""
+        with self.tx() as db:
+            n = db.execute("DELETE FROM submissions WHERE status IN ('uploading', 'uploading_final') "
+                           "AND created < ?", ((now or time.time()) - ABANDON_S,)).rowcount
+            if n:
+                _prune_manifests(db)
+        return n
 
     # ----------------------------------------------------------- families
 
@@ -404,9 +554,11 @@ class HubStore:
     # ----------------------------------------------------------- enrollment
 
     def code_for(self, task: str) -> str | None:
-        """The task's connect code (one per task, for good), unless revoked."""
-        row = self.q("SELECT code FROM enrollments WHERE task=? AND (used_by IS NULL OR used_by <> 'revoked') "
-                     "ORDER BY created DESC LIMIT 1", (task,), one=True)
+        """The task's connect code (one per task, for good), unless revoked. Codes that add
+        another node to the task (add_node_code) are not it."""
+        row = self.q("SELECT code FROM enrollments WHERE task=? AND extra=0 "
+                     "AND (used_by IS NULL OR used_by <> 'revoked') ORDER BY created DESC LIMIT 1",
+                     (task,), one=True)
         return row[0] if row else None
 
     def add_enrollment(self, task_dir: Path) -> tuple[str, Contract]:
@@ -422,8 +574,9 @@ class HubStore:
         files = self.package_files(task_dir)
         code = self.code_for(c.id)
         if code:
-            self.q("UPDATE enrollments SET files=?, version=version+1 WHERE code=?",
-                   (json.dumps(files), code))
+            # Every node serving the task gets the update, each behind its own code.
+            self.q("UPDATE enrollments SET files=?, version=version+1 WHERE task=? "
+                   "AND (used_by IS NULL OR used_by <> 'revoked')", (json.dumps(files), c.id))
         else:
             code = new_code()
             self.q("INSERT INTO enrollments (code, task, files, created, used_by, version) "
@@ -452,6 +605,26 @@ class HubStore:
                 files[rel.as_posix()] = {"base64": base64.b64encode(raw).decode()}
         return files
 
+    def add_node_code(self, task: str) -> tuple[str, Contract]:
+        """A connect code that adds one more node to an enrolled task, with the same package
+        and version. Jobs then go to whichever of its nodes asks first, so a busy task isn't
+        limited to one machine. Only for a task whose rows are split the same way on every
+        node (no split, or a fixed `by_column` split): a random split is drawn on each node
+        with its own secret seed, so two nodes would score different validation rows."""
+        code = self.code_for(task)
+        if not code:
+            raise KeyError(f"no task {task!r} on this hub")
+        _, files, _, version = self.enrollment(code)
+        c = Contract.from_dict(yaml.safe_load(files["contract.yaml"]))
+        if c.split and not c.split.by_column:
+            raise ValueError(f"task {task} splits its rows at random on each node; a second node "
+                             "would score different validation rows. Use split.by_column to serve "
+                             "it from several nodes.")
+        new = new_code()
+        self.q("INSERT INTO enrollments (code, task, files, created, used_by, version, extra) "
+               "VALUES (?,?,?,?,NULL,?,1)", (new, task, json.dumps(files), time.time(), version))
+        return new, c
+
     def enrollment(self, code: str) -> tuple[str, dict, str | None, int] | None:
         row = self.q("SELECT task, files, used_by, version FROM enrollments WHERE code=?", (code,), one=True)
         return (row[0], json.loads(row[1]), row[2], row[3]) if row else None
@@ -470,7 +643,8 @@ class HubStore:
         if e is None or e[2] == "revoked" or (e[2] is not None and e[2] != node_id):
             raise KeyError("code unknown or already used by another machine")
         task = e[0]
-        owner = self.q("SELECT node_id FROM node_tasks WHERE task=?", (task,), one=True)
+        owners = {r[0] for r in self.q("SELECT node_id FROM node_tasks WHERE task=?", (task,))}
+        extra = self.q("SELECT extra FROM enrollments WHERE code=?", (code,), one=True)[0]
         out = {"task": task}
         if node_id is None:
             node_id = "node_" + secrets.token_hex(6)
@@ -478,7 +652,8 @@ class HubStore:
             self.q("INSERT INTO nodes (id, secret_sha256, name, created, last_seen, accepting) "
                    "VALUES (?,?,?,?,NULL,0)", (node_id, _h(secret), name, time.time()))
             out["secret"] = secret
-        if owner and owner[0] != node_id:
+        # A task's own code binds one node; each further node needs a code made for it.
+        if owners - {node_id} and not extra:
             raise KeyError("task is already served by another node")
         self.q("INSERT OR REPLACE INTO node_tasks VALUES (?,?,NULL)", (task, node_id))
         # Each activation (a provider re-running their command) restarts the stall clock
@@ -513,14 +688,15 @@ class HubStore:
         if not apply:
             return counts
         backup = sqlite3.connect(self.state / f"hub.db.bak-{time.strftime('%Y%m%d-%H%M%S')}-retire-{task}")
-        with self.lock:
-            self.db.backup(backup)
+        with self._conn() as db:
+            db.backup(backup)
         backup.close()
-        with self.lock, self.db:
-            self.db.execute(f"DELETE FROM setup_reports WHERE code IN ({marks})", codes)
-            self.db.execute("DELETE FROM enrollments WHERE task=?", (task,))
-            self.db.execute("DELETE FROM node_tasks WHERE task=?", (task,))
-            self.db.execute("DELETE FROM submissions WHERE task=? AND status<>'done'", (task,))
+        with self.tx() as db:
+            db.execute(f"DELETE FROM setup_reports WHERE code IN ({marks})", codes)
+            db.execute("DELETE FROM enrollments WHERE task=?", (task,))
+            db.execute("DELETE FROM node_tasks WHERE task=?", (task,))
+            db.execute("DELETE FROM submissions WHERE task=? AND status<>'done'", (task,))
+            _prune_manifests(db)
         for name, tasks in self.families().items():
             if task in tasks:
                 self.set_family(name, [t for t in tasks if t != task])
@@ -730,17 +906,67 @@ def missing_blobs(blobs, agent: str, files: list[dict]) -> list[str]:
     return sorted(f["sha256"] for f, h in zip(uniq, held) if not h)
 
 
-def sign_all(blobs, agent: str, files: list[dict]) -> dict[str, str]:
-    """A download URL per distinct file, signed concurrently. On GCS each signature is an
-    IAM API call (~0.1 s); a 1,482-file bundle took minutes one by one, past the node's 60 s
-    read timeout, so the job was handed out, timed out and requeued over and over."""
-    from concurrent.futures import ThreadPoolExecutor
+def sign_all(blobs, agent: str, files: list[dict]) -> dict[str, dict]:
+    """A download link per distinct file. Normally a lookup: Presigner signed them when the
+    upload was committed. Any that aren't ready are signed here, concurrently: on GCS each
+    signature is an IAM API call (~0.1 s), and a 1,482-file bundle took minutes one by one,
+    past the node's 60 s read timeout, so the job was handed out, timed out and requeued
+    over and over."""
     uniq = {f["sha256"]: f for f in files}
-    if len(uniq) <= 4:
-        return {sha: blobs.download(agent, sha, f["size"]) for sha, f in uniq.items()}
-    with ThreadPoolExecutor(min(SIGN_THREADS, len(uniq))) as ex:
-        urls = list(ex.map(lambda f: blobs.download(agent, f["sha256"], f["size"]), uniq.values()))
-    return dict(zip(uniq, urls))
+    out = {sha: blobs.signed(agent, sha) for sha in uniq}
+    todo = [f for sha, f in uniq.items() if out[sha] is None]
+    for f, link in zip(todo, _concurrently(lambda f: blobs.download(agent, f["sha256"], f["size"]), todo)):
+        out[f["sha256"]] = link
+    return out
+
+
+class Presigner:
+    """Signs a queued job's download links before a node asks for it, so the hand-out
+    (/v1/node/next) only looks them up. Signing them in the hand-out (3,063 links for one
+    bundle on 2026-10-30) outlasted the node's 60 s read timeout, and the requeued job started
+    over at the next poll. Links are signed when an upload is committed, then checked every
+    RENEW_S while the job waits and renewed when under 2 * RENEW_S of reuse is left, so one
+    handed out still has at least URL_REUSE_MIN to run (2 * RENEW_S stays under the
+    URL_TTL - URL_REUSE_MIN a new link has, or every check would re-sign everything)."""
+
+    def __init__(self, store: HubStore, blobs):
+        from concurrent.futures import ThreadPoolExecutor
+        self.store, self.blobs = store, blobs
+        # Bundles one at a time, each with SIGN_THREADS signatures in flight: however many
+        # uploads commit at once, the hub's threads and the IAM quota stay bounded.
+        self._bundles = ThreadPoolExecutor(1, thread_name_prefix="presign")
+        self._files = ThreadPoolExecutor(SIGN_THREADS, thread_name_prefix="presign-file")
+        self._checked: dict[tuple[str, str], float] = {}   # (agent, manifest id) -> next check
+        self._lock = threading.Lock()
+
+    def warm(self, agent: str, mid: str):
+        """Queue the signing of a bundle's links for an agent, unless done within RENEW_S."""
+        now = time.time()
+        with self._lock:
+            if self._checked.get((agent, mid), 0) > now:
+                return None
+            self._checked[(agent, mid)] = now + RENEW_S   # claimed: a second caller skips it
+        return self._bundles.submit(self._warm, agent, mid)
+
+    def _warm(self, agent: str, mid: str) -> None:
+        try:
+            files = list({f["sha256"]: f for f in self.store.manifest(mid)["files"]}.values())
+            list(self._files.map(lambda f: self.blobs.download(agent, f["sha256"], f["size"],
+                                                               ahead=2 * RENEW_S), files))
+        except Exception as e:
+            with self._lock:
+                self._checked.pop((agent, mid), None)       # the next sweep tries again
+            print(f"[bmb-hub] signing links for {mid[:12]} failed: {type(e).__name__}: {e}", flush=True)
+
+    def sweep(self) -> None:
+        """Warm every queued job's bundle: renewals, finals (queued by request_final, not a
+        commit), and everything after a restart (signed links are kept in memory)."""
+        now = time.time()
+        with self._lock:
+            self._checked = {k: t for k, t in self._checked.items() if t > now}
+        for agent, mid in self.store.q("SELECT DISTINCT agent, manifest_id FROM submissions "
+                                       "WHERE status='queued'"):
+            self.warm(agent, mid)
 
 
 def flat_package(files: dict) -> bool:
@@ -808,17 +1034,27 @@ def check_stalled(store: HubStore, now: float | None = None) -> None:
     store.set_setting("stall_alerted", seen)
 
 
-def watch_stalled(store: HubStore, every_s: int = 300) -> threading.Thread:
+def every(seconds: int, what: str, fn) -> threading.Thread:
+    """Run fn now and then every `seconds` in a background thread, reporting failures."""
     def run():
         while True:
             try:
-                check_stalled(store)
+                fn()
             except Exception as e:
-                print(f"[bmb-hub] stall check failed: {type(e).__name__}: {e}", flush=True)
-            time.sleep(every_s)
+                print(f"[bmb-hub] {what} failed: {type(e).__name__}: {e}", flush=True)
+            time.sleep(seconds)
     t = threading.Thread(target=run, daemon=True)
     t.start()
     return t
+
+
+def watch_stalled(store: HubStore, every_s: int = 300) -> threading.Thread:
+    return every(every_s, "stall check", lambda: check_stalled(store))
+
+
+def drop_abandoned(store: HubStore) -> None:
+    if n := store.drop_abandoned():
+        print(f"[bmb-hub] dropped {n} uploads not committed within {ABANDON_S // 3600} h", flush=True)
 
 
 def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_bundle_gb: int):
@@ -831,6 +1067,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
     verify_sh = repo_root / "deploy" / "confidential" / "verify-image.sh"
     pages = {"/guide": repo_root / "docs" / "PROVIDER_SETUP.md"}
     image_tar = store.state / "sandbox-image.tar"
+    presigner = Presigner(store, blobs)
 
     def release_view() -> dict:
         """GET /release: which release this is, and the sha256 of each download. The
@@ -966,12 +1203,15 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 now = time.time()
                 rows = store.q("SELECT t.task, t.contract, n.last_seen, n.accepting FROM node_tasks t "
                                "JOIN nodes n ON n.id = t.node_id WHERE t.contract IS NOT NULL")
+                rank = {"offline": 0, "paused": 1, "online": 2}
+                tasks: dict[str, dict] = {}     # a task served by several nodes is listed once
+                for task, c, seen, acc in rows:
+                    state = ("offline" if not seen or now - seen > ONLINE_S
+                             else "online" if acc else "paused")
+                    if task not in tasks or rank[state] > rank[tasks[task]["node"]]:
+                        tasks[task] = {"contract": json.loads(c), "node": state}
                 cap, used = store.budget(agent)
-                return self._send(200, {"tasks": [{
-                    "contract": json.loads(c),
-                    "node": ("offline" if not seen or now - seen > ONLINE_S
-                             else "online" if acc else "paused"),
-                } for _, c, seen, acc in rows],
+                return self._send(200, {"tasks": list(tasks.values()),
                     "families": [{"name": n, "tasks": t} for n, t in store.families().items()],
                     "budget": {"evaluations": cap, "used": used}})
             if m := re.fullmatch(r"/v1/submissions/([\w-]{1,128})", p):
@@ -1127,19 +1367,12 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if not final and not self._budget_left(agent):
                 return
             sid = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(4)
-            kind = store.agent_kind(agent)
-            for task in tasks:
-                # A family submission is one row per dataset, sharing a group id.
-                rid, gid = (f"{sid}-{task}", sid) if fam else (sid, None)
-                store.q("INSERT INTO submissions (id, task, agent, created, status, node_id, result, "
-                        "manifest, group_id, kind) VALUES (?,?,?,?, ?, NULL, NULL, ?, ?, ?)",
-                        (rid, task, agent, time.time(), "uploading_final" if final else "uploading",
-                         json.dumps(manifest), gid, kind))
+            store.add_submission(sid, tasks, agent, manifest, bool(fam), final)
             uploads = plan_uploads(blobs, agent, files)
             self._send(201, {"submission_id": sid, "tasks": tasks, "uploads": uploads})
 
         def _commit(self, agent: str, sid: str) -> None:
-            row = store.q("SELECT status, manifest FROM submissions WHERE (id=? OR group_id=?) AND agent=? "
+            row = store.q("SELECT status, manifest_id FROM submissions WHERE (id=? OR group_id=?) AND agent=? "
                           "LIMIT 1", (sid, sid, agent), one=True)
             if not row:
                 return self._err(404, "not_found", "No such submission.")
@@ -1148,12 +1381,14 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             final = row[0] == "uploading_final"
             if not final and not self._budget_left(agent):
                 return
-            missing = missing_blobs(blobs, agent, json.loads(row[1])["files"])
+            missing = missing_blobs(blobs, agent, store.manifest(row[1])["files"])
             if missing:
                 return self._err(409, "files_missing", "Some files were not uploaded.",
                                  missing=missing)
             store.q("UPDATE submissions SET status=? WHERE (id=? OR group_id=?) AND agent=? "
                     "AND status=?", ("registered" if final else "queued", sid, sid, agent, row[0]))
+            if not final:
+                presigner.warm(agent, row[1])
             self._send(202, {"submission_id": sid, "status": "registered" if final else "pending"})
 
         def _blob_get(self, sha: str) -> None:
@@ -1182,23 +1417,20 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return
             if p != "/v1/node/next":
                 return self._err(404, "not_found", "No such endpoint.")
-            with store.lock, store.db:
-                row = store.db.execute(
-                    "SELECT s.id, s.task, s.agent, s.manifest, s.split, s.kind FROM submissions s "
-                    "JOIN node_tasks t "
-                    "ON t.task = s.task WHERE t.node_id=? AND s.status='queued' "
-                    "ORDER BY s.created LIMIT 1", (node,)).fetchone()
-                if row:
-                    store.db.execute("UPDATE submissions SET status='assigned', node_id=? "
-                                     "WHERE id=?", (node, row[0]))
-            if not row:
+            # Claimed in one statement under the write lock: two polls never get one job.
+            with store.tx() as db:
+                rows = db.execute(
+                    "UPDATE submissions SET status='assigned', node_id=? WHERE id = (SELECT s.id "
+                    "FROM submissions s JOIN node_tasks t ON t.task = s.task WHERE t.node_id=? "
+                    "AND s.status='queued' ORDER BY s.created LIMIT 1) "
+                    "RETURNING id, task, agent, manifest_id, split, kind", (node, node)).fetchall()
+            if not rows:
                 return self._send(204)
-            manifest = json.loads(row[3])
-            downloads = sign_all(blobs, row[2], manifest["files"])
-            self._send(200, {"submission_id": row[0], "task": row[1], "submitter": row[2],
-                             "split": row[4], "kind": row[5],
-                             "manifest": manifest, "bundle_id": manifest_id(manifest),
-                             "downloads": downloads})
+            sid, task, agent, mid, split, kind = rows[0]
+            manifest = store.manifest(mid)
+            self._send(200, {"submission_id": sid, "task": task, "submitter": agent,
+                             "split": split, "kind": kind, "manifest": manifest, "bundle_id": mid,
+                             "downloads": sign_all(blobs, agent, manifest["files"])})
 
         def _node_post(self, p: str) -> None:
             node = self._node()
@@ -1212,8 +1444,8 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 owned = {r[0] for r in store.q("SELECT task FROM node_tasks WHERE node_id=?", (node,))}
                 for task, contract in (body.get("tasks") or {}).items():
                     if task in owned:
-                        store.q("UPDATE node_tasks SET contract=? WHERE task=?",
-                                (json.dumps(contract), task))
+                        store.q("UPDATE node_tasks SET contract=? WHERE task=? AND node_id=?",
+                                (json.dumps(contract), task, node))
                 store.q("UPDATE nodes SET accepting=? WHERE id=?",
                         (1 if body.get("accepting") else 0, node))
                 st = body.get("status")
@@ -1236,16 +1468,19 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
                 return self._send(200, {"ok": True})
             if m := re.fullmatch(r"/v1/node/results/([\w-]{1,128})", p):
                 sid = m.group(1)
-                # Accept from the node that serves the task, even if the job was
+                # Accept from a node that serves the task, even if the job was
                 # re-queued while its result was in flight.
                 if not store.q("SELECT 1 FROM submissions s JOIN node_tasks t ON t.task = s.task "
                                "WHERE s.id=? AND t.node_id=?", (sid, node), one=True):
                     return self._err(404, "not_found", "No such job.")
-                store.q("UPDATE submissions SET status='done', node_id=?, result=? WHERE id=?",
-                        (node, json.dumps(body), sid))
+                # The first result stands: a job re-queued to another of the task's nodes
+                # while this one's result was in flight may report twice.
+                store.q("UPDATE submissions SET status='done', node_id=?, result=? "
+                        "WHERE id=? AND status<>'done'", (node, json.dumps(body), sid))
                 return self._send(200, {"ok": True})
             self._err(404, "not_found", "No such endpoint.")
 
+    Handler.presigner = presigner   # for serve's sweep (main)
     return Handler
 
 
@@ -1335,6 +1570,10 @@ def main(argv=None) -> None:
     p.add_argument("--replace", action="store_true",
                    help="replace an existing task's package even though it differs")
 
+    p = sub.add_parser("add-node", help="a connect code that adds another node to an enrolled task")
+    p.add_argument("task")
+    p.add_argument("--public-url", required=True)
+
     p = sub.add_parser("alerts", help="where operator alerts go (failed or stalled provider setups)")
     p.add_argument("--webhook", help="Slack-compatible incoming webhook URL ('' to turn off)")
     p.add_argument("--test", action="store_true", help="send a test alert")
@@ -1406,6 +1645,8 @@ def main(argv=None) -> None:
             from .sealed_launcher import loop
             loop(store)
         watch_stalled(store)
+        every(60, "link signing", handler.presigner.sweep)
+        every(3600, "abandoned upload cleanup", lambda: drop_abandoned(store))
         print(f"bmb-hub {release.describe(root)} on http://{args.host}:{args.port} (public: {url}; "
               f"model files: {'gs://' + args.bucket if args.bucket else 'hub disk'})")
         try:
@@ -1449,6 +1690,13 @@ def main(argv=None) -> None:
                   f"The provider's machine will show an update; they review and approve it with:\n"
                   f"    ~/bmb-eval/bmb-eval update\n"
                   f"Until then it keeps evaluating with the version they approved.")
+    elif args.cmd == "add-node":
+        try:
+            code, c = store.add_node_code(args.task)
+        except (KeyError, ValueError) as e:
+            raise SystemExit(str(e).strip("'\""))
+        print(f"(a code for one more node serving {c.id}; its first node keeps its own code)\n")
+        print(provider_message(args.public_url.rstrip("/"), code, c))
     elif args.cmd == "alerts":
         if args.webhook is not None:
             store.set_setting("alerts", {"webhook": args.webhook} if args.webhook else {})
@@ -1470,9 +1718,9 @@ def main(argv=None) -> None:
         else:
             print("Run again with --yes to do it.")
     elif args.cmd == "revoke":
-        with store.lock, store.db:
-            n = store.db.execute("UPDATE enrollments SET used_by='revoked' WHERE code=? AND used_by IS NULL",
-                                 (args.code,)).rowcount
+        with store.tx() as db:
+            n = db.execute("UPDATE enrollments SET used_by='revoked' WHERE code=? AND used_by IS NULL",
+                           (args.code,)).rowcount
         print(f"revoked {args.code}" if n else f"{args.code} is unknown or already used")
     elif args.cmd == "operator-token":
         print(store.set_operator())

@@ -2431,3 +2431,32 @@ def test_second_node_for_a_task_whose_contract_names_a_labels_file(hub, tmp_path
     task = Contract.load(d / "contract.yaml").id
     code, c = store.add_node_code(task)
     assert c.id == task and code
+
+
+def test_file_hashes_persist_across_processes(connected):
+    """A restarted node, `status` or `approve` reuses earlier hashes by (path, mtime, size),
+    as one process already did, instead of re-reading every data file."""
+    cfg, *_ = connected
+    first = approval.fingerprint(cfg)
+    assert (cfg.state_dir / approval.HASH_CACHE).exists()
+    approval._hash_cache.clear()                         # a new process
+    f = cfg.tasks["binding"].answers
+    st = f.stat()
+    data = bytearray(f.read_bytes())
+    data[-1] ^= 1                                        # same size, mtime put back
+    f.write_bytes(bytes(data))
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert approval.fingerprint(cfg) == first            # served from the saved hashes
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+    assert approval.fingerprint(cfg) != first            # a changed mtime is read again
+
+
+def test_applied_updates_leave_the_pending_list(connected):
+    cfg, *_ = connected
+    w = Worker(cfg)
+    from bmb_eval.node import pending_updates, updates_path
+    updates_path(cfg).write_text(json.dumps({"binding": 1}))   # stale: version 1 is installed
+    w._note_updates({"binding": 1})
+    assert pending_updates(cfg) == {}
+    w._note_updates({"binding": 2})                          # a real new version still shows
+    assert pending_updates(cfg) == {"binding": 2}

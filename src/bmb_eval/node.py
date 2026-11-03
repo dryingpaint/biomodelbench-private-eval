@@ -234,6 +234,11 @@ class Worker:
         self.parallel = 1 if cfg.sealed else cfg.max_parallel
         self.capacity = machine_capacity(cfg, self.runner.sandbox)
         self._modal_verified = 0.0
+        # The hourly volume-by-volume check runs in its own thread (_start_verify): it lists
+        # every volume (~360 on the public Modal node), and in the loop it held up the node
+        # for minutes and, rate-limited, kept it from taking work for hours (2026-11-02).
+        self._verify_thread: threading.Thread | None = None
+        self._verify_drift: list[str] = []      # what the last finished volume check found
         # Last answer of the Modal data check: None = not known yet, [] = matches, else the
         # problems. A check Modal can't answer (rate limit, API error) leaves it as it was.
         self._modal_state: list[str] | None = None
@@ -326,15 +331,13 @@ class Worker:
             lock = approval.lock_path(self.cfg).stat().st_mtime
         except OSError:
             lock = None
+        if lock != self._modal_lock_mtime:
+            # A new approval: the volume check's last answer was for other data. Check again.
+            self._verify_drift, self._modal_verified = [], 0.0
         if now < self._modal_next_check and lock == self._modal_lock_mtime:
-            return self._modal_state
+            return None if self._modal_state is None else self._modal_state + self._verify_drift
         try:
-            out = modal_sync.drift(self.cfg)
-            if not out and now - self._modal_verified > MODAL_VERIFY_S:
-                # Volumes listed in the last half hour (a check cut short) aren't listed again.
-                out = modal_sync.verify(self.cfg, max_age_s=MODAL_VERIFY_S / 2)
-                if not out:
-                    self._modal_verified = now
+            out = modal_sync.drift(self.cfg)          # the manifest: one call, in the loop
         except modal_sync.ModalCheckError as e:
             self._modal_check_failures += 1
             n = self._modal_check_failures
@@ -354,7 +357,33 @@ class Worker:
         self._modal_state = out
         self._modal_lock_mtime = lock
         self._modal_next_check = now + (MODAL_DRIFT_RETRY_S if out else MODAL_DRIFT_S)
-        return out
+        if not out and now - self._modal_verified > MODAL_VERIFY_S:
+            self._start_verify()
+        return out + self._verify_drift
+
+    def _start_verify(self) -> None:
+        """Every volume against the manifest, in the background. Drift it finds stops new work
+        (through _modal_drift) until a later check or approval clears it; a check Modal can't
+        answer stops nothing and is tried again in ten minutes."""
+        from . import modal_sync
+        if self._verify_thread is not None and self._verify_thread.is_alive():
+            return
+        cfg, started = self.cfg, time.time()
+        self._modal_verified = started             # due again only after this one
+        def run() -> None:
+            try:
+                # Volumes listed in the last half hour (a check cut short) aren't listed again.
+                self._verify_drift = modal_sync.verify(cfg, max_age_s=MODAL_VERIFY_S / 2)
+                if self._verify_drift:
+                    self._accepting = (0.0, False)   # take no more work from the next step on
+            except modal_sync.ModalCheckError as e:
+                self._modal_verified = started - MODAL_VERIFY_S + 600
+                audit.record(cfg.state_dir, "modal_verify_failed", error=str(e)[:300])
+            except Exception as e:
+                self._modal_verified = started - MODAL_VERIFY_S + 600
+                audit.record(cfg.state_dir, "modal_verify_failed", error=type(e).__name__)
+        self._verify_thread = threading.Thread(target=run, daemon=True, name="modal-verify")
+        self._verify_thread.start()
 
     # -------------------------------------------------------------- loop
 

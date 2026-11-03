@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 from .config import PKG, Config
@@ -17,11 +18,14 @@ from . import sandbox
 
 
 _hash_cache: dict[tuple, str] = {}
+_seen: set[tuple] = set()          # keys used by the fingerprint being computed
+HASH_CACHE = "hash_cache.json"     # in the node's state dir
 
 
 def _file_hash(p: Path) -> str:
     st = p.stat()
     k = (str(p.resolve()), st.st_mtime_ns, st.st_size)
+    _seen.add(k)
     if k not in _hash_cache:
         h = hashlib.sha256()
         with p.open("rb") as f:
@@ -29,6 +33,30 @@ def _file_hash(p: Path) -> str:
                 h.update(chunk)
         _hash_cache[k] = h.hexdigest()
     return _hash_cache[k]
+
+
+def _load_hashes(state_dir: Path) -> None:
+    """The per-file hashes of earlier processes, by (path, mtime, size) as in memory. Without
+    them every start, `status`, `approve` and `connect` re-read every data file: 2 min 43 s of
+    CPU on the public Modal node with 93 tasks (2026-11-03), all of it before a restarted node
+    took any work."""
+    try:
+        for row in json.loads((state_dir / HASH_CACHE).read_text()):
+            _hash_cache.setdefault((row[0], row[1], row[2]), row[3])
+    except (OSError, ValueError, TypeError, IndexError):
+        pass
+
+
+def _save_hashes(state_dir: Path) -> None:
+    """Keep the hashes of the files this fingerprint read (so the file stays bounded);
+    written whole and renamed into place, as the node and a CLI command may both save."""
+    rows = [[*k, _hash_cache[k]] for k in sorted(_seen) if k in _hash_cache]
+    try:
+        tmp = state_dir / f".{HASH_CACHE}.{os.getpid()}"
+        tmp.write_text(json.dumps(rows))
+        tmp.replace(state_dir / HASH_CACHE)
+    except OSError:
+        pass
 
 
 def _dir_hash(d: Path, pattern: str = "*") -> str:
@@ -70,6 +98,8 @@ def fingerprint_tasks(cfg: Config) -> dict:
 
 
 def fingerprint(cfg: Config) -> dict:
+    _load_hashes(cfg.state_dir)
+    _seen.clear()
     sb = {"backend": cfg.backend, "image_id": sandbox.make(cfg).image_id(), "runtime": cfg.runtime}
     if cfg.backend == "modal":
         # Where the data lives, and exactly what was uploaded there (modal_sync's manifest).
@@ -80,11 +110,13 @@ def fingerprint(cfg: Config) -> dict:
         # A batched model sees several tasks' inputs at once: turning it on is approved like
         # any other change to what a model sees. Absent when off, so existing locks still match.
         sb["batch_families"] = True
-    return {
+    out = {
         "node_code": _dir_hash(PKG, "*.py"),
         "sandbox": sb,
         "tasks": fingerprint_tasks(cfg),
     }
+    _save_hashes(cfg.state_dir)
+    return out
 
 
 def lock_path(cfg: Config) -> Path:

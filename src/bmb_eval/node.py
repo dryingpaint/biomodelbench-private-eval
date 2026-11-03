@@ -584,10 +584,13 @@ class Worker:
     def _note_updates(self, versions: dict) -> None:
         """BioModelBench changed a task: tell the provider (once per version).
         Nothing changes here until they review and approve it with `bmb-eval update`."""
-        pending = pending_updates(self.cfg)
+        def have(task: str) -> int:
+            return int((self.cfg.raw.get("tasks", {}).get(task) or {}).get("package_version", 1))
+        # Applied since (`bmb-eval update`): no longer pending. A notice added back by a node
+        # that hadn't reloaded the updated config stayed in `status` for good (2026-11-03).
+        pending = {t: v for t, v in pending_updates(self.cfg).items() if v > have(t)}
         for task, version in versions.items():
-            have = int((self.cfg.raw.get("tasks", {}).get(task) or {}).get("package_version", 1))
-            if version > have and pending.get(task) != version:
+            if version > have(task) and pending.get(task) != version:
                 pending[task] = version
                 audit.record(self.cfg.state_dir, "task_update_available", task=task, version=version)
                 alerts.send(self.cfg, "config", f"BioModelBench updated task {task} (version {version}); "

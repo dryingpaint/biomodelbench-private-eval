@@ -14,7 +14,7 @@ import fake_modal
 from bmb_eval import approval, cli, modal_backend, modal_sync
 from bmb_eval.client import Client
 from bmb_eval.config import Config
-from bmb_eval.node import Worker
+from bmb_eval.node import BATCH_MARKER, Worker
 from bmb_eval.runner import Runner, parse_frames
 from bmb_eval.sandbox import Mount, check_mounts
 from bmb_eval.sandbox_entry.predict import EXIT_RUNTIME, EXIT_TIMEOUT, FRAME, FRAME_MAGIC
@@ -45,6 +45,8 @@ def load_model():
 def predict(df):
     CALLS[0] += 1
     _log("predict")
+    # As agents' models do: which task is this? (A batch once handed them the list of all.)
+    _log("contract:" + json.loads(Path(os.environ["BMB_CONTRACT_FILE"]).read_text())["id"])
     if CALLS[0] == MODE.get("fail_call"):
         raise RuntimeError("this task's predict fails")
     if CALLS[0] == MODE.get("sleep_call"):
@@ -53,10 +55,12 @@ def predict(df):
 '''
 
 
-def _bundle(tmp_path: Path, **mode) -> tuple[Path, Path]:
+def _bundle(tmp_path: Path, batchable: bool = True, **mode) -> tuple[Path, Path]:
     b = tmp_path / f"bundle-{len(list(tmp_path.glob('bundle-*')))}"
     b.mkdir()
     (b / "predict.py").write_text(MODEL)
+    if batchable:
+        (b / BATCH_MARKER).write_text("")
     log = b.parent / f"{b.name}.log"
     (b / "mode.json").write_text(json.dumps({"log": str(log), **mode}))
     return b, log
@@ -66,7 +70,7 @@ def _calls(log: Path) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {"load": [], "predict": []}
     for line in (log.read_text().splitlines() if log.exists() else []):
         what, pid = line.split()
-        out[what].append(pid)
+        out.setdefault(what, []).append(pid)
     return out
 
 
@@ -137,6 +141,7 @@ def test_family_predicts_once_and_scores_each_dataset(hub, tmp_path):  # noqa: F
     assert sorted(stages) == [("predict", True)] + [("score", False)] * 3 + [("validate", False)] * 3
     calls = _calls(log)
     assert len(calls["load"]) == 1 and len(set(calls["predict"])) == 1 and len(calls["predict"]) == 3
+    assert sorted(k for k in calls if k.startswith("contract:")) == [f"contract:{t}" for t in tasks]
     # Each job keeps its own record, quota count and audit entry.
     for t, r in res.items():
         rec = _internal(cfg, r["run_id"])
@@ -158,6 +163,20 @@ def test_family_predicts_once_and_scores_each_dataset(hub, tmp_path):  # noqa: F
     assert sorted(stages) == [("predict", False)] * 3 + [("score", False)] * 3 + [("validate", False)] * 3
     assert {t: r["metrics"] for t, r in res2.items()} == {t: r["metrics"] for t, r in res.items()}
     assert len(_calls(log)["load"]) == 1 + 3
+
+
+def test_a_bundle_that_did_not_opt_in_runs_alone(hub, tmp_path):  # noqa: F811
+    """Batching is the model's choice (a BMB_BATCHABLE file): one that reads its contract only
+    at import would predict every task of a batch as the first."""
+    cfg, store, agent, tasks = _family(hub, tmp_path)
+    w = Worker(cfg)
+    stages = _count_stages(w)
+    b, log = _bundle(tmp_path, batchable=False)
+    gid = agent.submit_async(FAMILY, b)["submission_id"]
+    w.drain()
+    assert all(r["status"] == "ok" for r in _results(store, gid).values())
+    assert sorted(stages) == [("predict", False)] * 3 + [("score", False)] * 3 + [("validate", False)] * 3
+    assert len(set(_calls(log)["predict"])) == 3
 
 
 def test_node_that_did_not_opt_in_never_claims_siblings(hub, tmp_path):  # noqa: F811

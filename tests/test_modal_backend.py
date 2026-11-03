@@ -429,6 +429,15 @@ def test_manifest_drift_stops_accepting(modal_connected):
     assert w.accepting()
 
 
+def _after_volume_check(w):
+    """The volume check runs in the background: start it (an accepting() whose manifest
+    check passes), let it finish, and drop the cached answer."""
+    w.accepting()
+    if w._verify_thread is not None:
+        w._verify_thread.join(30)
+    w._accepting, w._modal_next_check = (0.0, False), 0.0
+
+
 def test_volume_changed_behind_the_manifest_is_found(modal_connected):
     cfg, *_, fm = modal_connected
     assert modal_sync.verify(cfg) == []
@@ -436,6 +445,7 @@ def test_volume_changed_behind_the_manifest_is_found(modal_connected):
     (ans / "extra.csv").write_text("x")
     assert any("1 unexpected" in p for p in modal_sync.verify(cfg, max_age_s=0))
     w = Worker(cfg)
+    _after_volume_check(w)
     assert not w.accepting()
 
 
@@ -605,6 +615,30 @@ def test_rate_limits_keep_the_last_good_check_and_back_off(modal_connected):
     assert w.accepting() and fm.api_calls == calls
 
 
+def test_volume_check_runs_in_the_background_and_its_failures_stop_nothing(modal_connected, monkeypatch):
+    """Listing every volume took minutes, and rate-limited it kept the node from taking work
+    for hours (2026-11-02): the node now accepts on the manifest while the volumes are
+    listed in another thread, and a volume check Modal can't answer stops nothing."""
+    cfg, *_, fm = modal_connected
+    gate = threading.Event()
+    real = modal_sync.verify
+    monkeypatch.setattr(modal_sync, "verify", lambda *a, **k: (gate.wait(10), real(*a, **k))[1])
+    w = Worker(cfg)
+    t = time.time()
+    assert w.accepting() and time.time() - t < 5          # the slow volume check isn't waited for
+    assert w._verify_thread.is_alive()
+    gate.set()
+    w._verify_thread.join(30)
+    monkeypatch.setattr(modal_sync, "verify", lambda *a, **k: (_ for _ in ()).throw(
+        modal_sync.ModalCheckError("rate limited")))
+    w._modal_verified = 0.0
+    _due(w)
+    assert w.accepting()
+    w._verify_thread.join(30)
+    _due(w)
+    assert w.accepting() and _events(cfg, "modal_verify_failed") and not _events(cfg, "modal_drift")
+
+
 def test_no_check_yet_means_no_work_but_no_drift(modal_connected):
     cfg, *_, fm = modal_connected
     fm.rate_limit = 10 ** 6
@@ -658,6 +692,7 @@ def test_a_cut_short_verification_resumes_and_real_drift_still_counts(modal_conn
                         "1 unexpected, 0 missing, 0 changed file(s)"]
     w = Worker(cfg)
     fm.rate_limit = 0
+    _after_volume_check(w)
     assert not w.accepting() and _events(cfg, "modal_drift")
 
 

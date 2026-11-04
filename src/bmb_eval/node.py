@@ -446,7 +446,7 @@ class Worker:
             self._dispatch(*local, self._need(local[0], local[1]), {})
             return True
         if (not accepting or time.time() < self._infra_pause_until
-                or not self._room_on_disk(self._deferred_need)):
+                or not self._room_on_disk(self._deferred_need, report=True)):
             return did
         job = self.api.next()
         if job:
@@ -767,18 +767,28 @@ class Worker:
             pending = sum(self._pending_files.values())
         return shutil.disk_usage(self.cfg.blob_dir).free - pending
 
-    def _room_on_disk(self, need: int = 0) -> bool:
+    def _room_on_disk(self, need: int = 0, report: bool = False) -> bool:
         """Whether `need` more bytes of model files leave min_free_gb free. The node used to
         take jobs whatever the disk held: on 2026-11-03 a Modal node holding 156 jobs (10
         bundles, waiting for GPUs) filled the shared 484 GB disk, a half-written audit log
-        then crashed it at every start, and both nodes took no work for about 14 hours."""
-        ok = self._free_bytes() - need >= self.cfg.min_free_gb << 30
-        if not ok and not self._disk_low:
-            audit.record(self.cfg.state_dir, "disk_low", free_gb=round(self._free_bytes() / 2**30, 1),
-                         need_gb=round(need / 2**30, 1), min_free_gb=self.cfg.min_free_gb)
-            alerts.send(self.cfg, "infra", "not taking work: the disk is too full for more model files "
-                        f"(keeping {self.cfg.min_free_gb} GB free)")
-        self._disk_low = not ok
+        then crashed it at every start, and both nodes took no work for about 14 hours.
+
+        `report` (the loop's check before asking for work) records disk_low and alerts once
+        per episode; the episode ends only once free space is DISK_LOW_CLEAR above the floor,
+        or a disk hovering at it alerted at every other step (2026-11-04)."""
+        floor = self.cfg.min_free_gb << 30
+        free = self._free_bytes()
+        ok = free - need >= floor
+        if report:
+            if not ok and not self._disk_low:
+                audit.record(self.cfg.state_dir, "disk_low", free_gb=round(free / 2**30, 1),
+                             need_gb=round(need / 2**30, 1), min_free_gb=self.cfg.min_free_gb)
+                alerts.send(self.cfg, "infra", "not taking work: the disk is too full for more model "
+                            f"files (keeping {self.cfg.min_free_gb} GB free)")
+                self._disk_low = True
+            elif self._disk_low and free - need >= floor + max(2 << 30, floor // 10):
+                audit.record(self.cfg.state_dir, "disk_ok", free_gb=round(free / 2**30, 1))
+                self._disk_low = False
         return ok
 
     def _refuse(self, sid: str, task: str, submitter: str, split: str, kind: str,

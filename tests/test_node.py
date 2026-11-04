@@ -2523,3 +2523,24 @@ def test_a_cut_off_audit_entry_is_set_aside_not_fatal(tmp_path):
     (tmp_path / "audit.jsonl").write_text((tmp_path / "audit.jsonl").read_text() + "not json\n")
     with pytest.raises(ValueError):                      # an edited log is not "repaired"
         audit.record(tmp_path, "four")
+
+
+def test_disk_low_is_reported_once_per_episode(connected, monkeypatch):
+    """A disk hovering at the floor reported disk_low at every other step (2026-11-04): an
+    episode ends only once free space is a margin above min_free_gb."""
+    import collections
+    cfg, store, url, agent = connected
+    Usage = collections.namedtuple("Usage", "total used free")
+    free = [0]
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: Usage(1 << 40, (1 << 40) - free[0], free[0]))
+    cfg.min_free_gb = 48
+    w = Worker(cfg)
+    for gb in (47.9, 48.1, 47.8, 48.2, 47.9, 49.0, 47.5):   # flapping around the floor
+        free[0] = int(gb * 2**30)
+        w._room_on_disk(report=True)
+    free[0] = 60 << 30                                   # well clear: the episode ends
+    w._room_on_disk(report=True)
+    free[0] = 40 << 30                                   # a new episode
+    w._room_on_disk(report=True)
+    events = [json.loads(x)["event"] for x in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert [e for e in events if e in ("disk_low", "disk_ok")] == ["disk_low", "disk_ok", "disk_low"]

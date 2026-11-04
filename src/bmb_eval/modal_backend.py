@@ -79,6 +79,10 @@ CAPACITY_POLL_S = (15, 30, 60, 120)
 # exceeded", 2026-10-31).
 BUNDLE_IDLE_S = 30 * 60
 VISIBLE_POLL_S = (1, 2, 4, 8)    # between listings of a newly staged volume, jittered
+# The longest a bundle's copy into its volume may take. Staging took at most 9.5 min (a
+# 148 GB bundle) in 975 runs; a copy whose exit status Modal's client lost stalled the job
+# for 16 h with no deadline (2026-11-04).
+STAGE_TIMEOUT_S = 30 * 60
 
 
 def _must_wait(e: Exception) -> bool:
@@ -106,6 +110,26 @@ class _Infra(Exception):
 
 
 # ----------------------------------------------------------------- helpers
+
+def _within(timeout_s: float, what: str, fn):
+    """fn() in a thread of its own, waited for at most timeout_s. Modal's client can lose an
+    exec and retry its exit status forever, long after the sandbox is gone."""
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as e:
+            box["error"] = e
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        raise TimeoutError(f"{what}: no answer from Modal after {timeout_s:.0f}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
 
 def import_modal(settings=None):
     if settings is not None and settings.profile:
@@ -685,13 +709,15 @@ class ModalSandbox:
                 sb.filesystem.write_bytes(json.dumps({"blobs": root + "/blobs", "out": root + "/out",
                                                       "files": manifest}).encode(), root + RUN + "/stage.json")
                 proc = sb.exec("python", "-m", "bmb_eval.modal_stage", root + RUN + "/stage.json", text=False)
-                out = proc.stdout.read()
-                code = proc.wait()
+                out, code = _within(STAGE_TIMEOUT_S, "staging the bundle",
+                                    lambda: (proc.stdout.read(), proc.wait()))
                 status = json.loads(out.decode().strip().splitlines()[-1]) if out.strip() else {}
             finally:
                 try:
                     sb.terminate()
-                    sb.wait(raise_on_termination=False)    # its volume writes are committed on exit
+                    # Its volume writes are committed on exit.
+                    _within(WATCHDOG_GRACE_S, "stopping the staging sandbox",
+                            lambda: sb.wait(raise_on_termination=False))
                 except Exception:
                     pass
             if status.get("ok"):

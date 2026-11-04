@@ -2460,3 +2460,66 @@ def test_applied_updates_leave_the_pending_list(connected):
     assert pending_updates(cfg) == {}
     w._note_updates({"binding": 2})                          # a real new version still shows
     assert pending_updates(cfg) == {"binding": 2}
+
+
+def test_node_takes_no_job_whose_files_would_fill_the_disk(connected, monkeypatch):
+    """A node keeps min_free_gb free: a job whose model files don't fit isn't recorded, and
+    the hub hands it out again (uncounted) once there is room. On 2026-11-03 a node holding
+    156 jobs filled its disk and both nodes stopped for ~14 hours."""
+    import collections
+    cfg, store, url, agent = connected
+    Usage = collections.namedtuple("Usage", "total used free")
+    free = [1 << 40]
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: Usage(2 << 40, (2 << 40) - free[0], free[0]))
+    cfg.min_free_gb = 100
+    w = Worker(cfg)
+    w.step()
+    sid = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
+    need = sum(f["size"] for f in manifest_for(EXAMPLE_BUNDLE)["files"])
+    free[0] = (100 << 30) + need - 1                      # one byte short of keeping 100 GB free
+    w._infra_pause_until = 0
+    w.step()
+    assert not w.store.has(sid)                          # not taken, so not counted
+    assert store.q("SELECT status FROM submissions WHERE id=?", (sid,), one=True)[0] in ("queued", "assigned")
+    w.step()                                             # the hello hands it back
+    assert store.q("SELECT status FROM submissions WHERE id=?", (sid,), one=True)[0] == "queued"
+    events = [json.loads(x)["event"] for x in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert "job_deferred_disk" in events
+    free[0] = 1 << 40                                    # room again: it runs, counted once
+    w.drain()
+    assert agent.status(sid)["result"]["status"] == "ok" and w.store.count_total("agent-1", "binding") == 1
+
+
+def test_node_below_min_free_asks_for_no_work(connected, monkeypatch):
+    import collections
+    cfg, store, url, agent = connected
+    Usage = collections.namedtuple("Usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: Usage(1 << 40, (1 << 40) - (5 << 30), 5 << 30))
+    cfg.min_free_gb = 20
+    w = Worker(cfg)
+    asked = []
+    real = w.api.next
+    w.api.next = lambda **k: (asked.append(k), real(**k))[1]
+    agent.submit_async("binding", EXAMPLE_BUNDLE)
+    w.step(); w.step()
+    assert not asked
+    events = [json.loads(x)["event"] for x in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
+    assert events.count("disk_low") == 1                 # reported once, not every step
+
+
+def test_a_cut_off_audit_entry_is_set_aside_not_fatal(tmp_path):
+    """A write cut off by a full disk left a last line that wasn't JSON, and the node then
+    crashed at every start (2026-11-03). Now the tail is set aside and the chain goes on."""
+    audit.record(tmp_path, "one")
+    audit.record(tmp_path, "two")
+    with (tmp_path / "audit.jsonl").open("a") as f:
+        f.write('{"ts": "2026-11-')                       # the disk filled mid-write
+    audit.record(tmp_path, "three")
+    ok, n, msg = audit.verify(tmp_path)
+    assert ok and n == 4, msg                            # one, two, the repair note, three
+    events = [json.loads(x)["event"] for x in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    assert events == ["one", "two", "audit_tail_repaired", "three"]
+    assert [p.read_text() for p in tmp_path.glob("audit.jsonl.partial-*")] == ['{"ts": "2026-11-']
+    (tmp_path / "audit.jsonl").write_text((tmp_path / "audit.jsonl").read_text() + "not json\n")
+    with pytest.raises(ValueError):                      # an edited log is not "repaired"
+        audit.record(tmp_path, "four")

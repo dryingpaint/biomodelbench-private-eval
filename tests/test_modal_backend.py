@@ -194,6 +194,46 @@ def test_no_capacity_waits_instead_of_failing(modal_connected, monkeypatch):
     assert "modal_infra_failure" not in events
 
 
+def test_a_job_waiting_for_a_gpu_lets_go_of_its_staged_files(modal_connected, monkeypatch):
+    """Once Modal holds the bundle, the node drops its folder and lets the cache evict its
+    files while the job waits: 156 waiting jobs kept theirs and filled the disk (2026-11-03)."""
+    cfg, store, url, agent, fm = modal_connected
+    w = Worker(cfg)
+    w.cfg.cache_gb = 0                               # evict everything a held job doesn't need
+    seen = []
+    attempt = w.runner.sandbox._attempt
+
+    def first_try(plan, bundle_vol, *a, **k):
+        if bundle_vol is not None and not seen:      # predict, after staging, before any GPU
+            seen.append((plan.bundle.exists(), sorted(p.name for p in cfg.blob_dir.iterdir())))
+        return attempt(plan, bundle_vol, *a, **k)
+    monkeypatch.setattr(w.runner.sandbox, "_attempt", first_try)
+    sid = agent.submit_async("split_task", EXAMPLE_BUNDLE)["submission_id"]
+    w.drain()
+    assert agent.status(sid)["result"]["status"] == "ok"
+    assert seen == [(False, [])]
+    assert not w._assembled and not w._staged_sids
+
+
+def test_files_of_a_job_not_yet_staged_are_kept(modal_connected):
+    """Another held job of the same bundle still needs the files to stage its own run."""
+    cfg, *_ = modal_connected
+    w = Worker(cfg)
+    w.cfg.cache_gb = 0
+    files = [{"path": "predict.py", "sha256": "a" * 64, "size": 3}]
+    for sid in ("s1", "s2"):
+        (w.queue_dir / f"{sid}.json").write_text(json.dumps({"files": files}))
+    (cfg.blob_dir / ("a" * 64)).write_text("abc")
+    bundle = cfg.blob_dir.parent / "bundles" / "s1"
+    bundle.mkdir(parents=True)
+    w._assembled[bundle.resolve()] = ["s1"]
+    w._bundle_staged(bundle)
+    assert not bundle.exists() and (cfg.blob_dir / ("a" * 64)).exists()   # s2 still holds it
+    (w.queue_dir / "s2.json").unlink()
+    w._evict()
+    assert not (cfg.blob_dir / ("a" * 64)).exists()
+
+
 def test_rate_limited_staging_waits_instead_of_failing(modal_connected, monkeypatch):
     """Modal asking us to slow down (volume listings while staging a bundle) is waited
     out like missing capacity, not spent as retries."""

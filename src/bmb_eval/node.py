@@ -260,6 +260,13 @@ class Worker:
         self._fetch_lock = threading.Lock()
         self._download_slots = threading.Semaphore(MAX_DOWNLOADS)
         self._download_failures = 0       # in a row, across jobs
+        # Assembled bundle folder -> the held jobs it is for; the jobs whose bundle Modal has
+        # staged, whose model files the cache may evict (_bundle_staged).
+        self._assembled: dict[Path, list[str]] = {}
+        self._staged_sids: set[str] = set()
+        self._evict_lock = threading.Lock()
+        if hasattr(self.runner.sandbox, "on_staged"):
+            self.runner.sandbox.on_staged = self._bundle_staged
         # Set by SIGTERM/SIGINT (run_forever): when draining began. A second signal forces exit.
         self._draining: float | None = None
         self._force_exit = False
@@ -574,15 +581,41 @@ class Worker:
 
     def _evict(self) -> None:
         """Keep the cache within cache_gb, sparing every file of a job this node still
-        holds (running or waiting). Evicting only when no job ran never happened on a
-        busy node: on 2026-10-30 its 100 GB cache had grown to 176 GB and the disk to 99%."""
+        holds (running or waiting) until Modal has staged its bundle. Evicting only when no
+        job ran never happened on a busy node: on 2026-10-30 its 100 GB cache had grown to
+        176 GB and the disk to 99%."""
+        with self._fetch_lock:
+            staged = set(self._staged_sids)
         keep: set[str] = set()
+        held: set[str] = set()
         for p in self.queue_dir.glob("*.json"):
+            held.add(p.stem)
+            if p.stem in staged:
+                continue
             try:
                 keep |= {f["sha256"] for f in json.loads(p.read_text())["files"]}
             except (OSError, ValueError, KeyError, TypeError):
                 continue
-        self.cache.evict(self.cfg.cache_gb << 30, keep=keep)
+        with self._fetch_lock:
+            self._staged_sids &= held
+        with self._evict_lock:
+            self.cache.evict(self.cfg.cache_gb << 30, keep=keep)
+
+    def _bundle_staged(self, bundle: Path) -> None:
+        """Modal holds this bundle's files now: drop the folder's hard links and let the
+        cache evict the files while the job waits for a GPU, often for hours. Waiting jobs
+        kept every file: on 2026-11-03, 156 of them filled the disk. A job that needs the
+        files again (run alone after its batch failed) downloads them again, or goes back
+        to the hub uncounted."""
+        if self.cfg.retain_bundles:
+            return
+        with self._fetch_lock:
+            sids = self._assembled.get(bundle.resolve())
+            if sids is None:
+                return
+            self._staged_sids.update(sids)
+        shutil.rmtree(bundle, ignore_errors=True)
+        self._evict()
 
     def wait_jobs(self, timeout: float | None = None) -> None:
         for th, *_ in list(self._jobs.values()):
@@ -871,6 +904,8 @@ class Worker:
         """The model's files for held jobs (sid, task, submitter) of one bundle, downloaded
         if need be and assembled; None when the jobs were handed back (a download failed)
         or refused (a file failed its hash) instead."""
+        with self._fetch_lock:              # needed on disk again (e.g. run alone after a batch)
+            self._staged_sids.difference_update(sid for sid, *_ in members)
         t0 = time.time()
         try:
             if fetched := self._fetch(job["files"], downloads):
@@ -889,7 +924,16 @@ class Worker:
             self._download_failures = 0
         # Assembled next to the cache (hard links, same filesystem): the
         # confidential node keeps its state in memory but models on disk.
-        return self.cache.assemble(job["files"], self.cfg.blob_dir.parent / "bundles" / members[0][0])
+        bundle = self.cache.assemble(job["files"], self.cfg.blob_dir.parent / "bundles" / members[0][0])
+        with self._fetch_lock:
+            self._assembled[bundle.resolve()] = [sid for sid, *_ in members]
+        return bundle
+
+    def _drop_bundle(self, bundle: Path) -> None:
+        with self._fetch_lock:
+            self._assembled.pop(bundle.resolve(), None)
+        if not self.cfg.retain_bundles:
+            shutil.rmtree(bundle, ignore_errors=True)
 
     def _run(self, sid: str, task: str, submitter: str, downloads: dict) -> None:
         def evaluate() -> dict | None:
@@ -902,8 +946,7 @@ class Worker:
                                             bundle_id=job.get("bundle_id"),
                                             split=job.get("split", "validation"))
             finally:
-                if not self.cfg.retain_bundles:
-                    shutil.rmtree(bundle, ignore_errors=True)
+                self._drop_bundle(bundle)
         self._finish(sid, task, evaluate)
 
     def _run_batch(self, members: list[tuple[str, str, str]], downloads: dict) -> None:
@@ -933,8 +976,8 @@ class Worker:
         except Exception as e:
             audit.record(self.cfg.state_dir, "worker_error", run_id=members[0][0], error=type(e).__name__)
         finally:
-            if bundle is not None and not self.cfg.retain_bundles:
-                shutil.rmtree(bundle, ignore_errors=True)
+            if bundle is not None:
+                self._drop_bundle(bundle)
             for sid, task, _ in members:
                 if sid not in predicted and self.store.requeue(sid):
                     audit.record(self.cfg.state_dir, "job_unbatched", run_id=sid, task=task)

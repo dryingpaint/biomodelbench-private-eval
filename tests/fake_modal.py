@@ -54,6 +54,8 @@ class FakeModal:
         self.fail_creates = 0
         self.no_capacity = 0       # that many Sandbox.create calls find no GPU free (Modal's message)
         self.lose_execs = 0
+        self.hang_stages = 0       # that many staging execs whose exit status never comes back
+        self.unhang = threading.Event()
         self.rate_limit = 0        # that many volume listings/reads raise ResourceExhaustedError
         self.api_calls = 0         # volume listings/reads made
         # Modal's request limits (InvalidError past them), as measured on 2026-11-01.
@@ -248,6 +250,18 @@ class FakeProcess:
         return self.returncode
 
 
+class HangingProcess:
+    """An exec Modal's client lost: reading its output or exit status blocks until released."""
+
+    def __init__(self, release: threading.Event):
+        self.release = release
+        self.stdout = SimpleNamespace(read=lambda: (release.wait(), b"")[1])
+
+    def wait(self):
+        self.release.wait()
+        return 0
+
+
 class FakeSandbox:
     def __init__(self, fm: FakeModal, n: int, tags: dict):
         self.fm, self.tags = fm, tags
@@ -269,6 +283,9 @@ class FakeSandbox:
         elif args[:3] == ["python", "-m", "bmb_eval.modal_stage"]:
             self.entry = "stage"
         with self.fm._lock:
+            if self.fm.hang_stages and self.entry == "stage":
+                self.fm.hang_stages -= 1
+                return HangingProcess(self.fm.unhang)
             if self.fm.lose_execs and self.entry != "stage":
                 self.fm.lose_execs -= 1
                 raise NotFoundError("fake: sandbox not found; it has already shut down")

@@ -348,6 +348,25 @@ def test_idle_volume_is_deleted_by_the_timer(modal_connected, monkeypatch):
     assert _bundle_volumes(fm) == [] and not sb._staged
 
 
+def test_a_lost_staging_exec_times_out_and_is_staged_afresh(modal_connected, monkeypatch):
+    """Modal's client can lose a staging exec and wait for its exit status forever: the
+    staging gives up after STAGE_TIMEOUT_S, its volume is deleted, and the job's retry
+    stages the bundle afresh instead of holding the job (2026-11-04: 16 h)."""
+    cfg, *_, fm = modal_connected
+    monkeypatch.setattr(modal_backend, "STAGE_TIMEOUT_S", 0.5)
+    fm.hang_stages = 1
+    try:
+        t0 = time.time()
+        assert Runner(cfg, send_alerts=False).evaluate("split_task", pack_dir(EXAMPLE_BUNDLE))["status"] == "ok"
+        assert time.time() - t0 < 60
+    finally:
+        fm.unhang.set()
+    staged = [r["volumes"]["/out"][0] for r in _stage_records(fm, "stage")]
+    mounted = {r["volumes"]["/bundle"][0] for r in _stage_records(fm, "predict")}
+    assert len(staged) == 2 and staged[0] not in mounted and staged[1] in mounted
+    assert staged[0] not in _bundle_volumes(fm)
+
+
 def test_a_failed_staging_is_never_mounted(modal_connected, monkeypatch):
     """Files that never became visible: the jobs waiting on that staging fail (and are
     retried), the half-staged volume is deleted, and the bundle is staged afresh."""

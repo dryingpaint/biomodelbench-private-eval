@@ -317,6 +317,53 @@ def _widen_node_tasks(db: sqlite3.Connection) -> None:
     db.execute("DROP TABLE node_tasks_old")
 
 
+LOCAL_BACKUPS = 5            # hub.db.bak-* copies kept next to hub.db
+OFFSITE_PREFIX = "hub-backups/"
+
+
+def local_backup(db: sqlite3.Connection, state: Path, label: str) -> Path:
+    """A copy of hub.db next to it, before a change that deletes rows; keeps the newest
+    LOCAL_BACKUPS. Nothing pruned them: by 2026-11-04, 55 copies (one per retired task,
+    315 MB each) held 16 GB of the hub's 96 GB disk."""
+    path = state / f"hub.db.bak-{time.strftime('%Y%m%d-%H%M%S')}-{label}"
+    dst = sqlite3.connect(path)
+    try:
+        db.backup(dst)
+    finally:
+        dst.close()
+    for old in sorted(state.glob("hub.db.bak-*"), key=lambda p: p.stat().st_mtime)[:-LOCAL_BACKUPS]:
+        old.unlink(missing_ok=True)
+    return path
+
+
+def offsite_backup(store: "HubStore", bucket: str, client=None) -> str:
+    """Copy hub.db to gs://<bucket>/hub-backups/, checked and gzipped; returns its URL.
+    Until 2026-11-04 the only copies were on the hub's own disk. The model bucket's
+    lifecycle rule (deploy/gcp/lifecycle.json) deletes them after 30 days."""
+    tmp = store.state / "hub.db.offsite.tmp"
+    try:
+        dst = sqlite3.connect(tmp)
+        try:
+            with store._conn() as db:
+                db.backup(dst)
+            if (ok := dst.execute("PRAGMA integrity_check").fetchone()[0]) != "ok":
+                raise RuntimeError(f"the copy failed its integrity check: {ok}")
+        finally:
+            dst.close()
+        name = f"{OFFSITE_PREFIX}hub-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}.db.gz"
+        with open(tmp, "rb") as f:
+            data = gzip.compress(f.read(), mtime=0)
+        if client is None:
+            from google.cloud import storage
+            client = storage.Client()
+        client.bucket(bucket).blob(name).upload_from_string(data, content_type="application/gzip")
+    finally:
+        tmp.unlink(missing_ok=True)
+    store.set_setting("last_offsite_backup", {"at": time.time(), "url": f"gs://{bucket}/{name}",
+                                              "bytes": len(data)})
+    return f"gs://{bucket}/{name}"
+
+
 class HubStore:
     """hub.db, shared by the HTTP server's request threads (one per request) and its background
     loops. Each call borrows a pooled connection, and WAL lets reads run alongside a write. On
@@ -332,9 +379,7 @@ class HubStore:
             db.executescript(SCHEMA)
             if "manifest" in _columns(db, "submissions"):
                 # Before moving manifests out: the move rewrites the biggest table in place.
-                bak = sqlite3.connect(state / f"hub.db.bak-{time.strftime('%Y%m%d-%H%M%S')}-manifests")
-                db.backup(bak)
-                bak.close()
+                local_backup(db, state, "manifests")
         moved = 0
         # One transaction, so a `bmb-hub` command started alongside a starting hub waits and
         # then finds the work done, and a failure leaves the database as it was.
@@ -709,10 +754,8 @@ class HubStore:
         }
         if not apply:
             return counts
-        backup = sqlite3.connect(self.state / f"hub.db.bak-{time.strftime('%Y%m%d-%H%M%S')}-retire-{task}")
         with self._conn() as db:
-            db.backup(backup)
-        backup.close()
+            local_backup(db, self.state, f"retire-{task}")
         with self.tx() as db:
             db.execute(f"DELETE FROM setup_reports WHERE code IN ({marks})", codes)
             db.execute("DELETE FROM enrollments WHERE task=?", (task,))
@@ -1634,6 +1677,9 @@ def main(argv=None) -> None:
     p.add_argument("task")
     p.add_argument("--yes", action="store_true", help="really remove it (hub.db is backed up first)")
 
+    p = sub.add_parser("backup", help="copy hub.db to Cloud Storage (daily, from a systemd timer)")
+    p.add_argument("--bucket", required=True)
+
     p = sub.add_parser("revoke", help="cancel an unused connect code")
     p.add_argument("code")
 
@@ -1756,6 +1802,13 @@ def main(argv=None) -> None:
         print(f"alerts go to {url[:40] + '...' if url else 'nowhere (set --webhook URL)'}")
         if args.test:
             alert(store, "test alert from bmb-hub alerts --test")
+    elif args.cmd == "backup":
+        try:
+            url = offsite_backup(store, args.bucket)
+        except Exception as e:
+            alert(store, f"hub.db backup to gs://{args.bucket} failed: {type(e).__name__}: {str(e)[:200]}")
+            raise SystemExit(1)
+        print(f"backed up hub.db to {url}")
     elif args.cmd == "retire":
         if not store.q("SELECT 1 FROM enrollments WHERE task=? UNION SELECT 1 FROM node_tasks WHERE task=?",
                        (args.task, args.task)):
@@ -1822,6 +1875,9 @@ def main(argv=None) -> None:
             f"stamp {img['stamp'] or 'unstamped'}" + (
                 " (current)" if img["current"] else
                 f" (STALE: this code expects {sandbox_stamp(root)}; run deploy/gcp/hub deploy)")))
+        b = store.setting("last_offsite_backup")
+        print("hub.db backup: " + (f"{b['url']}, {(now - b['at']) / 3600:.0f} h ago" if b else
+                                   "never (the bmb-hub-backup timer runs `bmb-hub backup` daily)"))
         for nid, name, seen, acc, st in store.q("SELECT id, name, last_seen, accepting, status FROM nodes"):
             age = f"{int(now - seen)}s ago" if seen else "never"
             tasks = [r[0] for r in store.q("SELECT task FROM node_tasks WHERE node_id=?", (nid,))]

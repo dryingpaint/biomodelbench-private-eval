@@ -63,6 +63,37 @@ UNIT
 if ! cmp -s "$UNIT_FILE.new" "$UNIT_FILE"; then mv "$UNIT_FILE.new" "$UNIT_FILE"; systemctl daemon-reload
 else rm -f "$UNIT_FILE.new"; fi
 
+# hub.db to Cloud Storage once a day (gs://$BUCKET/hub-backups/, deleted after 30 days by the
+# bucket's lifecycle rule). A failed backup alerts; `bmb-hub status` shows the last one.
+cat > /etc/systemd/system/bmb-hub-backup.service.new <<UNIT
+[Unit]
+Description=BioModelBench hub.db backup to Cloud Storage
+
+[Service]
+Type=oneshot
+User=bmb
+WorkingDirectory=$CODE
+ExecStart=$CODE/.venv/bin/bmb-hub --state $STATE backup --bucket $BUCKET
+UNIT
+cat > /etc/systemd/system/bmb-hub-backup.timer.new <<UNIT
+[Unit]
+Description=Daily hub.db backup
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+for f in bmb-hub-backup.service bmb-hub-backup.timer; do
+  if ! cmp -s "/etc/systemd/system/$f.new" "/etc/systemd/system/$f"; then
+    mv "/etc/systemd/system/$f.new" "/etc/systemd/system/$f"; systemctl daemon-reload
+  else rm -f "/etc/systemd/system/$f.new"; fi
+done
+systemctl enable -q --now bmb-hub-backup.timer
+
 # Model files go straight to Cloud Storage, so the hub only sees small JSON
 # bodies plus the provider downloads it serves (install script, image).
 # While the hub restarts (about a second on a deploy), Caddy holds requests and retries

@@ -3,9 +3,11 @@ a node asks, abandoned uploads dropped, concurrent polls, and the move of manife
 out of older hub.db files."""
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -314,3 +316,53 @@ def test_reads_are_not_held_up_by_a_write(tmp_path):
     release.set()
     t.join()
     assert store.q("SELECT eval_budget FROM agents", one=True)[0] == 5
+
+
+# ------------------------------------------------------------------ backups
+
+def test_local_backups_keep_only_the_newest(tmp_path):
+    store = hub_mod.HubStore(tmp_path)
+    old = []
+    for i in range(hub_mod.LOCAL_BACKUPS + 2):
+        p = tmp_path / f"hub.db.bak-2026100{i}-old"
+        p.write_bytes(b"x")
+        os.utime(p, (1000 + i, 1000 + i))
+        old.append(p)
+    with store._conn() as db:
+        new = hub_mod.local_backup(db, tmp_path, "retire-t")
+    left = sorted(tmp_path.glob("hub.db.bak-*"))
+    assert len(left) == hub_mod.LOCAL_BACKUPS and new in left
+    assert set(left) - {new} == set(old[-(hub_mod.LOCAL_BACKUPS - 1):])
+    assert sqlite3.connect(new).execute("SELECT COUNT(*) FROM nodes").fetchone() == (0,)
+
+
+class _Bucket:
+    def __init__(self):
+        self.objects = {}
+
+    def bucket(self, name):
+        outer = self
+
+        class B:
+            def blob(self, key):
+                class O:
+                    def upload_from_string(self, data, content_type=None):
+                        outer.objects[f"{name}/{key}"] = data
+                return O()
+        return B()
+
+
+def test_offsite_backup_uploads_a_checked_copy(tmp_path):
+    store = hub_mod.HubStore(tmp_path)
+    store.set_setting("alerts", {"webhook": "https://example.invalid/x"})
+    gcs = _Bucket()
+    url = hub_mod.offsite_backup(store, "bkt", client=gcs)
+    (key, data), = gcs.objects.items()
+    assert url == f"gs://{key}" and key.startswith("bkt/hub-backups/hub-") and key.endswith(".db.gz")
+    restored = tmp_path / "restored.db"
+    restored.write_bytes(gzip.decompress(data))
+    db = sqlite3.connect(restored)
+    assert db.execute("SELECT value FROM settings WHERE key='alerts'").fetchone()
+    assert not (tmp_path / "hub.db.offsite.tmp").exists()
+    assert store.setting("last_offsite_backup")["url"] == url
+    assert not list(tmp_path.glob("hub.db.bak-*"))          # local copies untouched

@@ -287,6 +287,9 @@ class ModalSandbox:
         self._staged: dict[str, _Staged] = {}      # bundle digest -> its staged volume
         self._staged_lock = threading.Lock()
         self._sweep_timer: threading.Timer | None = None
+        # Called with a bundle's local folder once its files are staged on Modal: the node
+        # lets go of its copy (the job may then wait hours for a GPU).
+        self.on_staged = None
         # Each staging gets a volume name never used before, so a volume being deleted (idle,
         # or failed) is never the one a new staging writes, and two processes of one node
         # (the node, a selftest) never share one.
@@ -421,6 +424,12 @@ class ModalSandbox:
                 try:
                     if plan.bundle is not None and held is None:
                         held = self._hold_bundle(plan.bundle, name)
+                        if self.on_staged is not None:
+                            try:
+                                self.on_staged(plan.bundle)
+                            except Exception as e:
+                                audit.record(self.cfg.state_dir, "worker_error", stage=name,
+                                             error=f"on_staged: {type(e).__name__}")
                     r = self._attempt(plan, held and held[1].volume, entry, env, limits, timeout_s,
                                       stdout_cap, stdin, gpus)
                     if waits:

@@ -246,6 +246,13 @@ class Worker:
         self._modal_check_failures = 0
         self._modal_lock_mtime: float | None = None
         self._infra_pause_until = 0.0     # after a lost sandbox: don't take new work until then
+        # Model files jobs this node took still have to download (sha -> size): counted as used
+        # disk when deciding whether another job fits (_room_on_disk).
+        self._pending_files: dict[str, int] = {}
+        self._disk_low = False
+        # Size of the last job turned away for lack of disk: no work is asked for until it
+        # fits, or the hub would hand the same (oldest) job back at every poll.
+        self._deferred_need = 0
         self._modal_alerted: str | None = None
         # Model files being downloaded: sha256 -> set once that download ends, so a second
         # job needing the same file waits for it rather than fetching it again.
@@ -438,7 +445,8 @@ class Worker:
             # No download links: a file evicted since is fetched by handing the job back.
             self._dispatch(*local, self._need(local[0], local[1]), {})
             return True
-        if not accepting or time.time() < self._infra_pause_until:
+        if (not accepting or time.time() < self._infra_pause_until
+                or not self._room_on_disk(self._deferred_need)):
             return did
         job = self.api.next()
         if job:
@@ -725,6 +733,20 @@ class Worker:
         if refusal:
             self._refuse(sid, task, submitter, split, kind, refusal, new=True)
             return None
+        # A job whose model files don't fit isn't recorded: the next hello doesn't report it
+        # held, so the hub hands it out again (uncounted) once this node, or another, has room.
+        with self._fetch_lock:
+            missing = {f["sha256"]: f["size"] for f in files
+                       if not self.cache.has(f["sha256"], f["size"]) and f["sha256"] not in self._pending_files}
+        if not self._room_on_disk(sum(missing.values())):
+            audit.record(self.cfg.state_dir, "job_deferred_disk", run_id=sid, task=task,
+                         need_gb=round(sum(missing.values()) / 2**30, 1))
+            self._deferred_need = sum(missing.values())
+            self._last_hello = 0.0
+            return None
+        self._deferred_need = 0
+        with self._fetch_lock:
+            self._pending_files.update(missing)
         # Taking a job is cheap: record it (so the next hello reports it held); its thread
         # (_start) downloads what this machine hasn't cached and then runs it. A
         # multi-GB download here used to stall the whole node: no new jobs, no results
@@ -737,6 +759,27 @@ class Worker:
                      bytes=sum(f["size"] for f in files))
         self.store.start(sid)
         return float(lim.cpus), mem_bytes(lim.memory), int(lim.gpus)
+
+    def _free_bytes(self) -> int:
+        """Free disk at the cache, less what taken jobs still have to download."""
+        with self._fetch_lock:
+            self._pending_files = {s: n for s, n in self._pending_files.items() if not self.cache.has(s, n)}
+            pending = sum(self._pending_files.values())
+        return shutil.disk_usage(self.cfg.blob_dir).free - pending
+
+    def _room_on_disk(self, need: int = 0) -> bool:
+        """Whether `need` more bytes of model files leave min_free_gb free. The node used to
+        take jobs whatever the disk held: on 2026-11-03 a Modal node holding 156 jobs (10
+        bundles, waiting for GPUs) filled the shared 484 GB disk, a half-written audit log
+        then crashed it at every start, and both nodes took no work for about 14 hours."""
+        ok = self._free_bytes() - need >= self.cfg.min_free_gb << 30
+        if not ok and not self._disk_low:
+            audit.record(self.cfg.state_dir, "disk_low", free_gb=round(self._free_bytes() / 2**30, 1),
+                         need_gb=round(need / 2**30, 1), min_free_gb=self.cfg.min_free_gb)
+            alerts.send(self.cfg, "infra", "not taking work: the disk is too full for more model files "
+                        f"(keeping {self.cfg.min_free_gb} GB free)")
+        self._disk_low = not ok
+        return ok
 
     def _refuse(self, sid: str, task: str, submitter: str, split: str, kind: str,
                 refusal: EvalError, new: bool) -> None:

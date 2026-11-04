@@ -29,5 +29,7 @@ def sequence_data(dest: Path, n: int = 500, seed: int = 1) -> tuple[Path, Path]:
 def _any_free_disk(monkeypatch):
     """`connect` stops when this machine has under 20 GB free; tests connect on whatever
     machine runs them. test_ops_tooling.py checks the threshold itself on a faked disk."""
-    from bmb_eval import cli
+    from bmb_eval import cli, config
     monkeypatch.setattr(cli, "MIN_FREE_GB", 0)
+    # Nodes keep min_free_gb free before taking work; tests use whatever disk they run on.
+    monkeypatch.setattr(config, "default_min_free_gb", lambda blob_dir: 0)

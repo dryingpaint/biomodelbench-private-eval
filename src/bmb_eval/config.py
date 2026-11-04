@@ -25,6 +25,15 @@ def default_cache_gb(blob_dir: Path) -> int:
     return max(1, min(CACHE_GB, (shutil.disk_usage(p).total >> 30) // 2))
 
 
+def default_min_free_gb(blob_dir: Path) -> int:
+    """Free disk the node keeps: it takes no job whose model files would leave less. 10% of
+    the disk holding the cache, at least 20 GB."""
+    p = blob_dir
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return max(20, (shutil.disk_usage(p).total >> 30) // 10)
+
+
 @dataclass
 class TaskBinding:
     id: str
@@ -85,6 +94,7 @@ class Config:
     infra_failure_threshold: int
     retain_bundles: bool
     cache_gb: int      # model-file cache size before least-recently-used files go
+    min_free_gb: int   # free disk kept: no job is taken whose model files would leave less
     # Evaluations run at once (each admitted only when its contract's CPUs, memory and GPUs
     # fit what is free). 1 (the default) runs them one at a time, as nodes always have.
     max_parallel: int
@@ -138,6 +148,8 @@ class Config:
             infra_failure_threshold=int(al.get("infra_failure_threshold", 3)),
             retain_bundles=bool(raw.get("retain_bundles", False)),
             cache_gb=int(raw["cache_gb"]) if raw.get("cache_gb") is not None else default_cache_gb(blob_dir),
+            min_free_gb=(int(raw["min_free_gb"]) if raw.get("min_free_gb") is not None
+                         else default_min_free_gb(blob_dir)),
             max_parallel=max(1, int(raw.get("max_parallel", 1))),
             hub=dict(raw.get("hub") or {}),
             blob_dir=blob_dir,

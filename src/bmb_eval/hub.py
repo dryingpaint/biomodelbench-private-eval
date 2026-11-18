@@ -469,7 +469,8 @@ class HubStore:
         return row[0] if row else None
 
     def operator_status(self, recent: int = 50) -> dict:
-        """Nodes, the submission queue by task/split/status, and the latest submissions."""
+        """Nodes, the submission queue by task/split/status, the latest submissions, families
+        and connect codes."""
         nodes = []
         for nid, name, seen, acc in self.q("SELECT id, name, last_seen, accepting FROM nodes"):
             nodes.append({"id": nid, "name": name, "last_seen": seen, "accepting": bool(acc),
@@ -480,8 +481,13 @@ class HubStore:
         rec = [{"id": i, "task": t, "split": sp, "status": st, "agent": a, "created": c}
                for i, t, sp, st, a, c in self.q("SELECT id, task, split, status, agent, created FROM submissions "
                                                 "ORDER BY created DESC LIMIT ?", (recent,))]
+        # What's registered: families, and each connect code's task and whether it was used
+        # (not the code itself, which still connects a machine while unused).
+        fams = [{"name": n, "tasks": t} for n, t in self.families().items()]
+        enr = [{"task": t, "created": c, "used": bool(u)}
+               for t, c, u in self.q("SELECT task, created, used_by FROM enrollments ORDER BY created")]
         return {"now": time.time(), "nodes": nodes, "submissions": subs, "recent": rec,
-                "setup_problems": self.setup_problems()}
+                "families": fams, "enrollments": enr, "setup_problems": self.setup_problems()}
 
     def is_operator(self, token: str) -> bool:
         op = self.setting("operator")

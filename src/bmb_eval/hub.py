@@ -57,6 +57,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (name TEXT PRIMARY KEY, token_sha256 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS families (name TEXT PRIMARY KEY, tasks TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS task_tags (      -- operator labels (provider, "sample"); not shown to agents
+    task TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY (task, tag));
 CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY, secret_sha256 TEXT NOT NULL, name TEXT NOT NULL,
     created REAL NOT NULL, last_seen REAL, accepting INTEGER NOT NULL DEFAULT 0);
@@ -86,6 +88,7 @@ SETUP_REASONS = {"data_problem", "declined", "machine_not_ready", "selftest_fail
                  "gcloud_not_ready", "gcloud_refused", "region_blocked", "tls", "hub_error",
                  "interrupted", "stopped", "crashed"}
 SETUP_DETAIL_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,39}")
+TAG_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,39}")
 # Release files the provider install needs from GitHub (uv, and the Python uv installs),
 # passed through and cached: providers' networks often allow this hub but not GitHub.
 # Only these two repositories' release assets; uv checks Python downloads' hashes itself.
@@ -487,7 +490,8 @@ class HubStore:
         enr = [{"task": t, "created": c, "used": bool(u)}
                for t, c, u in self.q("SELECT task, created, used_by FROM enrollments ORDER BY created")]
         return {"now": time.time(), "nodes": nodes, "submissions": subs, "recent": rec,
-                "families": fams, "enrollments": enr, "setup_problems": self.setup_problems()}
+                "families": fams, "tags": self.tags(), "enrollments": enr,
+                "setup_problems": self.setup_problems()}
 
     def is_operator(self, token: str) -> bool:
         op = self.setting("operator")
@@ -606,6 +610,26 @@ class HubStore:
 
     def families(self) -> dict[str, list[str]]:
         return {n: json.loads(t) for n, t in self.q("SELECT name, tasks FROM families ORDER BY name")}
+
+    # --------------------------------------------------------------- tags
+
+    def add_tags(self, task: str, tags: list[str]) -> None:
+        bad = [t for t in tags if not TAG_RE.fullmatch(t)]
+        if bad:
+            raise ValueError(f"tags are lowercase letters, digits, '_', '.', '-' (up to 40): {bad}")
+        with self.tx() as db:
+            db.executemany("INSERT OR IGNORE INTO task_tags VALUES (?,?)", [(task, t) for t in tags])
+
+    def remove_tags(self, task: str, tags: list[str]) -> None:
+        with self.tx() as db:
+            db.executemany("DELETE FROM task_tags WHERE task=? AND tag=?", [(task, t) for t in tags])
+
+    def tags(self) -> dict[str, list[str]]:
+        """{task: [tags]} for every tagged task."""
+        out: dict[str, list[str]] = {}
+        for task, tag in self.q("SELECT task, tag FROM task_tags ORDER BY task, tag"):
+            out.setdefault(task, []).append(tag)
+        return out
 
     def group_view(self, gid: str, agent: str | None = None) -> dict | None:
         """A family submission: per-dataset results plus an equal-weight combined
@@ -741,7 +765,7 @@ class HubStore:
 
     def retire(self, task: str, apply: bool = False) -> dict[str, int]:
         """Remove a task from the hub: its codes, its node binding, unfinished
-        submissions, family membership, setup reports, and any node left serving
+        submissions, family membership, tags, setup reports, and any node left serving
         nothing. Finished results stay as history. Dry run unless `apply`; with it,
         hub.db is backed up first. Returns how many of each would go (or went)."""
         codes = [r[0] for r in self.q("SELECT code FROM enrollments WHERE task=?", (task,))]
@@ -755,6 +779,7 @@ class HubStore:
             "unfinished submissions": self.q("SELECT COUNT(*) FROM submissions WHERE task=? AND status<>'done'",
                                              (task,), one=True)[0],
             "families": sum(task in t for t in self.families().values()),
+            "tags": len(self.tags().get(task, [])),
             "setup reports": self.q(f"SELECT COUNT(*) FROM setup_reports WHERE code IN ({marks})", codes,
                                     one=True)[0],
             "nodes left serving nothing": len(orphans),
@@ -767,6 +792,7 @@ class HubStore:
             db.execute(f"DELETE FROM setup_reports WHERE code IN ({marks})", codes)
             db.execute("DELETE FROM enrollments WHERE task=?", (task,))
             db.execute("DELETE FROM node_tasks WHERE task=?", (task,))
+            db.execute("DELETE FROM task_tags WHERE task=?", (task,))
             db.execute("DELETE FROM submissions WHERE task=? AND status<>'done'", (task,))
             _prune_manifests(db)
         for name, tasks in self.families().items():
@@ -1703,6 +1729,11 @@ def main(argv=None) -> None:
     p.add_argument("name", nargs="?")
     p.add_argument("tasks", nargs="*")
 
+    p = sub.add_parser("tag", help="label tasks (e.g. provider, sample); operator-only, agents never see them")
+    p.add_argument("action", choices=["add", "rm", "list"])
+    p.add_argument("task", nargs="?", help="for list: show only tasks with this tag")
+    p.add_argument("tags", nargs="*")
+
     sub.add_parser("status", help="nodes, tasks and queue")
 
     p = sub.add_parser("confidential-image", help="publish the sealed-node image providers approve")
@@ -1847,6 +1878,25 @@ def main(argv=None) -> None:
         else:
             for n, t in store.families().items():
                 print(f"{n}: {', '.join(t)}")
+    elif args.cmd == "tag":
+        if args.action == "list":
+            for task, tags in store.tags().items():
+                if args.task is None or args.task in tags:
+                    print(f"{task}: {', '.join(tags)}")
+        else:
+            if not args.task or not args.tags:
+                raise SystemExit(f"usage: bmb-hub tag {args.action} <task> <tag> [<tag> ...]")
+            if args.action == "add":
+                if not store.q("SELECT 1 FROM enrollments WHERE task=? UNION SELECT 1 FROM node_tasks WHERE task=?",
+                               (args.task, args.task)):
+                    raise SystemExit(f"No task {args.task!r} on this hub.")
+                try:
+                    store.add_tags(args.task, args.tags)
+                except ValueError as e:
+                    raise SystemExit(str(e))
+            else:
+                store.remove_tags(args.task, args.tags)
+            print(f"{args.task}: {', '.join(store.tags().get(args.task, [])) or '(no tags)'}")
     elif args.cmd == "confidential-image":
         if "@sha256:" not in args.image:
             raise SystemExit("give the image by digest: registry/path@sha256:...")
@@ -1895,6 +1945,8 @@ def main(argv=None) -> None:
         for task, split, status, n in store.q(
                 "SELECT task, split, status, COUNT(*) FROM submissions GROUP BY 1, 2, 3"):
             print(f"task {task}: {split} {status} {n}")
+        for task, tags in store.tags().items():
+            print(f"tags {task}: {', '.join(tags)}")
         for prob in store.setup_problems(now):
             when = time.strftime('%m-%d %H:%M', time.gmtime(prob["at"]))
             if prob["kind"] == "failed":

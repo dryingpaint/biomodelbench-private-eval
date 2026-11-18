@@ -1155,6 +1155,27 @@ def test_family_results_command(family, capsys):
     assert gid in out and "combined=" in out and out.count("final ") == 2
 
 
+def test_tags_label_tasks_for_the_operator_only(connected, capsys):
+    cfg, store, url, agent = connected
+    state = str(store.state)
+    hub_mod.main(["--state", state, "tag", "add", "binding", "gctx", "sample"])
+    hub_mod.main(["--state", state, "tag", "add", "binding", "sample"])          # adding twice is a no-op
+    assert store.tags() == {"binding": ["gctx", "sample"]}
+    with pytest.raises(SystemExit, match="No task"):
+        hub_mod.main(["--state", state, "tag", "add", "nope", "gctx"])
+    with pytest.raises(SystemExit, match="lowercase"):
+        hub_mod.main(["--state", state, "tag", "add", "binding", "Bad Tag"])
+    capsys.readouterr()
+    hub_mod.main(["--state", state, "tag", "list", "gctx"])
+    assert capsys.readouterr().out == "binding: gctx, sample\n"
+    hub_mod.main(["--state", state, "tag", "list", "other"])
+    assert capsys.readouterr().out == ""
+    assert store.operator_status()["tags"] == {"binding": ["gctx", "sample"]}
+    assert "tags" not in json.dumps(agent.tasks())                              # agents never see them
+    hub_mod.main(["--state", state, "tag", "rm", "binding", "sample"])
+    assert store.tags() == {"binding": ["gctx"]}
+
+
 def test_unbudgeted_tokens_still_work(connected):
     cfg, store, url, agent = connected
     assert agent.tasks()["budget"] == {"evaluations": None, "used": 0}
@@ -2207,9 +2228,11 @@ def test_retire_removes_a_task_but_keeps_results(connected, tmp_path, capsys):
     w.drain()
     pending = agent.submit_async("binding", EXAMPLE_BUNDLE)["submission_id"]
     store.set_family("fam", ["binding", "other"])
+    store.add_tags("binding", ["sample"])
     code = store.code_for("binding")
     dry = store.retire("binding")
     assert dry["codes"] == 1 and dry["unfinished submissions"] == 1 and dry["nodes left serving nothing"] == 1
+    assert dry["tags"] == 1
     assert store.code_for("binding") == code                          # dry run changed nothing
     store.retire("binding", apply=True)
     assert store.code_for("binding") is None and store.enrollment(code) is None
@@ -2218,6 +2241,7 @@ def test_retire_removes_a_task_but_keeps_results(connected, tmp_path, capsys):
     assert store.q("SELECT 1 FROM submissions WHERE id=?", (pending,), one=True) is None
     assert store.families() == {"fam": ["other"]}
     assert store.q("SELECT COUNT(*) FROM nodes", one=True)[0] == 0
+    assert store.tags() == {}
     assert list(store.state.glob("hub.db.bak-*-retire-binding"))      # backed up first
 
 

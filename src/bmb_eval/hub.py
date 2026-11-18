@@ -57,6 +57,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS agents (name TEXT PRIMARY KEY, token_sha256 TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS families (name TEXT PRIMARY KEY, tasks TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS providers (       -- who provides each task's data (operator bookkeeping)
+    task TEXT PRIMARY KEY, name TEXT NOT NULL, set_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY, secret_sha256 TEXT NOT NULL, name TEXT NOT NULL,
     created REAL NOT NULL, last_seen REAL, accepting INTEGER NOT NULL DEFAULT 0);
@@ -469,8 +471,8 @@ class HubStore:
         return row[0] if row else None
 
     def operator_status(self, recent: int = 50) -> dict:
-        """Nodes, the submission queue by task/split/status, the latest submissions, families
-        and connect codes."""
+        """Nodes, the submission queue by task/split/status, the latest submissions, families,
+        connect codes and who provides each task."""
         nodes = []
         for nid, name, seen, acc in self.q("SELECT id, name, last_seen, accepting FROM nodes"):
             nodes.append({"id": nid, "name": name, "last_seen": seen, "accepting": bool(acc),
@@ -487,7 +489,8 @@ class HubStore:
         enr = [{"task": t, "created": c, "used": bool(u)}
                for t, c, u in self.q("SELECT task, created, used_by FROM enrollments ORDER BY created")]
         return {"now": time.time(), "nodes": nodes, "submissions": subs, "recent": rec,
-                "families": fams, "enrollments": enr, "setup_problems": self.setup_problems()}
+                "families": fams, "enrollments": enr, "providers": self.providers(),
+                "setup_problems": self.setup_problems()}
 
     def is_operator(self, token: str) -> bool:
         op = self.setting("operator")
@@ -606,6 +609,23 @@ class HubStore:
 
     def families(self) -> dict[str, list[str]]:
         return {n: json.loads(t) for n, t in self.q("SELECT name, tasks FROM families ORDER BY name")}
+
+    def set_provider(self, name: str, tasks: list[str]) -> list[str]:
+        """Record who provides each task's data (a family name stands for its tasks); an
+        empty name clears the record. Kept when a task is retired, as history. Returns the
+        tasks it set."""
+        fams = self.families()
+        out = list(dict.fromkeys(t for x in tasks for t in fams.get(x, [x])))
+        with self.tx() as db:
+            for t in out:
+                if name:
+                    db.execute("INSERT OR REPLACE INTO providers VALUES (?,?,?)", (t, name, time.time()))
+                else:
+                    db.execute("DELETE FROM providers WHERE task=?", (t,))
+        return out
+
+    def providers(self) -> dict[str, str]:
+        return dict(self.q("SELECT task, name FROM providers ORDER BY task"))
 
     def group_view(self, gid: str, agent: str | None = None) -> dict | None:
         """A family submission: per-dataset results plus an equal-weight combined
@@ -1671,6 +1691,7 @@ def main(argv=None) -> None:
     p.add_argument("--public-url", required=True)
     p.add_argument("--replace", action="store_true",
                    help="replace an existing task's package even though it differs")
+    p.add_argument("--provider", help="who provides the data, e.g. the company (see `provider`)")
 
     p = sub.add_parser("add-node", help="a connect code that adds another node to an enrolled task")
     p.add_argument("task")
@@ -1697,6 +1718,10 @@ def main(argv=None) -> None:
     p.add_argument("--baseline", action="store_true",
                    help="a token for BioModelBench's own reference model: its finals count against "
                         "the task's baseline_final_evaluations, not the agents' final_evaluations")
+
+    p = sub.add_parser("provider", help="record who provides each task's data (a family = its tasks)")
+    p.add_argument("action", choices=["set", "unset", "list"])
+    p.add_argument("args", nargs="*", help="set: <name> <task or family>...; unset: <task or family>...")
 
     p = sub.add_parser("family", help="group tasks so one submission is scored on all of them")
     p.add_argument("action", choices=["set", "list"])
@@ -1781,6 +1806,8 @@ def main(argv=None) -> None:
                     f"again with --replace. Use another task id for a separate task.")
         code, c = store.add_enrollment(Path(args.task_dir))
         version = store.enrollment(code)[3]
+        if args.provider:
+            store.set_provider(args.provider, [c.id])
         if not existing or not used:
             if existing:
                 print(f"(updated task {c.id} to version {version}; same code)\n")
@@ -1838,6 +1865,22 @@ def main(argv=None) -> None:
         print(store.set_operator())
     elif args.cmd == "agent-token":
         print(store.add_agent(args.name, args.evaluations, "baseline" if args.baseline else "agent"))
+    elif args.cmd == "provider":
+        if args.action == "list":
+            known = store.providers()
+            tasks = sorted(set(known) | {r[0] for r in store.q("SELECT task FROM node_tasks UNION "
+                                                               "SELECT task FROM enrollments")})
+            for t in tasks:
+                print(f"{t}: {known.get(t, '(unknown)')}")
+        elif args.action == "set":
+            if len(args.args) < 2:
+                raise SystemExit("usage: bmb-hub provider set <name> <task or family> [...]")
+            done = store.set_provider(args.args[0], args.args[1:])
+            print(f"{args.args[0]}: {', '.join(done)}")
+        else:
+            if not args.args:
+                raise SystemExit("usage: bmb-hub provider unset <task or family> [...]")
+            print(f"cleared: {', '.join(store.set_provider('', args.args))}")
     elif args.cmd == "family":
         if args.action == "set":
             if not args.name or not args.tasks:

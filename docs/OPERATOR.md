@@ -90,8 +90,10 @@ Run from your laptop; they execute on the hub VM:
 
 ```bash
 deploy/gcp/hub agent-token attempt-17 --evaluations 40   # one token per attempt, with its evaluation budget
-deploy/gcp/hub enroll examples/tasks/sequence_regression  # prints the provider email
+deploy/gcp/hub enroll examples/tasks/sequence_regression --provider "Acme Bio"  # prints the provider email
 deploy/gcp/hub family set admet admet_ism admet_labx      # group datasets for one run
+deploy/gcp/hub provider set "Acme Bio" admet_labx         # who provides the data (a family = its tasks)
+deploy/gcp/hub provider list                              # every task and its provider, or (unknown)
 deploy/gcp/hub final <submission_id>                      # held-out test runs (every dataset, for a family)
 deploy/gcp/hub results <task or family>                   # all scores, including finals
 deploy/gcp/hub revoke <code>                              # cancel an unused connect code

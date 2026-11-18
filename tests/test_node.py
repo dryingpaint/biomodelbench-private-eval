@@ -1603,6 +1603,8 @@ def test_operator_issues_tokens_and_runs_finals_over_the_api(family):
     st = op._req("GET", "/v1/operator/status")
     assert {"nodes", "submissions", "recent", "now"} <= set(st)
     assert all({"id", "name", "last_seen", "accepting", "tasks"} <= set(n) for n in st["nodes"])
+    assert {"name": "fitness", "tasks": ["fit_lab_a", "fit_lab_b"]} in st["families"]
+    assert all(set(e) == {"task", "created", "used"} for e in st["enrollments"])   # never the code
     run = Client(url, tok["token"])
     assert run.tasks()["budget"] == {"evaluations": 2, "used": 0}
     assert op.agent_token("run-1", 2)["error"]["code"] == "name_taken"   # a live token isn't cut off

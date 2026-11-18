@@ -2335,6 +2335,34 @@ def test_second_node_needs_its_own_code(hub, tmp_path, provider_files):
         store.activate(code, None, "node_b")                 # the task's own code: one machine
 
 
+def test_first_node_can_rerun_its_code_once_a_second_node_serves_the_task(hub, tmp_path,
+                                                                          provider_files):
+    """`bmb-eval update` re-runs connect with the node's code. The task's own code must
+    still work on its node after add-node binds another (2026-11-10: seven pert tasks'
+    updates were refused, one alert each)."""
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    a = _fresh_node(tmp_path / "node_a")
+    node_a = _connect(a, url, code, data).hub["node_id"]
+    second, _ = store.add_node_code("binding")
+    _connect(_fresh_node(tmp_path / "node_b"), url, second, data)
+    assert _connect(a, url, code, data).hub["node_id"] == node_a
+    assert len(store.q("SELECT node_id FROM node_tasks WHERE task='binding'")) == 2
+    assert _reports(store) == []
+
+
+def test_refused_activation_reports_which_refusal(hub, tmp_path, provider_files):
+    store, url = hub
+    data, task_dir = provider_files
+    code, _ = store.add_enrollment(task_dir)
+    second, _ = store.add_node_code("binding")
+    _connect(_fresh_node(tmp_path / "node_b"), url, second, data)
+    with pytest.raises(SystemExit, match="already served"):
+        _connect(_fresh_node(tmp_path / "node_a"), url, code, data)   # own code, other node serves
+    assert _reports(store)[-1] == ("activate", "hub_error", "already_served")
+
+
 def test_random_split_task_cannot_get_a_second_node(hub, tmp_path):
     store, url = hub
     d = _split_task(tmp_path, name="split_task")            # validation_fraction: drawn per node

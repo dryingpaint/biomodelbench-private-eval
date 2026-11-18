@@ -505,6 +505,18 @@ class SetupSteps:
         HubAPI(self.hub).report_setup(self.code, self.step, reason, detail)
 
 
+def _activate_refusal(e) -> str:
+    """The fixed detail a failed activation reports: which of the hub's refusals it was."""
+    msg = str(e)
+    if e.status is None:
+        return "unreachable"
+    if "already served" in msg:
+        return "already_served"
+    if "already used" in msg:
+        return "code_refused"
+    return f"http_{e.status}"
+
+
 def cmd_connect(args) -> None:
     steps = SetupSteps()
     try:
@@ -640,6 +652,7 @@ def _connect(args, steps: SetupSteps) -> None:
     try:
         creds = api.activate(code, cfg.node_name)
     except HubError as e:
+        steps.reason, steps.detail = "hub_error", _activate_refusal(e)
         raise SystemExit(f"Couldn't finish connecting: {e}")
     raw = yaml.safe_load(cfg_path.read_text())
     hub = raw.get("hub") or {"url": hub_url}

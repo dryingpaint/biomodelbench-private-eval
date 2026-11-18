@@ -720,7 +720,8 @@ class HubStore:
                    "VALUES (?,?,?,?,NULL,0)", (node_id, _h(secret), name, time.time()))
             out["secret"] = secret
         # A task's own code binds one node; each further node needs a code made for it.
-        if owners - {node_id} and not extra:
+        # A node that already serves the task may re-run its code (`bmb-eval update`).
+        if owners and node_id not in owners and not extra:
             raise KeyError("task is already served by another node")
         self.q("INSERT OR REPLACE INTO node_tasks VALUES (?,?,NULL)", (task, node_id))
         # Each activation (a provider re-running their command) restarts the stall clock

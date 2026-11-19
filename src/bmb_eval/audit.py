@@ -32,10 +32,18 @@ def _last_hash(path: Path) -> tuple[str, int]:
     with path.open("rb+") as f:
         f.seek(0, 2)
         size = f.tell()
-        start = max(0, size - 65536)
-        f.seek(start)
-        tail = f.read()
-        lines = tail.splitlines(keepends=True)
+        # Read back until the last entry is whole: an entry can be longer than any fixed window
+        # (an `approved` fingerprint of ~130 tasks passed 64 KiB on 2026-11-19, and every
+        # record() after it then failed as if the line had been edited).
+        window = 65536
+        while True:
+            start = max(0, size - window)
+            f.seek(start)
+            tail = f.read()
+            lines = tail.splitlines(keepends=True)
+            if start == 0 or len(lines) > 1:
+                break
+            window *= 4
         last = lines[-1] if lines else b""
         try:
             return json.loads(last)["hash"], 0

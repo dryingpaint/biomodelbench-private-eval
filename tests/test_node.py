@@ -2598,3 +2598,16 @@ def test_disk_low_is_reported_once_per_episode(connected, monkeypatch):
     w._room_on_disk(report=True)
     events = [json.loads(x)["event"] for x in (cfg.state_dir / "audit.jsonl").read_text().splitlines()]
     assert [e for e in events if e in ("disk_low", "disk_ok")] == ["disk_low", "disk_ok", "disk_low"]
+
+
+def test_an_audit_entry_longer_than_the_read_window_is_read_whole(tmp_path):
+    """An `approved` fingerprint of ~130 tasks passed 64 KiB (2026-11-19); every record()
+    after it raised "its last line isn't an audit entry" and the node took no work."""
+    audit.record(tmp_path, "one")
+    audit.record(tmp_path, "approved", fingerprint={"tasks": "x" * 300_000})
+    audit.record(tmp_path, "two")
+    audit.record(tmp_path, "approved", fingerprint={"tasks": "y" * 70_000})
+    audit.record(tmp_path, "three")
+    ok, n, msg = audit.verify(tmp_path)
+    assert ok and n == 5, msg
+    assert not list(tmp_path.glob("audit.jsonl.partial-*"))

@@ -1,16 +1,24 @@
 # Connecting your data to BioModelBench
 
 BioModelBench scores AI-trained models on your data and sends back only the
-scores. There are two ways to connect; our email says which commands to run
-for each:
+scores. There are three ways to set it up; our email says which commands to
+run for each:
 
-- **Option A: no machine to run (recommended).** Your data is encrypted on
-  your computer with a key in your own Google Cloud project, and only our
+- **Option A: share the data under an NDA/CDA.** We sign a strict NDA/CDA and
+  you send us the data directly.
+- **Option B: we manage the machine (lower overhead).** Your data is encrypted
+  on your computer with a key in your own Google Cloud project, and only our
   sealed evaluation machine can open it.
-- **Option B: your own machine.** Models are sent to a Linux machine of
+- **Option C: you manage the machine.** Models are sent to a Linux machine of
   yours, which scores them where your data already is.
 
-# Option A: sealed evaluation (no machine to run)
+# Option A: share the data under an NDA/CDA
+
+If you are comfortable sharing your data, we sign a strict NDA/CDA and you send
+it to us directly. Tell us and we'll send the agreement; there is nothing to
+install.
+
+# Option B: we manage the machine (sealed evaluation)
 
 Your data is encrypted with a key that only you control, and only our sealed
 evaluation machine can open it. Nobody else can read it, including
@@ -63,7 +71,7 @@ hardware, that it runs the exact software you approved, with debugging off.
 
 The command installs the tool in `~/bmb-confidential` and checks your data on
 your computer (and, if the task holds out a test set, splits it there). Its approval
-screen shows the same terms as Option B's, plus the exact software your key
+screen shows the same terms as Option C's, plus the exact software your key
 will open for and the public source commit it was built from. When you type
 `y`, it creates the key, bucket and access rule in your project, encrypts
 everything on your computer, and uploads only the encrypted copy.
@@ -119,19 +127,22 @@ Domain-restricted sharing and Google's secure-by-default policies don't get in
 the way (tested). If a step is refused, the command stops and shows Google's
 message; send it to us.
 
-# Option B: your own machine
+# Option C: you manage the machine
 
 BioModelBench sends AI-trained models to your machine. Your machine scores
 them on your data and sends back only the scores. Your data never leaves.
 
 ## What you need
 
-- **An x86_64 (Intel or AMD) Linux machine that stays on**, of the size our email gives for your
-  tasks (for example, two 80 GB NVIDIA GPUs, 24 CPUs, 256 GB RAM and 500 GB
-  free disk for tasks whose final evaluations run the largest models). Most of
-  the time it runs small models on CPUs. GPUs need NVIDIA driver 580 or newer. The install checks the machine and
-  says if anything is missing. If you don't have a suitable machine, talk to
-  us and we'll help you set one up, or use Option A.
+- **An x86_64 (Intel or AMD) Linux machine that stays on**, ideally where your
+  data already is. Its size depends on your tasks, and our email gives it. To
+  accommodate all types of models, plan for at least one NVIDIA H100 GPU, 64 GB
+  RAM and 300 GB free disk; tasks whose models run on CPUs need no GPU, and
+  less disk (the install requires at least 20 GB free). GPUs need NVIDIA driver
+  580 or newer. The install checks the machine and says if anything is missing.
+  We reimburse the cost of running the machine during the evaluation. If you
+  don't have a suitable machine, talk to us and we'll help you set one up, or
+  use Option B.
 - **The data you described to us**, as one file or one folder, in whatever
   format it's already in.
 
@@ -141,7 +152,7 @@ Run the command from our email on that machine:
 curl -fsSL https://<hub address>/install.sh | sh -s -- YOUR-CODE --data /path/to/your/data
 ```
 
-It takes about 15 minutes and may ask for your password once. It starts by
+It takes 15–30 minutes, mostly downloading, and may ask for your password once. It starts by
 listing its steps and how long each usually takes, then shows each step as it
 runs (with a progress bar for the sandbox download). It installs what's needed
 (including GPU support if the machine has an NVIDIA GPU), checks your data,
@@ -272,7 +283,7 @@ all evaluations. Honest models reveal far less.
 
 **Who decides which half of my data is the test set?** Most tasks don't
 split your data; when one does, the approval screen says so. Your computer (Option
-A) or machine (Option B) splits it at random when you connect, with a secret
+B) or machine (Option C) splits it at random when you connect, with a secret
 seed. Nobody, including BioModelBench, knows which row is where. Agents are
 scored only on the validation half; the test half is used at most a few times,
 at the end, and only BioModelBench sees those scores.

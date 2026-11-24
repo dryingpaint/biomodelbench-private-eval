@@ -89,7 +89,12 @@ def instance_body(name: str, zone: str, model: str, project: str, conf: dict, po
     if model == "FLEX_START":
         sched["maxRunDuration"] = {"seconds": str(MAX_RUN_S)}
         extra["params"] = {"requestValidForDuration": {"seconds": str(FLEX_WAIT_S)}}
-    family = "confidential-space-preview-cgpu" if conf.get("gpu_preview") else "confidential-space"
+    # Google's stable image, also for H100s: its attestation reports the GPU's confidential mode.
+    # The GPU preview family (confidential-space-preview-cgpu, last built 2025-07) stopped
+    # attesting (Nov 2026: "VerifyAttestation ... attestation failed: possibly an incorrect
+    # Confidential Space configuration"), so its VMs never reach a provider's key. Providers'
+    # key rules accept STABLE images (attestation_condition), so no provider has to act.
+    family = "confidential-space"
     return {
         "name": name, "machineType": f"zones/{zone}/machineTypes/a3-highgpu-1g",
         "confidentialInstanceConfig": {"confidentialInstanceType": "TDX"},

@@ -26,7 +26,7 @@ fi
 DBG=""; [ "$ENV_FILE" = none ] && DBG="-debug"
 if [ "$KIND" = h100 ]; then
   HW=(--machine-type a3-highgpu-1g --confidential-compute-type TDX --maintenance-policy TERMINATE
-      --boot-disk-size 300GB --image-family confidential-space$DBG-preview-cgpu
+      --boot-disk-size 300GB --image-family confidential-space$DBG
       ${SPOT:+--provisioning-model SPOT --instance-termination-action DELETE})
   META="$META~tee-install-gpu-driver=true"
 elif [ "$KIND" = cpu-tdx ]; then

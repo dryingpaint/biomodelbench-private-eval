@@ -639,6 +639,20 @@ class HubStore:
         rows = self.q(q, (gid, agent) if agent else (gid,))
         return _summary(gid, rows) if rows else None
 
+    def agent_submissions(self, agent: str) -> list[dict]:
+        """Every validation submission of one attempt, oldest first: a family submission once,
+        with each dataset's result, in group_view's shape plus `created`. Operator only (the run
+        pages chart an attempt's submissions from the hub's records, not from its own log)."""
+        groups = self.q("SELECT COALESCE(group_id, id), MIN(created) FROM submissions WHERE agent=? "
+                        "AND split='validation' AND status NOT IN ('uploading', 'uploading_final') "
+                        "GROUP BY COALESCE(group_id, id) ORDER BY MIN(created)", (agent,))
+        out = []
+        for gid, created in groups:
+            rows = self.q("SELECT task, status, result FROM submissions WHERE COALESCE(group_id, id)=? "
+                          "AND agent=? AND split='validation' ORDER BY task", (gid, agent))
+            out.append({**_summary(gid, rows), "created": created})
+        return out
+
     def final_view(self, sid: str) -> dict | None:
         """The latest final (test set) evaluation of each dataset of a submission, in
         group_view's shape. Operator only."""
@@ -1300,7 +1314,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if p.startswith("/v1/node/"):
                 return self._node_get(p, qs)
             if p.startswith("/v1/operator/"):
-                return self._operator("GET", p)
+                return self._operator("GET", p, qs)
             agent = store.agent(self._bearer())
             if agent is None:
                 return self._err(401, "unauthorized", "Missing or invalid token.")
@@ -1397,7 +1411,7 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
 
         # ---------------------------------------------------------- operator
 
-        def _operator(self, method: str, p: str) -> None:
+        def _operator(self, method: str, p: str, qs: dict | None = None) -> None:
             """Automated runs (BioModelBench's harness): issue an attempt's agent token,
             request final evaluations and read their results."""
             # Read the body first, even to refuse: a reply sent before the client has
@@ -1429,6 +1443,12 @@ def make_handler(store: HubStore, blobs, public_url: str, repo_root: Path, max_b
             if method == "GET" and p == "/v1/operator/status":
                 # Read-only: what `bmb-hub status` prints, for the ops page.
                 return self._send(200, store.operator_status())
+            if method == "GET" and p == "/v1/operator/submissions":
+                # One attempt's validation submissions with each dataset's result (?agent=<name>).
+                agent = urllib.parse.unquote((qs or {}).get("agent", ""))[:200]
+                if not agent:
+                    return self._err(400, "bad_request", "Give ?agent=<attempt name>.")
+                return self._send(200, {"agent": agent, "submissions": store.agent_submissions(agent)})
             if m := re.fullmatch(r"/v1/operator/submissions/([\w-]{1,128})/final", p):
                 if method == "GET":
                     view = store.final_view(m.group(1))

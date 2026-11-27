@@ -1645,6 +1645,18 @@ def test_operator_issues_tokens_and_runs_finals_over_the_api(family):
     again = op.request_final(sid, again=True)["finals"]
     assert len(again) == 2 and not set(again) & set(finals)
     assert op.final(sid.replace("-", "_", 1))["error"]["code"] == "not_found"   # no wildcard match
+    # An attempt's validation submissions with each dataset's result, for the run pages.
+    vsid = run.submit_async("fitness", EXAMPLE_BUNDLE)["submission_id"]
+    _drain(workers)
+    assert agent._req("GET", "/v1/operator/submissions?agent=run-1")["error"]["code"] == "unauthorized"
+    assert op._req("GET", "/v1/operator/submissions")["error"]["code"] == "bad_request"
+    subs = op.agent_submissions("run-1")
+    assert subs["agent"] == "run-1" and [x["submission_id"] for x in subs["submissions"]] == [sid, vsid]
+    reg, val = subs["submissions"]
+    assert reg["status"] == "registered" and val["status"] == "done" and val["created"] >= reg["created"]
+    assert set(val["result"]["datasets"]) == {"fit_lab_a", "fit_lab_b"}
+    assert all(d["split"] == "validation" for d in val["result"]["datasets"].values())
+    assert op.agent_submissions("no/such run")["submissions"] == []
     rotated = op.agent_token("run-1", 2, rotate=True)["token"]
     assert run.tasks()["error"]["code"] == "unauthorized" and Client(url, rotated).tasks()["budget"]
     new_op = store.set_operator()

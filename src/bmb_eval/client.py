@@ -54,6 +54,11 @@ class Client:
     def tasks(self) -> dict:
         return self._req("GET", "/v1/tasks")
 
+    def agent_submissions(self, agent: str) -> dict:
+        """Operator: an attempt's validation submissions with each dataset's result."""
+        import urllib.parse
+        return self._req("GET", "/v1/operator/submissions?agent=" + urllib.parse.quote(agent, safe=""))
+
     def contract(self, task: str) -> dict:
         for t in self.tasks()["tasks"]:
             if t["contract"]["id"] == task:
